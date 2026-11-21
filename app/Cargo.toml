@@ -1,0 +1,17 @@
+[package]
+name = "maverick"
+version = "0.1.0"
+description = "The Maverick desktop app"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui-kit = "0.10.0"
+maverick-core = { path = "../core" }
+tokio = { version = "1.54.1", features = ["net", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+gpui-kit = { version = "0.10.0", features = ["test-support"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
