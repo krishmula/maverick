@@ -30,6 +30,10 @@ pub struct Answers {
     /// from it. With no background, essay questions are left for the user.
     #[serde(default)]
     pub background: Vec<String>,
+    /// The jobs the user is looking for, one statement per entry, such as levels and kinds of work.
+    /// Scoring judges each posting against these and the background.
+    #[serde(default)]
+    pub target: Vec<String>,
 }
 
 /// Answers every question whose text holds one of `any` and none of `not`.

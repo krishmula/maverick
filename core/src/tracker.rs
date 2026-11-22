@@ -206,6 +206,8 @@ fn posting(record: &Record<'_>) -> Result<Posting, String> {
         variant: record.owned("Variant"),
         flags: record.owned("Flags"),
         notes: record.owned("Notes"),
+        address: None,
+        sponsorship: None,
     })
 }
 

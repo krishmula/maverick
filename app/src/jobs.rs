@@ -40,7 +40,11 @@ pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job>
                 company: posting.company.clone(),
                 title: posting.title.clone(),
                 score: posting.score,
-                address: apply::posting_address(&posting_address(&posting.link))?,
+                address: posting
+                    .address
+                    .as_deref()
+                    .and_then(apply::posting_address)
+                    .or_else(|| apply::posting_address(&posting_address(&posting.link)))?,
                 location: posting.location.clone(),
                 source: posting.source.clone(),
                 found_on: posting.found_at.strftime("%b %-d, %Y").to_string(),
@@ -226,6 +230,8 @@ mod tests {
             variant: None,
             flags: None,
             notes: None,
+            address: None,
+            sponsorship: None,
         }
     }
 
@@ -248,6 +254,10 @@ mod tests {
                 Some(95),
             ),
             posting(&ashby(6), "Not scored", Stage::Found, None),
+            Posting {
+                address: Some(format!("{}?utm_source=board", ashby(8))),
+                ..posting("https://simplify.jobs/p/8", "Board copy", Stage::Review, Some(70))
+            },
             posting(&ashby(1), "Reviewed again", Stage::Review, Some(66)),
             posting(
                 &format!("{}?utm_source=x", ashby(7)),
@@ -267,6 +277,7 @@ mod tests {
             listed,
             [
                 ("Wrapped link", ashby(3).as_str()),
+                ("Board copy", ashby(8).as_str()),
                 ("Reviewed", ashby(1).as_str()),
                 ("Not scored", ashby(6).as_str()),
             ]
