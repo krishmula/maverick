@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/icon.png" width="128" alt="Maverick icon"></p>
+
 # Maverick
 
 Maverick is a personal desktop app for macOS, written in Rust with [GPUI](https://www.gpui.rs). It works with the Chrome you already use, through a small extension.
@@ -10,7 +12,17 @@ Today it lists every open Chrome tab, updates the list as tabs change, and switc
 - Rust 1.89 or later. The code is tested on Rust 1.100.
 - Google Chrome 116 or later.
 
-## Run the app
+## Install
+
+1. Download the `.dmg` for the latest version from [Releases](https://github.com/krishmula/maverick/releases). Builds are for Apple silicon.
+2. Open it and drag **Maverick** into **Applications**. Start it from there, not from the disk image: Chrome stores the app's path when it first runs.
+3. The app is not notarized by Apple, so macOS blocks the first launch. Open **System Settings > Privacy & Security** and click **Open Anyway**, or run:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Maverick.app
+   ```
+
+## Run from source
 
 ```sh
 cargo run --release -p maverick
@@ -124,6 +136,19 @@ MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
 	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
 	cargo test -p maverick --test chrome a_live -- --ignored --nocapture
 ```
+
+## Make a release
+
+1. Raise `version` in `app/Cargo.toml` and merge it into `main`.
+2. Tag that commit and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The `Release` workflow builds `Maverick.app` and attaches a `.dmg` and a `.zip` to a new GitHub release. The tag must match the version. To build the same files locally, run `scripts/bundle.sh`; they land in `target/dist`.
+
+The icon source is `assets/icon/icon.svg`. After editing it, run `assets/icon/build.sh` (needs `brew install librsvg`) and commit the new `Maverick.icns`.
 
 ## Layout
 
