@@ -1,18 +1,31 @@
-//! The main window: a status header over either the tab list or the steps to connect Chrome.
+//! The main window: a bar, the band, and either a list beside a detail pane or the steps to connect Chrome.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use std::time::Duration;
+
 use gpui_kit::component::list::{List, ListEvent, ListState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::{IndexPath, Theme, TitleBar, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
+    canvas, div, fill, point, px, relative, size,
 };
-use maverick_core::apply::{FieldResult, Outcome, Source};
-use maverick_core::bridge::BrowserState;
+use maverick_core::bridge::{BrowserState, Tab};
 
-use crate::browser::{Browser, Fill, Latency};
-use crate::jobs::{Job, JobList};
-use crate::tabs::TabList;
+use crate::band::{Band, Cell, Mark};
+use crate::browser::{Browser, Fill, Latency, Subject};
+use crate::jobs::{Job, JobList, system_name};
+use crate::report;
+use crate::tabs::{TabList, host_of};
+use crate::ui::{self, Palette, Signal};
+
+/// How often the band redraws while the window is in front.
+const FRAME: Duration = Duration::from_millis(66);
+const BAR_HEIGHT: f32 = 40.0;
+const BAND_HEIGHT: f32 = 164.0;
+/// The widest the detail pane gets. A wider window gives the rest to the list.
+const PANE_WIDTH: f32 = 620.0;
+/// How many jobs the band tracks besides the target.
+const TRACKED: usize = 6;
 
 /// Which list the window shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -26,12 +39,21 @@ pub struct MainView {
     showing: Showing,
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
+    band: Band,
     _subscriptions: Vec<Subscription>,
+    _drift: Task<()>,
 }
 
 impl MainView {
-    pub fn new(browser: Entity<Browser>, jobs: Vec<Job>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let jobs = cx.new(|cx| ListState::new(JobList::new(jobs), window, cx).searchable(true));
+    pub fn new(
+        browser: Entity<Browser>,
+        jobs: Vec<Job>,
+        cells: Vec<Cell>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let showing = if jobs.is_empty() { Showing::Tabs } else { Showing::Jobs };
+        let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let _subscriptions = vec![
             cx.observe_in(&browser, window, |this, browser, window, cx| {
@@ -43,9 +65,18 @@ impl MainView {
                     .iter()
                     .map(|sent| sent.address.clone())
                     .collect();
+                for address in &applied {
+                    this.band.mark_applied(address);
+                }
                 this.jobs.update(cx, |jobs, cx| {
+                    let listed = jobs.delegate().len();
                     for address in &applied {
                         jobs.delegate_mut().remove(address);
+                    }
+                    // Only a removal moves the selection. Anything else would undo the user's scrolling.
+                    if jobs.delegate().len() != listed {
+                        let shown = jobs.delegate().shown();
+                        keep_a_row_selected(jobs, shown, window, cx);
                     }
                     cx.notify();
                 });
@@ -59,34 +90,50 @@ impl MainView {
                     // A click moves focus to the row. Typing should always search.
                     tabs.update(cx, |tabs, cx| tabs.focus(window, cx));
                 }
+                // The detail pane follows the selection.
+                cx.notify();
             }),
             cx.subscribe_in(&jobs, window, |this, jobs, event: &ListEvent, window, cx| {
                 if let ListEvent::Confirm(ix) = event
                     && let Some(job) = jobs.read(cx).delegate().job_at(*ix).cloned()
                 {
-                    let title = format!("{} at {}", job.title, job.company);
-                    this.browser
-                        .update(cx, |browser, cx| browser.apply(title, job.address.clone(), cx));
-                    jobs.update(cx, |jobs, cx| {
-                        jobs.delegate_mut().mark_opened(&job.address);
-                        jobs.focus(window, cx);
-                        cx.notify();
-                    });
+                    this.act_on(&job, cx);
+                    jobs.update(cx, |jobs, cx| jobs.focus(window, cx));
                 }
+                cx.notify();
             }),
             cx.observe_window_appearance(window, |_, window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
             }),
         ];
+        let _drift = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FRAME).await;
+                let drawn = this.update_in(cx, |_, window, cx| {
+                    if window.is_window_active() {
+                        cx.notify();
+                    }
+                });
+                if drawn.is_err() {
+                    break;
+                }
+            }
+        });
         let mut view = Self {
             browser,
-            showing: Showing::Tabs,
+            showing,
             jobs,
             tabs,
+            band: Band::new(cells),
             _subscriptions,
+            _drift,
         };
         view.show_current_tabs(window, cx);
-        view.tabs.update(cx, |tabs, cx| tabs.focus(window, cx));
+        view.jobs.update(cx, |jobs, cx| {
+            let shown = jobs.delegate().shown();
+            keep_a_row_selected(jobs, shown, window, cx);
+        });
+        view.show(showing, window, cx);
         view
     }
 
@@ -98,44 +145,10 @@ impl MainView {
         };
         self.tabs.update(cx, |list, cx| {
             list.delegate_mut().set_tabs(tabs);
-            let count = list.delegate().len();
-            let selected = match list.selected_index() {
-                _ if count == 0 => None,
-                Some(ix) if ix.row < count => Some(ix),
-                _ => Some(IndexPath::default()),
-            };
-            list.set_selected_index(selected, window, cx);
+            let shown = list.delegate().len();
+            keep_a_row_selected(list, shown, window, cx);
             cx.notify();
         });
-    }
-
-    fn status(&self, cx: &mut Context<Self>) -> AnyElement {
-        let browser = self.browser.read(cx);
-        let BrowserState::Connected { tabs } = browser.state() else {
-            return div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("Chrome not connected")
-                .into_any_element();
-        };
-        let count = match tabs.len() {
-            1 => "1 tab".to_owned(),
-            count => format!("{count} tabs"),
-        };
-        let latency = match browser.latency() {
-            Latency::Measuring => "measuring".to_owned(),
-            Latency::Measured(took) => format!("{:.1} ms", took.as_secs_f64() * 1000.0),
-            Latency::Failed(reason) => reason.clone(),
-        };
-        Button::new("measure-latency")
-            .ghost()
-            .xsmall()
-            .label(SharedString::from(format!("Chrome connected · {count} · {latency}")))
-            .tooltip("Round trip to Chrome and back. Click to measure again.")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.browser.update(cx, |browser, cx| browser.measure(cx));
-            }))
-            .into_any_element()
     }
 
     fn show(&mut self, showing: Showing, window: &mut Window, cx: &mut Context<Self>) {
@@ -147,250 +160,585 @@ impl MainView {
         cx.notify();
     }
 
-    /// The two buttons that switch between the lists.
-    fn switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// What Enter does to a job: opens its form and fills it, or, once that is done,
+    /// brings the filled form forward for the user to review.
+    fn act_on(&mut self, job: &Job, cx: &mut Context<Self>) {
+        let subject = Subject::Posting(job.address.clone());
+        let filled = matches!(self.browser.read(cx).fill_of(&subject), Some(Fill::Done { .. }));
+        if filled {
+            self.browser.update(cx, |browser, cx| browser.review(cx));
+            return;
+        }
+        let title = format!("{} at {}", job.title, job.company);
+        self.browser
+            .update(cx, |browser, cx| browser.apply(title, job.address.clone(), cx));
+        self.jobs.update(cx, |jobs, cx| {
+            jobs.delegate_mut().mark_opened(&job.address);
+            cx.notify();
+        });
+    }
+
+    /// The bar: the wordmark, the two lists, and the link to Chrome.
+    fn bar(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let jobs = self.jobs.read(cx).delegate().len();
         let showing_now = self.showing;
-        let button = |id: &'static str, label: String, showing: Showing, cx: &mut Context<Self>| {
-            let button = Button::new(id).xsmall().label(SharedString::from(label));
-            let button = if showing_now == showing { button } else { button.ghost() };
-            button.on_click(cx.listener(move |this, _, window, cx| this.show(showing, window, cx)))
+        let tab = |id: &'static str,
+                   name: String,
+                   word: &'static str,
+                   count: Option<usize>,
+                   showing: Showing,
+                   cx: &mut Context<Self>| {
+            let ink = palette.ink;
+            let face = h_flex()
+                .gap(px(5.))
+                .text_color(if showing_now == showing {
+                    palette.ink
+                } else {
+                    palette.faint
+                })
+                .hover(move |face| face.text_color(ink))
+                .child(word)
+                .children(count.map(|count| {
+                    div()
+                        .text_color(palette.faint)
+                        .child(SharedString::from(count.to_string()))
+                }));
+            ui::button(id, name, face)
+                .on_click(cx.listener(move |this, _, window, cx| this.show(showing, window, cx)))
+                .into_any_element()
         };
-        h_flex()
-            .gap_1()
-            .child(button("show-tabs", "Tabs".to_owned(), Showing::Tabs, cx))
-            .child(button("show-jobs", format!("Jobs · {jobs}"), Showing::Jobs, cx))
-            .into_any_element()
+        let tabs = match self.browser.read(cx).state() {
+            BrowserState::Connected { tabs } => Some(tabs.len()),
+            BrowserState::Disconnected => None,
+        };
+        TitleBar::new()
+            .h(px(BAR_HEIGHT))
+            .pr(px(14.))
+            .child(
+                h_flex()
+                    .gap_5()
+                    .child(
+                        div()
+                            .ml_2()
+                            .font_family(ui::DOTS)
+                            .font_weight(FontWeight::BLACK)
+                            .text_size(px(17.))
+                            .text_color(palette.ink)
+                            .child("MAVERICK"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(tab(
+                                "show-jobs",
+                                format!("Jobs · {jobs}"),
+                                "jobs",
+                                Some(jobs),
+                                Showing::Jobs,
+                                cx,
+                            ))
+                            .child(tab("show-tabs", "Tabs".to_owned(), "tabs", tabs, Showing::Tabs, cx)),
+                    ),
+            )
+            .child(self.link(palette, cx))
     }
 
-    /// What the form filler is doing or did, shown until the user closes it.
-    fn fill_report(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let muted = cx.theme().muted_foreground;
-        let (heading, lines) = match self.browser.read(cx).fill() {
-            Fill::Idle => return None,
-            Fill::Running { title } => (format!("Filling {title}"), Vec::new()),
-            Fill::Failed { title, reason } => (
-                format!("Could not fill {title}"),
-                vec![
-                    div()
-                        .text_color(cx.theme().danger)
-                        .child(SharedString::from(reason.clone())),
-                ],
-            ),
-            Fill::Done { title, report } => {
-                let outcomes = &report.outcomes;
-                let filled = outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome.result, FieldResult::Filled { .. }))
-                    .count();
-                let line = |outcome: &Outcome, why: String| {
-                    let required = if outcome.required { " (required)" } else { "" };
-                    div().child(SharedString::from(format!("{}{required}: {why}", outcome.title)))
-                };
-                let mut lines = Vec::new();
-                if let Some(problem) = &report.model_problem {
-                    lines.push(
-                        div()
-                            .text_color(cx.theme().danger)
-                            .child(SharedString::from(format!("The model was not asked: {problem}"))),
-                    );
-                }
-                if let Some(note) = &report.note {
-                    lines.push(div().text_color(muted).child(SharedString::from(note.clone())));
-                }
-                for outcome in outcomes {
-                    if let FieldResult::Failed(problem) = &outcome.result {
-                        lines.push(line(outcome, problem.clone()).text_color(cx.theme().danger));
-                    }
-                }
-                for outcome in outcomes {
-                    if let FieldResult::Left(why) = &outcome.result {
-                        lines.push(line(outcome, format!("left for you, {why}")).text_color(muted));
-                    }
-                }
-                // The model's answers are listed so the user can check them before submitting.
-                for outcome in outcomes {
-                    if let FieldResult::Filled {
-                        shown,
-                        by: Source::Model { basis },
-                    } = &outcome.result
-                    {
-                        lines.push(line(outcome, format!("the model answered {shown:?}. {basis}")));
-                    }
-                    if let FieldResult::Filled {
-                        by: Source::Draft { basis },
-                        ..
-                    } = &outcome.result
-                    {
-                        let note = format!("the model drafted this. Read it before you submit. {basis}");
-                        lines.push(line(outcome, note));
-                    }
-                }
-                (
-                    format!(
-                        "Filled {filled} of {} fields in {title}. Nothing was submitted.",
-                        outcomes.len()
-                    ),
-                    lines,
-                )
-            }
+    /// The state of the link to Chrome. A click measures the round trip again.
+    fn link(&self, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let browser = self.browser.read(cx);
+        let BrowserState::Connected { tabs } = browser.state() else {
+            return h_flex()
+                .gap_2()
+                .text_color(palette.muted)
+                .child(ui::square(palette.faint))
+                .child("chrome not connected")
+                .into_any_element();
         };
-        let running = matches!(self.browser.read(cx).fill(), Fill::Running { .. });
-        Some(
-            v_flex()
-                .id("fill-report")
-                .px_3()
-                .py_2()
-                .gap_1()
-                .max_h_64()
-                .overflow_y_scroll()
+        let count = match tabs.len() {
+            1 => "1 tab".to_owned(),
+            count => format!("{count} tabs"),
+        };
+        let (latency, signal) = match browser.latency() {
+            Latency::Measuring => ("measuring".to_owned(), Signal::Done),
+            Latency::Measured(took) => (format!("{:.1} ms", took.as_secs_f64() * 1000.0), Signal::Done),
+            Latency::Failed(reason) => (reason.clone(), Signal::Failed),
+        };
+        let ink = palette.ink;
+        let face = h_flex()
+            .gap_2()
+            .text_color(palette.muted)
+            .hover(move |face| face.text_color(ink))
+            .child(ui::square(palette.signal(signal)))
+            .child(SharedString::from(format!("chrome {latency}")));
+        ui::button(
+            "measure-latency",
+            format!("Chrome connected · {count} · {latency}"),
+            face,
+        )
+        .tip("Round trip to Chrome and back. Click to measure again.")
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.browser.update(cx, |browser, cx| browser.measure(cx));
+        }))
+        .into_any_element()
+    }
+
+    /// One line each for what the user should know right now, whatever list is showing.
+    fn notices(&self, palette: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let browser = self.browser.read(cx);
+        let notice = |signal: Signal, text: String| {
+            h_flex()
+                .items_start()
+                .gap(px(9.))
+                .px(px(14.))
+                .py(px(7.))
                 .border_b_1()
-                .border_color(cx.theme().border)
+                .border_color(palette.line)
+                .child(ui::square(palette.signal(signal)).mt(px(6.)))
                 .child(
-                    h_flex()
-                        .justify_between()
-                        .gap_3()
+                    ui::serif(text)
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.5))
+                        .text_color(palette.ink),
+                )
+        };
+        let mut notices = Vec::new();
+        if let Some(reason) = browser.failure() {
+            notices.push(notice(Signal::Failed, reason.to_owned()).into_any_element());
+        }
+        if browser.extension_is_outdated() {
+            let reload = "Chrome is running an old Maverick Bridge extension. \
+                          Open chrome://extensions and click the reload arrow on Maverick Bridge.";
+            notices.push(
+                notice(Signal::Yours, reload.to_owned())
+                    .id("reload-extension")
+                    .into_any_element(),
+            );
+        }
+        if let Some(sent) = browser.applied().last() {
+            notices.push(
+                match &sent.not_saved {
+                    None => notice(Signal::Done, format!("Submitted: {}. Marked as applied.", sent.title)),
+                    Some(reason) => notice(
+                        Signal::Failed,
+                        format!("Submitted: {}. It could not be saved: {reason}", sent.title),
+                    ),
+                }
+                .into_any_element(),
+            );
+        }
+        notices
+    }
+
+    /// The band, aimed at the selected job and tracking the next best ones.
+    fn band(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let mark = |job: &Job| Mark {
+            address: job.address.clone(),
+            score: job.score,
+            title: job.title.clone(),
+        };
+        let jobs = self.jobs.read(cx).delegate();
+        let target = (self.showing == Showing::Jobs).then(|| jobs.selected_job()).flatten();
+        let tracked = jobs
+            .best(TRACKED, target.map(|job| job.address.as_str()))
+            .map(mark)
+            .collect();
+        div()
+            .flex_none()
+            .h(px(BAND_HEIGHT))
+            .border_b_1()
+            .border_color(palette.line)
+            .child(self.band.element(target.map(mark), tracked, cx))
+    }
+
+    /// The detail pane: the selected row, and its fill report once it has one.
+    fn pane(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        match self.showing {
+            Showing::Jobs => match self.jobs.read(cx).delegate().selected_job().cloned() {
+                Some(job) => self.job_pane(&job, palette, cx),
+                None => v_flex(),
+            },
+            Showing::Tabs => match self.tabs.read(cx).delegate().selected_tab().cloned() {
+                Some(tab) => self.tab_pane(&tab, palette, cx),
+                None => v_flex(),
+            },
+        }
+    }
+
+    fn job_pane(&self, job: &Job, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let fill = self
+            .browser
+            .read(cx)
+            .fill_of(&Subject::Posting(job.address.clone()))
+            .cloned();
+        let tag = match system_name(&job.address) {
+            Some(system) => format!("{} / {system}", job.company),
+            None => job.company.clone(),
+        };
+        let facts = [
+            ("location", job.location.clone().unwrap_or_default()),
+            ("found", job.found_on.clone()),
+            ("source", job.source.clone()),
+            ("address", host_of(&job.address).to_owned()),
+        ];
+        let (word, name, note) = match &fill {
+            None => ("open and fill", "Open and fill", "you click submit."),
+            Some(Fill::Running { .. }) => ("", "", "filling. nothing gets submitted."),
+            Some(Fill::Failed { .. }) => ("try again", "Try again", "nothing was submitted."),
+            Some(_) => ("review in chrome", "Review in Chrome", "you click submit."),
+        };
+        let acted = job.clone();
+        let primary = (!word.is_empty()).then(|| {
+            ui::button("act-on-job", name, ui::primary_face(word, Some("enter"), palette))
+                .on_click(cx.listener(move |this, _, _, cx| this.act_on(&acted, cx)))
+                .into_any_element()
+        });
+        v_flex()
+            .size_full()
+            .child(header(&tag, &job.title, Some(job.score), palette))
+            .children(self.pane_body(fill.as_ref(), &facts, palette))
+            .child(self.footer(primary, fill.as_ref(), note, palette, cx))
+    }
+
+    fn tab_pane(&self, tab: &Tab, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let fill = self
+            .browser
+            .read(cx)
+            .fill_of(&Subject::Tab(tab.connection, tab.tab.id))
+            .cloned();
+        let host = host_of(&tab.tab.url);
+        let tag = match system_name(&tab.tab.url) {
+            Some(system) => format!("{host} / {system}"),
+            None => host.to_owned(),
+        };
+        let title = if tab.tab.title.is_empty() {
+            &tab.tab.url
+        } else {
+            &tab.tab.title
+        };
+        let shows = if tab.tab.active {
+            "in front in its window"
+        } else {
+            "behind another tab"
+        };
+        let facts = [("address", tab.tab.url.clone()), ("chrome", shows.to_owned())];
+        let note = match &fill {
+            Some(Fill::Running { .. }) => "filling. nothing gets submitted.",
+            Some(Fill::Done { .. }) => "you click submit.",
+            Some(_) => "nothing was submitted.",
+            None => "enter switches chrome to this tab.",
+        };
+        v_flex()
+            .size_full()
+            .child(header(&tag, title, None, palette))
+            .children(self.pane_body(fill.as_ref(), &facts, palette))
+            .child(self.footer(None, fill.as_ref(), note, palette, cx))
+    }
+
+    /// The middle of the detail pane: the fill report when there is one, the row's facts when not.
+    fn pane_body(&self, fill: Option<&Fill>, facts: &[(&str, String)], palette: &Palette) -> Vec<AnyElement> {
+        let scroll = |id: &'static str, content: Div| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_4()
+                .py_3()
+                .child(content)
+                .into_any_element()
+        };
+        let said = |signal: Signal, title: &str, why: &str| {
+            h_flex()
+                .items_start()
+                .gap(px(9.))
+                .child(ui::square(palette.signal(signal)).mt(px(7.)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(ui::serif(title.to_owned()).text_color(palette.ink))
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(heading)),
-                        )
-                        .children((!running).then(|| {
-                            Button::new("close-fill-report")
-                                .ghost()
-                                .xsmall()
-                                .label("Close")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.browser.update(cx, |browser, cx| browser.dismiss_fill(cx));
-                                }))
-                        })),
+                                .text_size(px(11.))
+                                .line_height(px(15.))
+                                .text_color(palette.muted)
+                                .child(SharedString::from(why.to_owned())),
+                        ),
                 )
-                .children(lines)
-                .into_any_element(),
-        )
+        };
+        match fill {
+            Some(Fill::Done { report, .. }) => vec![
+                div()
+                    .flex_none()
+                    .px_4()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(palette.line)
+                    .child(report::form_map(report, palette))
+                    .into_any_element(),
+                scroll("fill-report", report::sections(report, palette)),
+            ],
+            Some(Fill::Running { .. }) => vec![scroll(
+                "fill-report",
+                said(
+                    Signal::Yours,
+                    "Filling the form in Chrome",
+                    "Maverick answers what your standard answers and facts cover.",
+                ),
+            )],
+            Some(Fill::Failed { reason, .. }) => vec![scroll(
+                "fill-report",
+                said(Signal::Failed, "Maverick could not fill this form", reason),
+            )],
+            Some(Fill::Idle) | None => vec![scroll(
+                "facts",
+                v_flex()
+                    .gap(px(7.))
+                    .children(
+                        facts
+                            .iter()
+                            .filter(|(_, value)| !value.is_empty())
+                            .map(|(label, value)| {
+                                h_flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(ui::caps(label).w(px(72.)).pt(px(1.)).text_color(palette.faint))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_color(palette.muted)
+                                            .child(SharedString::from(value.clone())),
+                                    )
+                            }),
+                    ),
+            )],
+        }
     }
 
-    fn connect_guide(&self, cx: &mut Context<Self>) -> AnyElement {
-        let guide = v_flex().id("connect-guide").max_w_128().mx_auto().p_8().gap_3().child(
-            div()
-                .text_xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Connect Chrome"),
-        );
+    /// The foot of the detail pane: the user's move, a way to put a report away, and a reminder.
+    fn footer(
+        &self,
+        primary: Option<AnyElement>,
+        fill: Option<&Fill>,
+        note: &str,
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let closable = matches!(fill, Some(Fill::Done { .. } | Fill::Failed { .. }));
+        h_flex()
+            .flex_none()
+            .gap_3()
+            .px_4()
+            .py(px(10.))
+            .min_h(px(46.))
+            .border_t_1()
+            .border_color(palette.line)
+            .children(primary)
+            .children(closable.then(|| {
+                ui::button("close-fill-report", "Close", ui::quiet_face("close", palette)).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.browser.update(cx, |browser, cx| browser.dismiss_fill(cx));
+                    },
+                ))
+            }))
+            .child(
+                ui::serif(note.to_owned())
+                    .ml_auto()
+                    .text_size(px(13.5))
+                    .text_color(palette.muted),
+            )
+    }
+
+    fn connect_guide(&self, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let step = |text: &'static str| ui::serif(text).text_color(palette.ink);
+        let guide = v_flex()
+            .id("connect-guide")
+            .w_full()
+            .max_w(px(560.))
+            .mx_auto()
+            .p_8()
+            .gap_3()
+            .child(h_flex().child(ui::boxed("chrome not connected", palette.faint)))
+            .child(
+                div()
+                    .font_family(ui::SERIF)
+                    .text_size(px(26.))
+                    .line_height(px(30.))
+                    .text_color(palette.ink)
+                    .child("Connect Chrome"),
+            );
         match self.browser.read(cx).extension_dir() {
             Err(reason) => guide
                 .child(
-                    div()
-                        .text_color(cx.theme().danger)
-                        .child(SharedString::from(reason.to_owned())),
+                    h_flex()
+                        .items_start()
+                        .gap(px(9.))
+                        .child(ui::square(palette.signal(Signal::Failed)).mt(px(7.)))
+                        .child(ui::serif(reason.to_owned()).flex_1().text_color(palette.ink)),
                 )
                 .into_any_element(),
             Ok(folder) => {
                 let folder = folder.to_owned();
                 guide
-                    .child("1. Open chrome://extensions in Chrome and turn on Developer mode.")
-                    .child("2. Show the extension folder, then drag it onto that page.")
+                    .child(step(
+                        "1. Open chrome://extensions in Chrome and turn on Developer mode.",
+                    ))
+                    .child(step("2. Show the extension folder, then drag it onto that page."))
                     .child(
                         h_flex()
                             .gap_3()
                             .p_2()
-                            .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().muted)
+                            .border_color(palette.line)
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_xs()
+                                    .text_size(px(11.))
+                                    .text_color(palette.muted)
                                     .child(SharedString::from(folder.display().to_string())),
                             )
                             .child(
-                                Button::new("show-extension-folder")
-                                    .small()
-                                    .label("Show folder")
-                                    .on_click(move |_, _, cx| cx.reveal_path(&folder)),
+                                ui::button(
+                                    "show-extension-folder",
+                                    "Show folder",
+                                    ui::primary_face("show folder", None, palette),
+                                )
+                                .on_click(move |_, _, cx| cx.reveal_path(&folder)),
                             ),
                     )
-                    .child(div().text_color(cx.theme().muted_foreground).child(
-                        "This screen changes to your tabs as soon as Chrome connects. \
-                         If the extension is already loaded, Chrome reconnects within 30 seconds.",
-                    ))
+                    .child(
+                        ui::serif(
+                            "This screen changes to your lists as soon as Chrome connects. \
+                             If the extension is already loaded, Chrome reconnects within 30 seconds.",
+                        )
+                        .text_size(px(13.5))
+                        .text_color(palette.muted),
+                    )
                     .into_any_element()
             }
         }
     }
 }
 
+/// Keeps the selection on a row that exists, so Enter always has a target.
+fn keep_a_row_selected<D: gpui_kit::component::list::ListDelegate>(
+    list: &mut ListState<D>,
+    shown: usize,
+    window: &mut Window,
+    cx: &mut Context<ListState<D>>,
+) {
+    let selected = match list.selected_index() {
+        _ if shown == 0 => None,
+        Some(ix) if ix.row < shown => Some(ix),
+        _ => Some(IndexPath::default()),
+    };
+    list.set_selected_index(selected, window, cx);
+}
+
+/// The head of the detail pane: where the row is from, its name, and its score when it has one.
+fn header(tag: &str, title: &str, score: Option<Option<u8>>, palette: &Palette) -> Div {
+    h_flex()
+        .flex_none()
+        .items_end()
+        .justify_between()
+        .gap_4()
+        .px_4()
+        .pt(px(14.))
+        .pb(px(12.))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(7.))
+                .child(h_flex().child(ui::boxed(tag, palette.faint).truncate()))
+                .child(
+                    div()
+                        .font_family(ui::SERIF)
+                        .text_size(px(26.))
+                        .line_height(px(30.))
+                        .text_color(palette.ink)
+                        .child(SharedString::from(title.to_owned())),
+                ),
+        )
+        .children(score.map(|score| ui::score(score, 54.).text_color(palette.ink)))
+}
+
+/// The faint grid behind the whole window.
+fn grid(color: gpui_kit::Hsla) -> impl IntoElement {
+    const STEP: f32 = 24.0;
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let mut x = STEP;
+            while x < width {
+                let from = point(bounds.origin.x + px(x), bounds.origin.y);
+                window.paint_quad(fill(Bounds::new(from, size(px(1.), bounds.size.height)), color));
+                x += STEP;
+            }
+            let mut y = STEP;
+            while y < height {
+                let from = point(bounds.origin.x, bounds.origin.y + px(y));
+                window.paint_quad(fill(Bounds::new(from, size(bounds.size.width, px(1.))), color));
+                y += STEP;
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 impl Render for MainView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::of(cx);
         let connected = matches!(self.browser.read(cx).state(), BrowserState::Connected { .. });
-        let failure = self
-            .browser
-            .read(cx)
-            .failure()
-            .map(|reason| SharedString::from(reason.to_owned()));
         v_flex()
+            .relative()
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .text_sm()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("Maverick"))
-                            .child(self.switcher(cx)),
-                    )
-                    .child(self.status(cx)),
-            )
-            .children(failure.map(|reason| div().px_3().py_2().text_color(cx.theme().danger).child(reason)))
-            .children(self.browser.read(cx).extension_is_outdated().then(|| {
-                div()
-                    .id("reload-extension")
-                    .px_3()
-                    .py_2()
-                    .text_color(cx.theme().danger)
-                    .child(
-                        "Chrome is running an old Maverick Bridge extension. \
-                     Open chrome://extensions and click the reload arrow on Maverick Bridge.",
-                    )
-            }))
-            .children(self.browser.read(cx).applied().last().map(|sent| {
-                let note = match &sent.not_saved {
-                    None => format!("Submitted: {}. Marked as applied.", sent.title),
-                    Some(reason) => format!("Submitted: {}. It could not be saved: {reason}", sent.title),
-                };
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_color(cx.theme().success)
-                    .child(SharedString::from(note))
-            }))
-            .children(self.fill_report(cx))
+            .bg(palette.background)
+            .text_color(palette.ink)
+            .font_family(ui::MONO)
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .child(grid(palette.grid))
+            .child(self.bar(&palette, cx))
+            .children(self.notices(&palette, cx))
+            .child(self.band(&palette, cx))
             .child(if connected {
-                div()
+                h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(match self.showing {
-                        Showing::Tabs => List::new(&self.tabs)
-                            .search_placeholder("Search tabs")
-                            .into_any_element(),
-                        Showing::Jobs => List::new(&self.jobs)
-                            .search_placeholder("Search jobs. Enter opens the posting and fills its form.")
-                            .into_any_element(),
-                    })
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .border_r_1()
+                            .border_color(palette.line)
+                            .child(match self.showing {
+                                Showing::Tabs => List::new(&self.tabs)
+                                    .search_placeholder("search tabs")
+                                    .into_any_element(),
+                                Showing::Jobs => List::new(&self.jobs)
+                                    .search_placeholder("search jobs")
+                                    .into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(relative(0.52))
+                            .max_w(px(PANE_WIDTH))
+                            .h_full()
+                            .child(self.pane(&palette, cx)),
+                    )
                     .into_any_element()
             } else {
-                self.connect_guide(cx)
+                self.connect_guide(&palette, cx)
             })
     }
 }
@@ -469,7 +817,10 @@ mod tests {
         jobs: Vec<Job>,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
         let extension_dir = PathBuf::from("/data/maverick/extension");
         let background = runtime.handle().clone();
         let browser = cx.update(|cx| {
@@ -485,7 +836,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), window, cx))
             })
             .expect("the test window opens")
         });
@@ -713,12 +1064,19 @@ mod tests {
             title: "Backend Engineer".into(),
             score: Some(82),
             address: posting.into(),
+            ..Job::default()
         }];
         let (window, browser) = open_window_with_answers(&bridge, &runtime, Some(answers_file), jobs, cx);
 
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
+            // With a job to show, the window opens on the jobs list and its detail pane.
             assert_eq!(window.find("show-jobs").label(), Some("Jobs · 1"));
+            assert_eq!(window.find("act-on-job").label(), Some("Open and fill"));
+            window.click("show-tabs", cx);
+            window.render_frame(cx);
+            assert!(window.try_find(job_row_id(0)).is_none());
+            assert!(window.try_find("act-on-job").is_none());
             window.click("show-jobs", cx);
             window.render_frame(cx);
             window.click(job_row_id(0), cx);
@@ -777,5 +1135,18 @@ mod tests {
                 reason: "the page did not load: net::ERR_FAILED".into()
             }
         );
+
+        // The detail pane now shows the failed run for this job. Its button does what Enter does.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("act-on-job").label(), Some("Try again"));
+            assert_eq!(window.find("close-fill-report").label(), Some("Close"));
+            window.click("act-on-job", cx);
+        })
+        .unwrap();
+        let again = chrome
+            .next_command(Duration::from_secs(5))
+            .expect("Try again reaches Chrome");
+        assert_eq!(again["method"], "tabs.create");
     }
 }
