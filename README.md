@@ -94,9 +94,30 @@ A rule answers every question that holds one of its `any` phrases and none of it
 Maverick also fills applications on Workday sites, at `*.myworkdayjobs.com` and `*.myworkdaysite.com`. A Workday application has several pages, and Maverick fills one page at a time.
 
 1. Choose the job in Maverick, or click **Fill form** on the posting's tab. Maverick opens the application and chooses **Apply Manually**.
-2. Most employers then ask for an account. Maverick stops and tells you so. Sign in to Workday in that tab yourself. Maverick never creates an account, never types a password and never signs in.
+2. Most employers then ask for an account. Maverick signs in with the sign-in you stored, as the next section describes. With none stored, it stops and tells you how to store one, and you can sign in to Workday in that tab yourself.
 3. On each page of the application, click **Fill form** on the tab's row. Maverick fills the page that is on screen.
 4. Review the page and click **Save and Continue** yourself. Maverick never clicks it, and it never submits.
+
+### Sign in to Workday
+
+Each employer has its own Workday site with its own accounts. Maverick uses one email address and one password for all of them, and reads them from your macOS Keychain. Store them once, in Terminal:
+
+```sh
+security add-generic-password -s dev.maverick.workday -a <email> -w
+```
+
+Type the password at the prompt. It does not show, and it stays out of your shell history. To change it later, add `-U` to the same command. Maverick reads the item with `/usr/bin/security` on each fill that meets a sign-in page, keeps it only for that fill, and never writes it to a file, a log or a message.
+
+When an application asks for an account, Maverick does this, once per fill:
+
+1. It types the email address and the password into the sign-in form and presses **Sign In**.
+2. If Workday refuses, it tries once to create your account at that employer, with the same email address and password. Workday gives the same answer for a wrong password and for an email address it does not know, so Maverick cannot tell the two apart. It ticks the consent box when the form has one.
+3. If Workday asks you to verify your email address, Maverick stops and says so. Open the email from Workday, verify, then click **Fill form** again. Maverick never reads your email.
+4. If Workday also refuses the new account, Maverick stops and shows you what Workday said. It never tries the sign-in or the new account a second time in one fill.
+
+The report of a fill says **Signed in to Workday** or **Created your Workday account** when Maverick did either.
+
+Nobody has pressed **Sign In** or **Create Account** on a live Workday site with this code. What Maverick does up to the press is verified on live sites with made-up values. What it does after the press follows Workday's public page script and is tested only against a page rebuilt from it. Watch the first real sign-in.
 
 Maverick fills text fields, the email and the phone number, drop-down lists, radio groups, check boxes and the resume upload. It leaves these for you:
 
@@ -112,6 +133,9 @@ Check every answer before you continue. This is how far each part is verified:
 | Part | Verified against |
 |---|---|
 | Posting addresses, the job's details, opening the application, the sign-in stop | Live Workday sites |
+| Reading the stored sign-in from the Keychain | The real Keychain, with made-up items that the test stores and deletes |
+| Finding the sign-in form and the create-account form, typing into them, ticking the consent box, finding the button to press | The sign-in pages of 19 employers, with a made-up email address and password. No button was pressed |
+| Everything after a press of **Sign In** or **Create Account**: a good sign-in, a refusal, the new account, the request to verify your email address | A page rebuilt from Workday's public script. No live page |
 | Reading a page's fields, and filling text, an email, a phone number, a radio group, a check box and a drop-down list | The first page of two live applications that ask for no account, with made-up answers that were never saved |
 | Later pages, a signed-in session, the resume upload, groups of check boxes and long text | A page rebuilt from Workday's public scripts and public notes. No live page |
 | Noticing that you submitted | Nothing. Maverick may not mark a Workday posting as applied |
@@ -165,7 +189,7 @@ MAVERICK_E2E_GREENHOUSE="https://job-boards.greenhouse.io/<board>/jobs/<posting 
 	cargo test -p maverick --test chrome a_live_greenhouse -- --ignored --nocapture
 ```
 
-Three more tests cover Workday. One fills a page rebuilt to look like a Workday application and runs with the first command above. The other two reach live sites and need a posting's address:
+Six more tests cover Workday. Three run with the first command above, against rebuilt pages: one fills a page rebuilt to look like a Workday application, and two take a page rebuilt to look like Workday's sign-in through the sign-in and the new account, with a made-up sign-in in place of the Keychain. The other three reach live sites and need a posting's address:
 
 ```sh
 MAVERICK_E2E_WORKDAY="https://<company>.wd1.myworkdayjobs.com/<site>/job/<place>/<posting id>" \
@@ -173,7 +197,9 @@ MAVERICK_E2E_WORKDAY="https://<company>.wd1.myworkdayjobs.com/<site>/job/<place>
 	cargo test -p maverick --test chrome a_live_workday_posting -- --ignored --nocapture
 ```
 
-That test reads the job, opens the application and expects the sign-in stop. It types nothing. For a posting whose application asks for no account, set `MAVERICK_E2E_WORKDAY_OPEN` and run `a_live_workday_page`. It fills the first page with made-up answers, uploads nothing and never leaves the page.
+That test reads the job, opens the application and expects the sign-in stop. It types nothing. With the same address, `a_live_workday_wall` types a made-up email address and password into the sign-in form and the create-account form, and presses nothing. No test reads your stored sign-in, and none presses **Sign In** or **Create Account** on a live site. For a posting whose application asks for no account, set `MAVERICK_E2E_WORKDAY_OPEN` and run `a_live_workday_page`. It fills the first page with made-up answers, uploads nothing and never leaves the page.
+
+`cargo test --workspace` also stores a made-up item in your login Keychain under `dev.maverick.test-<number>`, reads it back and deletes it.
 
 ## Layout
 

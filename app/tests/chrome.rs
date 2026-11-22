@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::apply::{FieldResult, FillError, Outcome, Source, System};
+use maverick_core::apply::{FieldResult, FillError, Outcome, Report, Source, System};
 use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
+use maverick_core::credentials::{Password, SignIn};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
 use maverick_core::greenhouse;
 use maverick_core::page::{Locator, Page, PageError};
@@ -594,8 +595,8 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
 
 /// Proves the part of Workday that needs no account, on a live posting: the job is read, the
 /// application is opened by way of "Apply Manually", and the sign-in wall is reported.
-/// It types nothing, creates no account and never signs in. Set `MAVERICK_E2E_WORKDAY` to a
-/// posting's address.
+/// It is given no sign-in and never reads the Keychain, so it types nothing, creates no account
+/// and never signs in. Set `MAVERICK_E2E_WORKDAY` to a posting's address.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs MAVERICK_E2E_CHROME and MAVERICK_E2E_WORKDAY, and reaches a live site"]
 async fn a_live_workday_posting_is_read_and_stops_at_the_sign_in_wall() {
@@ -622,10 +623,13 @@ async fn a_live_workday_posting_is_read_and_stops_at_the_sign_in_wall() {
     println!("description: {} characters", job.description.len());
     assert!(!job.job.is_empty() && !job.description.is_empty());
 
-    let wall = Err(FillError::SignInNeeded { system: "Workday" });
-    assert_eq!(workday::fill_saving_captures(&page, &answers, None).await, wall);
+    let wall = Err(FillError::SignInNeeded {
+        system: "Workday",
+        service: workday::SIGN_IN_SERVICE,
+    });
+    assert_eq!(workday::fill_with(&page, &answers, None, &NO_SIGN_IN).await, wall);
     // The tab is inside the application now, where the user signs in. A second run stops there too.
-    assert_eq!(workday::fill_saving_captures(&page, &answers, None).await, wall);
+    assert_eq!(workday::fill_with(&page, &answers, None, &NO_SIGN_IN).await, wall);
     let seen = page
         .evaluate(
             r#"({
@@ -648,6 +652,305 @@ async fn a_live_workday_posting_is_read_and_stops_at_the_sign_in_wall() {
         workday::posting_address(&posting),
         "the wall's address still names the posting"
     );
+}
+
+/// No stored sign-in. A fill given this never reads the Keychain and stops at a sign-in wall.
+const NO_SIGN_IN: Option<SignIn> = None;
+
+/// A made-up password with a quote, a backslash, a space and a character outside ASCII.
+const MADE_UP_PASSWORD: &str = "Made-up 1 \"pass\\word\" é";
+
+/// A made-up sign-in, handed to a fill in place of the Keychain.
+fn made_up_sign_in() -> Option<SignIn> {
+    Some(SignIn {
+        account: "ada@example.com".into(),
+        password: Password::new(MADE_UP_PASSWORD),
+    })
+}
+
+/// A page built to look like Workday's sign-in wall, with a script that plays Workday's part
+/// after a press. Nobody signed in to Workday or created an account to make it: see the comment
+/// at its top.
+const WORKDAY_WALL: &str = include_str!("workday_wall.html");
+
+/// Opens the reconstructed wall, with what it should do in `outcome`, and runs a fill against it.
+/// Returns the fill's result and what the page saw: each press of a submit button, in order.
+async fn fill_behind_the_reconstructed_wall(
+    page: &Page,
+    wall: &str,
+    outcome: &str,
+    sign_in: &Option<SignIn>,
+) -> (Result<Report, FillError>, serde_json::Value) {
+    page.navigate(&format!("{wall}?{outcome}")).await.unwrap();
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": "/nowhere/Ada-Example-Resume.pdf",
+        "rules": [{ "any": ["first name"], "answer": "Ada" }],
+    }))
+    .unwrap();
+    let job = workday::Job {
+        job: "Backend Engineer, Springfield".into(),
+        description: "Build things.".into(),
+    };
+    let result = workday::fill_application(page, &answers, job, None, sign_in).await;
+    let seen = page
+        .evaluate(
+            r#"({
+                presses: JSON.parse(sessionStorage.presses ?? "[]"),
+                path: location.pathname,
+                hidden: document.querySelector('[data-automation-id="beecatcher"]').value,
+                typed: [...document.querySelectorAll('[data-automation-id="signInContent"] input')].map((input) => input.value).join(""),
+                first: document.getElementById("name--legalName--firstName")?.value ?? null,
+                advanced: window.advanced === true,
+            })"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen["hidden"], "", "nothing was typed into the field for robots");
+    assert_eq!(seen["advanced"], false, "the application was not moved on");
+    (result, seen)
+}
+
+/// What the reconstructed wall records for a press that reached its made-up server.
+fn sent(form: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut press = json!({ "form": form, "email": "ada@example.com", "password": MADE_UP_PASSWORD, "sent": true });
+    press
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    press
+}
+
+/// Runs the whole sign-in and create-account flow against `WORKDAY_WALL`, a RECONSTRUCTION, with
+/// a made-up sign-in in place of the Keychain. Nothing after a press of Sign In or Create Account
+/// was ever seen on a live Workday site, so this proves the flow against what Workday's public
+/// script says the wall does, not against Workday.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_reconstructed_workday_wall_is_passed_by_signing_in_or_by_creating_the_account() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let wall = serve(WORKDAY_WALL).await;
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    let sign_in = made_up_sign_in();
+
+    // The wall opens on the create-account form, as most live walls do. The sign-in goes through.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=ok", &sign_in).await;
+    let report = result.unwrap();
+    let note = report.note.unwrap();
+    assert!(
+        note.starts_with("Signed in to Workday with the sign-in in your Keychain. "),
+        "{note}"
+    );
+    assert!(note.contains("Check every answer"), "{note}");
+    assert_eq!(seen["presses"], json!([sent("sign-in", json!({}))]));
+    assert_eq!(seen["first"], "Ada", "the application page behind the wall was filled");
+
+    // The wall opens on the chooser. Workday refuses the sign-in, so the account is created, with
+    // the consent box ticked. A notice that shows for a moment is not taken for a stop.
+    let outcome = "start=chooser&consent=1&signin=wrong&create=greets";
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, outcome, &sign_in).await;
+    let note = result.unwrap().note.unwrap();
+    assert!(
+        note.starts_with(
+            "Created your Workday account at this employer with the sign-in in your Keychain, \
+             and ticked the consent box on its form. "
+        ),
+        "{note}"
+    );
+    let created = json!({ "verify": MADE_UP_PASSWORD, "consent": true });
+    assert_eq!(
+        seen["presses"],
+        json!([sent("sign-in", json!({})), sent("create", created)])
+    );
+    assert_eq!(seen["first"], "Ada");
+
+    // A form without a consent box.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=wrong&create=ok", &sign_in).await;
+    let note = result.unwrap().note.unwrap();
+    assert!(note.starts_with("Created your Workday account at this employer with the sign-in in your Keychain. "));
+    assert_eq!(
+        seen["presses"][1],
+        sent("create", json!({ "verify": MADE_UP_PASSWORD, "consent": null }))
+    );
+}
+
+/// The stops of the flow, against `WORKDAY_WALL`, the same RECONSTRUCTION: no stored sign-in, an
+/// email address to verify, and refusals. Each fill presses Sign In at most once and Create
+/// Account at most once, and no error holds the password.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_reconstructed_workday_wall_stops_the_fill_after_one_try_of_each_kind() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let wall = serve(WORKDAY_WALL).await;
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    let sign_in = made_up_sign_in();
+    let forms = |seen: &serde_json::Value| -> Vec<(String, bool)> {
+        let press = |press: &serde_json::Value| (press["form"].as_str().unwrap().to_owned(), press["sent"] == true);
+        seen["presses"].as_array().unwrap().iter().map(press).collect()
+    };
+    let (signed_in, created) = (("sign-in".to_owned(), true), ("create".to_owned(), true));
+    let stopped = |result: Result<Report, FillError>| -> String {
+        let error = result.expect_err("the fill stopped at the wall");
+        let told = format!("{error}");
+        assert!(matches!(error, FillError::SignIn(_)), "{error:?}");
+        assert!(
+            !format!("{error:?} {told}").contains("Made-up 1"),
+            "an error holds the password: {told}"
+        );
+        told
+    };
+
+    // With no stored sign-in the fill stops as it always did, types nothing, and says how to store one.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=ok", &NO_SIGN_IN).await;
+    let needed = result.unwrap_err();
+    assert_eq!(
+        needed,
+        FillError::SignInNeeded {
+            system: "Workday",
+            service: "dev.maverick.workday"
+        }
+    );
+    let told = needed.to_string();
+    assert!(
+        told.contains("`security add-generic-password -s dev.maverick.workday -a <email> -w`"),
+        "{told}"
+    );
+    assert!(told.contains("type the password at the prompt"), "{told}");
+    assert_eq!((forms(&seen), &seen["typed"]), (vec![], &json!("")));
+
+    // Workday wants the new account's email address verified, and moves to its sign-in page.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=wrong&create=verify", &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("asked it to create your account"), "{told}");
+    assert!(told.contains("We sent an email to verify your account."), "{told}");
+    assert!(
+        told.contains("open the email from Workday and verify. Then click Fill form again."),
+        "{told}"
+    );
+    assert_eq!(forms(&seen), [signed_in.clone(), created.clone()]);
+    assert_eq!(seen["path"], "/login");
+
+    // The account exists and its email address is unverified. No account is created.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=unverified", &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("may need its email address verified"), "{told}");
+    assert!(told.contains("your account may need verification"), "{told}");
+    assert_eq!(forms(&seen), std::slice::from_ref(&signed_in));
+
+    // Both are refused: a wrong password for an account that exists. Each was tried once.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=wrong&create=exists", &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("Wrong email address or password."), "{told}");
+    assert!(
+        told.contains("An account with this email address exists already."),
+        "{told}"
+    );
+    assert!(told.contains("tried each once"), "{told}");
+    assert_eq!(forms(&seen), [signed_in.clone(), created.clone()]);
+
+    // The employer's rules refuse the password before anything is sent.
+    let outcome = "consent=1&signin=wrong&create=weak";
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, outcome, &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("The password must hold a made-up thing."), "{told}");
+    assert_eq!(forms(&seen), [signed_in.clone(), ("create".to_owned(), false)]);
+
+    // The sign-in form itself refuses what was typed. That says nothing about an account, so none is created.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=invalid", &sign_in).await;
+    let told = stopped(result);
+    assert!(
+        told.contains("Enter a valid email address.") && told.contains("created no account"),
+        "{told}"
+    );
+    assert_eq!(forms(&seen), [("sign-in".to_owned(), false)]);
+
+    // Should Workday ever repeat the password in its own message, the message is dropped.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "signin=echo&create=exists", &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("held the password, so it is left out"), "{told}");
+    assert_eq!(forms(&seen), [signed_in, created]);
+
+    // A form Maverick does not know gets no typing and no press.
+    let (result, seen) = fill_behind_the_reconstructed_wall(&page, &wall, "start=other", &sign_in).await;
+    let told = stopped(result);
+    assert!(told.contains("a sign-in page that Maverick does not know"), "{told}");
+    assert_eq!((forms(&seen), &seen["typed"]), (vec![], &json!("")));
+}
+
+/// Proves, on a live posting, every step of the sign-in flow that comes BEFORE a press: the wall's
+/// forms are brought up, a MADE-UP email and password are typed into them and read back, the
+/// consent box is ticked, and a press would land on Workday's click filter.
+/// It presses neither Sign In nor Create Account, so it tries no sign-in and creates no account,
+/// and it never reads the Keychain. Set `MAVERICK_E2E_WORKDAY` to a posting's address.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME and MAVERICK_E2E_WORKDAY, and reaches a live site"]
+async fn a_live_workday_wall_takes_a_made_up_sign_in_and_nothing_is_pressed() {
+    let posting = std::env::var("MAVERICK_E2E_WORKDAY").expect("MAVERICK_E2E_WORKDAY");
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": "/nowhere/Ada-Example-Resume.pdf",
+    }))
+    .unwrap();
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    page.navigate(&posting).await.unwrap();
+    let wall = workday::fill_with(&page, &answers, None, &NO_SIGN_IN).await;
+    assert!(matches!(wall, Err(FillError::SignInNeeded { .. })), "{wall:?}");
+
+    let rehearsal = workday::rehearse_wall(&page, &made_up_sign_in().unwrap())
+        .await
+        .unwrap();
+    println!("consent box: {}", rehearsal.consented);
+    assert_eq!(
+        (rehearsal.create_press.as_str(), rehearsal.sign_in_press.as_str()),
+        ("click_filter", "click_filter")
+    );
+    let seen = page
+        .evaluate(
+            r#"({
+                path: location.pathname,
+                title: document.querySelector('[data-automation-id="signInContent"] #authViewTitle')?.textContent,
+                typed: [...document.querySelectorAll('[data-automation-id="signInContent"] input')].map((input) => input.value),
+                hidden: document.querySelector('[data-automation-id="beecatcher"]')?.value ?? null,
+                said: document.querySelectorAll('[data-automation-id="errorMessage"], [data-automation-id="alertMessage"], [data-automation-id="inputAlert"]').length,
+            })"#,
+        )
+        .await
+        .unwrap();
+    println!("the wall has a field for robots: {}", !seen["hidden"].is_null());
+    assert!(
+        seen["path"].as_str().unwrap().ends_with("/apply/applyManually"),
+        "the wall was not left"
+    );
+    assert_eq!(seen["title"], "Sign In");
+    assert_eq!(seen["typed"], json!(["ada@example.com", MADE_UP_PASSWORD]));
+    assert!(
+        seen["hidden"].is_null() || seen["hidden"] == "",
+        "nothing was typed into the field for robots"
+    );
+    assert_eq!(seen["said"], 0, "nothing was sent, so Workday said nothing");
 }
 
 /// A few employers show a Workday application without an account. This fills the first page of
@@ -686,7 +989,7 @@ async fn a_live_workday_page_that_needs_no_account_is_filled_and_not_left() {
     let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
     page.navigate(&posting).await.unwrap();
     let captures = scratch.path().join("captures");
-    let fill = || workday::fill_saving_captures(&page, &answers, Some(&captures));
+    let fill = || workday::fill_with(&page, &answers, Some(&captures), &NO_SIGN_IN);
     let outcomes = fill().await.unwrap().outcomes;
     for outcome in &outcomes {
         let required = if outcome.required { "required" } else { "optional" };
