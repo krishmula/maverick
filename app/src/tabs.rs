@@ -1,14 +1,14 @@
 //! The searchable list of browser tabs.
 
-use gpui_kit::component::button::Button;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{App, Context, ElementId, Entity, ParentElement as _, SharedString, Styled as _, Task, Window, div};
+use gpui_kit::component::{IndexPath, h_flex, v_flex};
+use gpui_kit::{App, Context, ElementId, Entity, ParentElement as _, Styled as _, Task, Window};
 use maverick_core::apply::System;
 use maverick_core::bridge::{ConnectionId, Tab};
 
-use crate::browser::Browser;
+use crate::browser::{Browser, Fill, Subject};
+use crate::report::Tally;
+use crate::ui::{self, Palette, Signal};
 
 pub struct TabList {
     browser: Entity<Browser>,
@@ -36,6 +36,10 @@ impl TabList {
 
     pub fn tab_at(&self, ix: IndexPath) -> Option<&Tab> {
         self.matches.get(ix.row)
+    }
+
+    pub fn selected_tab(&self) -> Option<&Tab> {
+        self.tab_at(self.selected?)
     }
 
     pub fn len(&self) -> usize {
@@ -94,61 +98,65 @@ impl ListDelegate for TabList {
 
     fn render_item(&mut self, ix: IndexPath, _: &mut Window, cx: &mut Context<ListState<Self>>) -> Option<ListItem> {
         let held = self.matches.get(ix.row)?;
+        let palette = Palette::of(cx);
+        let selected = self.selected == Some(ix);
+        let tone = if selected { palette.ink } else { palette.muted };
         let title = if held.tab.title.is_empty() {
             &held.tab.url
         } else {
             &held.tab.title
         };
+        let fill = self
+            .browser
+            .read(cx)
+            .fill_of(&Subject::Tab(held.connection, held.tab.id));
+        let mark = match fill {
+            Some(Fill::Running { .. }) => Some(ui::boxed("filling", palette.muted)),
+            Some(Fill::Failed { .. }) => Some(ui::chip(Signal::Failed, "failed", &palette)),
+            Some(Fill::Done { report, .. }) => Some(match Tally::of(report) {
+                Tally { failed: 1.., .. } => ui::chip(Signal::Failed, "failed", &palette),
+                Tally { yours: 0, .. } => ui::chip(Signal::Done, "filled", &palette),
+                Tally { yours, .. } => ui::chip(Signal::Yours, format!("{yours} yours"), &palette),
+            }),
+            Some(Fill::Idle) | None => None,
+        };
+        let fill_button = System::of(&held.tab.url).is_some().then(|| {
+            let browser = self.browser.clone();
+            let tab = held.clone();
+            let list = cx.entity().downgrade();
+            ui::button(
+                fill_button_id(held.connection, held.tab.id),
+                "Fill form",
+                ui::quiet_face("fill form", &palette),
+            )
+            .tip("Fill this application with your standard answers. You review it and click Submit.")
+            .on_click(move |_, window, cx| {
+                browser.update(cx, |browser, cx| browser.fill_form(&tab, cx));
+                // The report shows for the selected row, so the row that was filled becomes it.
+                list.update(cx, |list, cx| list.set_selected_index(Some(ix), window, cx))
+                    .ok();
+            })
+        });
         let row = h_flex()
             .gap_3()
+            // The square is solid for the tab Chrome shows in its window.
+            .child(ui::square(if held.tab.active { tone } else { palette.line }))
             .child(
-                div()
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(title.clone())),
+                    .child(ui::serif(title.clone()).truncate().text_color(tone))
+                    .child(ui::caps(host_of(&held.tab.url)).truncate().text_color(palette.faint)),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .max_w_2_5()
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(host_of(&held.tab.url).to_owned())),
-            )
-            .when(System::of(&held.tab.url).is_some(), |row| {
-                let browser = self.browser.clone();
-                let tab = held.clone();
-                row.child(
-                    Button::new(fill_button_id(held.connection, held.tab.id))
-                        .xsmall()
-                        .label("Fill form")
-                        .tooltip("Fill this application with your standard answers. You review it and click Submit.")
-                        .on_click(move |_, _, cx| browser.update(cx, |browser, cx| browser.fill_form(&tab, cx))),
-                )
-            })
-            .when(held.tab.active, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().success)
-                        .child("Active"),
-                )
-            });
-        Some(
-            ListItem::new(row_id(held.connection, held.tab.id))
-                .selected(self.selected == Some(ix))
-                .child(row),
-        )
+            .children(mark)
+            .children(fill_button);
+        Some(ui::row(row_id(held.connection, held.tab.id), selected, row, &palette))
     }
 
     fn render_empty(&mut self, _: &mut Window, cx: &mut Context<ListState<Self>>) -> impl gpui_kit::IntoElement {
-        div()
-            .p_3()
-            .text_color(cx.theme().muted_foreground)
-            .child(SharedString::from(format!("No tab matches \"{}\".", self.query)))
+        ui::serif(format!("No tab matches \"{}\".", self.query))
+            .p_4()
+            .text_color(Palette::of(cx).muted)
     }
 
     fn set_selected_index(&mut self, ix: Option<IndexPath>, _: &mut Window, cx: &mut Context<ListState<Self>>) {

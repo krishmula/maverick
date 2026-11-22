@@ -5,6 +5,7 @@ pub mod apply;
 pub mod ashby;
 pub mod bridge;
 pub mod extension;
+pub mod greenhouse;
 pub mod jobs;
 pub mod model;
 pub mod page;
@@ -12,6 +13,7 @@ pub mod relay;
 pub mod rules;
 pub mod store;
 pub mod tracker;
+pub mod workday;
 pub mod xlsx;
 
 use std::path::PathBuf;

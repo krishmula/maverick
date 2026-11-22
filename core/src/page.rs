@@ -55,6 +55,7 @@ pub enum Key {
     Tab,
     Escape,
     ArrowDown,
+    ArrowUp,
 }
 
 impl Key {
@@ -64,6 +65,7 @@ impl Key {
             Self::Tab => "Tab",
             Self::Escape => "Escape",
             Self::ArrowDown => "ArrowDown",
+            Self::ArrowUp => "ArrowUp",
         }
     }
 
@@ -73,6 +75,7 @@ impl Key {
             Self::Tab => 9,
             Self::Escape => 27,
             Self::ArrowDown => 40,
+            Self::ArrowUp => 38,
         }
     }
 }
