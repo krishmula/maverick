@@ -52,6 +52,8 @@ pub struct MainView {
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     mav: Entity<Mav>,
+    /// How many of the applications sent in this run Mav has offered a follow-up for.
+    followed_up: usize,
     band: Band,
     /// What the last funnel pass did, for the bar.
     funnel_status: Option<String>,
@@ -72,7 +74,8 @@ impl MainView {
         let showing = if jobs.is_empty() { Showing::Tabs } else { Showing::Jobs };
         let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
-        let mav = cx.new(|cx| Mav::new(browser.read(cx).background()));
+        let background = browser.read(cx).background();
+        let mav = cx.new(|cx| Mav::new(background, window, cx));
         let _subscriptions = vec![
             // The bar counts what is due.
             cx.observe(&mav, |_, _, cx| cx.notify()),
@@ -88,6 +91,7 @@ impl MainView {
                 for address in &applied {
                     this.band.mark_applied(address);
                 }
+                this.offer_follow_ups(cx);
                 this.jobs.update(cx, |jobs, cx| {
                     let listed = jobs.delegate().len();
                     for address in &applied {
@@ -149,6 +153,7 @@ impl MainView {
             jobs,
             tabs,
             mav,
+            followed_up: 0,
             band: Band::new(cells),
             funnel_status: None,
             _funnel: None,
@@ -183,9 +188,31 @@ impl MainView {
         match showing {
             Showing::Tabs => self.tabs.update(cx, |tabs, cx| tabs.focus(window, cx)),
             Showing::Jobs => self.jobs.update(cx, |jobs, cx| jobs.focus(window, cx)),
-            Showing::Mav => self.mav.update(cx, |mav, cx| mav.load(cx)),
+            Showing::Mav => self.mav.update(cx, |mav, cx| {
+                mav.load(cx);
+                mav.focus(window, cx);
+            }),
         }
         cx.notify();
+    }
+
+    /// Offers a follow-up task in Mav for each application that went through since the last offer.
+    fn offer_follow_ups(&mut self, cx: &mut Context<Self>) {
+        let applied = self.browser.read(cx).applied();
+        let new: Vec<String> = applied[self.followed_up.min(applied.len())..]
+            .iter()
+            .map(|sent| sent.title.clone())
+            .collect();
+        self.followed_up = applied.len();
+        let now = jiff::ZonedDateTime::now();
+        self.mav.update(cx, |mav, cx| {
+            for title in new {
+                if let Some(action) = maverick_core::mav::follow_up(&title, &now, &mav.lists()) {
+                    let why = format!("Your application for {title} went through. Follow up in a week?");
+                    mav.suggest(why, action, cx);
+                }
+            }
+        });
     }
 
     /// What Enter does to a job: opens its form and fills it, or, once that is done,

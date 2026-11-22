@@ -309,6 +309,39 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `maverick mav <message>`: shows what Mav would propose. It never writes anything.
+pub fn mav(message: &str) -> Result<(), Box<dyn Error>> {
+    use maverick_core::mav::{self, Context};
+
+    if message.trim().is_empty() {
+        return Err("usage: maverick mav <what to remember or plan>".into());
+    }
+    let runtime = runtime()?;
+    let reply = runtime.block_on(async {
+        let context = Context::read(jiff::ZonedDateTime::now()).await?;
+        println!(
+            "Read {} lists, {} tasks and {} events.",
+            context.lists.len(),
+            context.agenda.overdue.len() + context.agenda.today.len() + context.agenda.upcoming.len(),
+            context.events.len()
+        );
+        mav::ask(message, &[], &context).await
+    })?;
+    println!("Mav: {}", reply.text);
+    for proposal in reply.proposals {
+        match proposal {
+            Ok(action) => {
+                println!("  [{}] {}", action.kind(), action.title());
+                for (label, value) in action.facts() {
+                    println!("      {label:<8} {value}");
+                }
+            }
+            Err(why) => println!("  [refused] {why}"),
+        }
+    }
+    Ok(())
+}
+
 /// `maverick ticktick <token|today|forget>`: connects TickTick and shows the agenda.
 pub fn ticktick(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::credentials::Password;

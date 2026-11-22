@@ -205,7 +205,7 @@ The report counts what the rules would skip and lists each posting where the rul
 
 ## Connect Google accounts
 
-Maverick can connect any number of Google accounts and use Sheets, Drive, Gmail and Calendar for each one. It signs in with your own OAuth client, so first create one:
+Maverick can connect any number of Google accounts and use Sheets, Drive, Gmail and Calendar for each one. Calendar access includes adding events, which Mav uses for planned blocks. It signs in with your own OAuth client, so first create one:
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create a project and enable the Google Sheets, Google Drive, Gmail and Google Calendar APIs.
 2. Set up the OAuth consent screen as **External**, add each account you will connect as a test user, and publish the app. Sign-ins to an app that stays in testing expire after 7 days.
@@ -223,9 +223,23 @@ maverick google remove <email>
 
 The client secret and each account's refresh token are kept in the macOS Keychain, under `dev.maverick.google-client` and `dev.maverick.google`. The list of accounts, which holds no secret, is `google-accounts.json` in the data directory. Google warns that the app is not verified. That warning is expected for a client you made yourself.
 
-## Connect TickTick
+## Talk to Mav
 
-The **mav** view shows your undone TickTick tasks: overdue ones from the last week, today's, and the coming week's. It reads them each time you open the view. Tasks with no date are left out.
+The **mav** view is a conversation with Mav, your planning assistant. Type what to remember or plan and press Enter, for example "remind me to follow up with the recruiter Tuesday at 10" or "find me 2 hours tomorrow for take-home prep".
+
+Mav proposes each TickTick task or calendar block as a card. Nothing is written until you click **Confirm** on the card. **Skip** drops it. A block that overlaps a busy event lists the clash in pink before you confirm. Questions such as "what is left today?" get an answer and no cards.
+
+The right side shows today's and tomorrow's events, then your undone TickTick tasks: overdue ones from the last week, today's, and the coming week's. The number next to **mav** in the bar counts the tasks that are overdue or due today.
+
+When an application goes through, Mav offers a task to follow up a week later at 10:00, in a list whose name contains "job", or else the Inbox.
+
+Mav runs the `claude` command you are signed in to, like the form filler. To see what Mav would propose without the window, and without writing anything:
+
+```sh
+maverick mav "find me 2 hours tomorrow for take-home prep"
+```
+
+### Connect TickTick
 
 Maverick uses a personal API token. In TickTick on the web, open **Settings**, then **Account**, then **API Token**, and create one. Then store it:
 
@@ -236,6 +250,12 @@ maverick ticktick forget
 ```
 
 The token is kept in the macOS Keychain under `dev.maverick.ticktick`.
+
+### Connect your calendar
+
+Mav reads the primary calendar of every Google account you connected (see [Connect Google accounts](#connect-google-accounts)). It adds blocks to the first account that granted permission to change events. An account connected before that permission was added only allows reading: run `maverick google add` and sign in to that account again to grant it.
+
+Free time is counted between 8:00 and 22:00. Events marked free do not block time.
 
 ## Link the live tracker
 
