@@ -184,6 +184,11 @@ impl Browser {
         .detach();
     }
 
+    /// The tokio runtime that runs work off the main thread.
+    pub fn background(&self) -> Handle {
+        self.background.clone()
+    }
+
     /// True when Chrome runs an older extension than this app ships and has not reloaded it.
     pub fn extension_is_outdated(&self) -> bool {
         self.extension_is_outdated

@@ -4,6 +4,7 @@ mod cli;
 mod icon;
 mod jobs;
 mod main_view;
+mod mav;
 mod report;
 mod schedule;
 mod tabs;
@@ -50,6 +51,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("run") => return cli::run(),
         Some("tracker") => return cli::tracker(&arguments.collect::<Vec<_>>()),
         Some("google") => return cli::google(&arguments.collect::<Vec<_>>()),
+        Some("ticktick") => return cli::ticktick(&arguments.collect::<Vec<_>>()),
         Some("score") => {
             let mut limit = maverick_core::score::RUN_CAP;
             let mut dry_run = false;

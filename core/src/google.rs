@@ -7,11 +7,9 @@
 //! The OAuth client is the user's own, made in their Google Cloud project. Its id and secret are
 //! in the Keychain too, never in this repository.
 //!
-//! Requests go through `/usr/bin/curl` with the token passed on its input, so no token ever shows
-//! in the list of processes.
+//! Requests go through `crate::http`, so no token ever shows in the list of processes.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -22,9 +20,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
-use tokio::process::Command;
 
 use crate::credentials::{self, Password, SignIns as _};
+use crate::http::{self, curl, form_encoded, quoted};
 
 /// The Keychain item that holds the OAuth client: the account is its id, the password its secret.
 pub const CLIENT_SERVICE: &str = "dev.maverick.google-client";
@@ -45,7 +43,6 @@ pub const SCOPES: &[&str] = &["openid", "email", SHEETS, DRIVE_READ, GMAIL_READ,
 
 /// How long the browser sign-in may take before Maverick stops waiting.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(5 * 60);
-const TIME_LIMIT: Duration = Duration::from_secs(60);
 
 /// The user's OAuth client.
 #[derive(Clone, Debug)]
@@ -198,34 +195,9 @@ pub async fn access_token(client: &Client, email: &str) -> Result<Password, Stri
         .ok_or_else(|| "Google's token reply had no access token".to_owned())
 }
 
-/// One authorized call. `body` is sent as JSON. The reply is JSON; an empty reply is `null`.
+/// One authorized call to a Google API.
 pub async fn call(token: &Password, method: &str, url: &str, body: Option<&Value>) -> Result<Value, String> {
-    let mut config = format!(
-        "url = {}\nrequest = {}\nheader = {}\n",
-        quoted(url),
-        quoted(method),
-        quoted(&format!("Authorization: Bearer {}", token.reveal()))
-    );
-    if let Some(body) = body {
-        config.push_str(&format!(
-            "header = \"Content-Type: application/json\"\ndata-binary = {}\n",
-            quoted(&body.to_string())
-        ));
-    }
-    let (status, reply) = curl(&config).await?;
-    let json: Value = if reply.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&reply).map_err(|_| format!("Google answered with status {status} and no JSON"))?
-    };
-    if !(200..300).contains(&status) {
-        let message = json["error"]["message"]
-            .as_str()
-            .or(json["error_description"].as_str())
-            .unwrap_or("no reason given");
-        return Err(format!("Google answered with status {status}: {message}"));
-    }
-    Ok(json)
+    http::call("Google", token, method, url, body).await
 }
 
 async fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<Value, String> {
@@ -248,76 +220,6 @@ async fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<Value, String> 
         return Err(format!("Google answered with status {status}: {why}"));
     }
     Ok(json)
-}
-
-/// Runs curl with its options on standard input, and returns the status and the body.
-async fn curl(config: &str) -> Result<(u16, String), String> {
-    let mut child = Command::new("/usr/bin/curl")
-        .args(["--silent", "--show-error", "--config", "-"])
-        .args([
-            "--max-time",
-            &TIME_LIMIT.as_secs().to_string(),
-            "--write-out",
-            "\n%{http_code}",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("could not run curl: {error}"))?;
-    let mut input = child.stdin.take().expect("the input is piped");
-    input
-        .write_all(config.as_bytes())
-        .await
-        .map_err(|error| format!("could not talk to curl: {error}"))?;
-    drop(input);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("curl failed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "the request failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (body, status) = text.rsplit_once('\n').ok_or("curl gave no status")?;
-    Ok((
-        status.trim().parse().map_err(|_| "curl gave no status")?,
-        body.to_owned(),
-    ))
-}
-
-/// A value for a curl config file: in double quotes, with `\` and `"` escaped and no line breaks.
-fn quoted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn form_encoded(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 fn authorize_url(client_id: &str, redirect: &str, challenge: &str, state: &str) -> String {
@@ -482,13 +384,6 @@ mod tests {
         let reply = json!({ "id_token": format!("header.{claims}.signature") });
         assert_eq!(email_in(&reply), Ok("ada@example.com".to_owned()));
         assert!(email_in(&json!({ "id_token": "bad" })).is_err());
-    }
-
-    #[test]
-    fn config_values_and_form_fields_are_escaped() {
-        assert_eq!(quoted(r#"a "b" \c"#), r#""a \"b\" \\c""#);
-        assert_eq!(quoted("x\ny"), r#""x\ny""#);
-        assert_eq!(form_encoded("1//a b&c=d"), "1%2F%2Fa%20b%26c%3Dd");
     }
 
     #[test]

@@ -44,9 +44,9 @@ After an app update, Maverick asks the extension to reload itself. Extension 0.2
 
 ## The window
 
-The bar at the top switches between two lists, **jobs** and **tabs**, and shows the link to Chrome. Click the link to measure the round trip again.
+The bar at the top switches between the **jobs** and **tabs** lists and the **mav** view, and shows the link to Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
 
-Under the bar is the band. Each cell is one posting from your tracker, oldest at the left:
+On the jobs and tabs lists, the band is under the bar. Each cell is one posting from your tracker, oldest at the left:
 
 - An orange cell is an open posting, one that is on the jobs list.
 - A teal cell is a posting you applied to.
@@ -222,6 +222,20 @@ maverick google remove <email>
 ```
 
 The client secret and each account's refresh token are kept in the macOS Keychain, under `dev.maverick.google-client` and `dev.maverick.google`. The list of accounts, which holds no secret, is `google-accounts.json` in the data directory. Google warns that the app is not verified. That warning is expected for a client you made yourself.
+
+## Connect TickTick
+
+The **mav** view shows your undone TickTick tasks: overdue ones from the last week, today's, and the coming week's. It reads them each time you open the view. Tasks with no date are left out.
+
+Maverick uses a personal API token. In TickTick on the web, open **Settings**, then **Account**, then **API Token**, and create one. Then store it:
+
+```sh
+maverick ticktick token < file-with-the-token   # checks the token with TickTick, then stores it
+maverick ticktick today                         # prints the same agenda as the mav view
+maverick ticktick forget
+```
+
+The token is kept in the macOS Keychain under `dev.maverick.ticktick`.
 
 ## Link the live tracker
 
