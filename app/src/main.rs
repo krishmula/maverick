@@ -9,6 +9,7 @@ mod mav;
 mod models;
 mod report;
 mod schedule;
+mod setup;
 mod tabs;
 mod ui;
 
@@ -157,7 +158,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
-                    let mut view = MainView::new(browser, jobs, cells, icon_file, window, cx);
+                    let mut view = MainView::new(browser, jobs, cells, icon_file, !setup::done(), window, cx);
                     if let Some(funnel) = funnel {
                         view.run_funnel(funnel, window, cx);
                     }

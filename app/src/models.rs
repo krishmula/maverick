@@ -68,6 +68,13 @@ impl Models {
         }
     }
 
+    /// True when at least one provider is installed or keyed.
+    pub fn any_ready(&self) -> bool {
+        self.statuses
+            .values()
+            .any(|status| matches!(status, Status::Ready(_) | Status::Present(_)))
+    }
+
     /// Reads the saved choices and takes a quick look at every provider, at no cost.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.choices = Choices::current();

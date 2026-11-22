@@ -19,11 +19,13 @@ use gpui_kit::TestSupportExt as _;
 use crate::band::{Band, Cell, Mark};
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::connections::Connections;
+use crate::connections::OpenSetup;
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
 use crate::report;
 use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Refreshed};
+use crate::setup::{Finished, Setup};
 use crate::tabs::{TabList, host_of};
 use crate::ui::{self, Palette, Signal};
 
@@ -45,6 +47,8 @@ enum Showing {
     Mav,
     /// The Google profiles, TickTick, the model and Chrome.
     Connections,
+    /// The first-run guide.
+    Setup,
 }
 
 pub struct MainView {
@@ -56,6 +60,7 @@ pub struct MainView {
     tabs: Entity<ListState<TabList>>,
     mav: Entity<Mav>,
     connections: Entity<Connections>,
+    setup: Entity<Setup>,
     /// How many of the applications sent in this run Mav has offered a follow-up for.
     followed_up: usize,
     band: Band,
@@ -72,16 +77,31 @@ impl MainView {
         jobs: Vec<Job>,
         cells: Vec<Cell>,
         icon_file: Option<PathBuf>,
+        first_run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let showing = if jobs.is_empty() { Showing::Tabs } else { Showing::Jobs };
+        // A first start opens the guide, so a new user sets up a model before anything needs one.
+        let showing = if first_run {
+            Showing::Setup
+        } else if jobs.is_empty() {
+            Showing::Tabs
+        } else {
+            Showing::Jobs
+        };
         let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
         let mav = cx.new(|cx| Mav::new(background, window, cx));
         let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
+        let setup = cx.new(|cx| Setup::new(connections.clone(), cx));
         let _subscriptions = vec![
+            cx.subscribe_in(&setup, window, |this, _, _: &Finished, window, cx| {
+                this.show(Showing::Connections, window, cx);
+            }),
+            cx.subscribe_in(&connections, window, |this, _, _: &OpenSetup, window, cx| {
+                this.show(Showing::Setup, window, cx);
+            }),
             // The bar counts what is due.
             cx.observe(&mav, |_, _, cx| cx.notify()),
             cx.observe_in(&browser, window, |this, browser, window, cx| {
@@ -159,6 +179,7 @@ impl MainView {
             tabs,
             mav,
             connections,
+            setup,
             followed_up: 0,
             band: Band::new(cells),
             funnel_status: None,
@@ -198,9 +219,11 @@ impl MainView {
                 mav.load(cx);
                 mav.focus(window, cx);
             }),
-            Showing::Connections => self
-                .connections
-                .update(cx, |connections, cx| connections.refresh(window, cx)),
+            Showing::Connections => self.connections.update(cx, |connections, cx| {
+                connections.show_only(None, cx);
+                connections.refresh(window, cx);
+            }),
+            Showing::Setup => self.setup.update(cx, |setup, cx| setup.start(window, cx)),
         }
         cx.notify();
     }
@@ -539,7 +562,7 @@ impl MainView {
                 Some(tab) => self.tab_pane(&tab, palette, cx),
                 None => v_flex(),
             },
-            Showing::Mav | Showing::Connections => v_flex(),
+            Showing::Mav | Showing::Connections | Showing::Setup => v_flex(),
         }
     }
 
@@ -894,6 +917,8 @@ impl Render for MainView {
                     .min_h_0()
                     .child(self.connections.clone())
                     .into_any_element()
+            } else if self.showing == Showing::Setup {
+                div().flex_1().min_h_0().child(self.setup.clone()).into_any_element()
             } else if connected {
                 h_flex()
                     .flex_1()
@@ -910,9 +935,11 @@ impl Render for MainView {
                                 Showing::Tabs => List::new(&self.tabs)
                                     .search_placeholder("search tabs")
                                     .into_any_element(),
-                                Showing::Jobs | Showing::Mav | Showing::Connections => List::new(&self.jobs)
-                                    .search_placeholder("search jobs")
-                                    .into_any_element(),
+                                Showing::Jobs | Showing::Mav | Showing::Connections | Showing::Setup => {
+                                    List::new(&self.jobs)
+                                        .search_placeholder("search jobs")
+                                        .into_any_element()
+                                }
                             }),
                     )
                     .child(
@@ -1060,7 +1087,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), icon_file, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), icon_file, false, window, cx))
             })
             .expect("the test window opens")
         });
