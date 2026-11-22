@@ -239,11 +239,15 @@ Mav runs the `claude` command you are signed in to, like the form filler. To see
 maverick mav "find me 2 hours tomorrow for take-home prep"
 ```
 
+### First start
+
+The first time Maverick opens, a guide walks through four steps: choose a model, connect TickTick, connect Google, and connect Chrome. Only the model is required; the rest can be skipped, and **later** closes the guide. **run setup again** under **connections** opens it again. Each step shows the same controls as **connections**.
+
 ### Connections
 
 **connections** in the bar shows everything Maverick is linked to:
 
-- **Google profiles.** Up to 5 Google accounts, each named by you, such as Work or School. Click a profile to rename it, choose which of its calendars Mav reads (the primary one unless you choose others), and mark the one profile new calendar blocks go to. Mav knows the names, so "put it on my school calendar" goes to School. **sign in again** in orange means the account has not granted something Maverick now asks for, such as adding events. **+ add account** opens the Google sign-in in your browser.
+- **Google profiles.** Before the first account, paste the ID and secret of your Google OAuth client (a Desktop app client from the Google Cloud console; see [Connect Google accounts](#connect-google-accounts)). Up to 5 Google accounts, each named by you, such as Work or School. Click a profile to rename it, choose which of its calendars Mav reads (the primary one unless you choose others), and mark the one profile new calendar blocks go to. Mav knows the names, so "put it on my school calendar" goes to School. **sign in again** in orange means the account has not granted something Maverick now asks for, such as adding events. **+ add account** opens the Google sign-in in your browser.
 - **TickTick.** Paste your API token to connect. Choose the list new tasks go to, and which lists Mav shows.
 - **Models.** Which model providers can run, and which provider and model each job uses: Mav chat, form filling and scoring. See [Choose the models](#choose-the-models).
 - **Chrome.** Whether Chrome is connected.

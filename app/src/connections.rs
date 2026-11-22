@@ -23,6 +23,20 @@ use crate::ui::{self, Palette, Signal};
 
 const DETAIL_WIDTH: f32 = 400.0;
 
+/// One part of Connections, which the first-run guide shows on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Section {
+    Models,
+    TickTick,
+    Google,
+    Chrome,
+}
+
+/// Asks the window to open the first-run guide.
+pub struct OpenSetup;
+
+impl gpui_kit::EventEmitter<OpenSetup> for Connections {}
+
 /// Where TickTick stands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TickTick {
@@ -49,6 +63,10 @@ pub struct Connections {
     models: Entity<Models>,
     label: Entity<InputState>,
     token: Entity<InputState>,
+    client_id: Entity<InputState>,
+    client_secret: Entity<InputState>,
+    /// Shows one section alone, for the first-run guide. `None` shows them all.
+    only: Option<Section>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -57,6 +75,8 @@ impl Connections {
         let background = browser.read(cx).background();
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Name this profile, such as Work"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("Paste your TickTick API token"));
+        let client_id = cx.new(|cx| InputState::new(window, cx).placeholder("Client ID"));
+        let client_secret = cx.new(|cx| InputState::new(window, cx).placeholder("Client secret"));
         let models = cx.new(|cx| Models::new(background.clone(), window, cx));
         let _subscriptions = vec![
             cx.subscribe_in(&label, window, |this, input, event: &InputEvent, _, cx| {
@@ -87,8 +107,58 @@ impl Connections {
             models,
             label,
             token,
+            client_id,
+            client_secret,
+            only: None,
             _subscriptions,
         }
+    }
+
+    /// Shows one section alone, or all of them with `None`.
+    pub fn show_only(&mut self, only: Option<Section>, cx: &mut Context<Self>) {
+        self.only = only;
+        cx.notify();
+    }
+
+    /// What the first-run guide reports for each step: true once the step needs nothing more.
+    pub fn is_set_up(&self, section: Section, cx: &gpui_kit::App) -> bool {
+        match section {
+            Section::Models => self.models.read(cx).any_ready(),
+            Section::TickTick => matches!(self.ticktick, TickTick::Ready(_)),
+            Section::Google => !self.accounts.is_empty(),
+            Section::Chrome => matches!(self.browser.read(cx).state(), BrowserState::Connected { .. }),
+        }
+    }
+
+    /// Stores the Google OAuth client the user typed in.
+    fn save_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.client_id.read(cx).value().trim().to_owned();
+        let secret = self.client_secret.read(cx).value().trim().to_owned();
+        if id.is_empty() || secret.is_empty() {
+            self.problem = Some("Google needs both the client ID and the client secret".to_owned());
+            cx.notify();
+            return;
+        }
+        self.client_secret
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let saved = self
+            .background
+            .spawn(async move { Client::new(id, Password::new(secret)).save().await });
+        cx.spawn(async move |this, cx| {
+            let saved = saved.await.map_err(|error| error.to_string()).and_then(|saved| saved);
+            this.update(cx, |this, cx| {
+                match saved {
+                    Ok(()) => {
+                        this.client_stored = Some(true);
+                        this.problem = None;
+                    }
+                    Err(error) => this.problem = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Reads every connection again.
@@ -344,6 +414,11 @@ impl Connections {
     }
 
     #[cfg(test)]
+    pub fn models(&self) -> Entity<Models> {
+        self.models.clone()
+    }
+
+    #[cfg(test)]
     pub fn show(&mut self, accounts: Vec<Account>, ticktick: TickTick, window: &mut Window, cx: &mut Context<Self>) {
         self.accounts_file = None;
         self.accounts = accounts;
@@ -386,17 +461,48 @@ impl Render for Connections {
                             .clone()
                             .map(|problem| ui::serif(problem).text_color(palette.signal(Signal::Failed))),
                     )
-                    .child(self.google(&palette, cx))
-                    .child(rule(&palette))
-                    .child(self.ticktick(&palette, cx))
-                    .child(rule(&palette))
-                    .child(self.others(&palette, cx)),
+                    .children(self.only.is_none().then(|| {
+                        h_flex().justify_end().child(
+                            ui::button(
+                                "run-setup",
+                                "Run setup again",
+                                ui::quiet_face("run setup again", &palette),
+                            )
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenSetup))),
+                        )
+                    }))
+                    .children(self.sections(&palette, cx)),
             )
-            .child(self.detail(&palette, cx))
+            .children(matches!(self.only, None | Some(Section::Google)).then(|| self.detail(&palette, cx)))
     }
 }
 
 impl Connections {
+    fn sections(&self, palette: &Palette, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let section = |section: Section, this: &Self, cx: &mut Context<Self>| match section {
+            Section::Google => this.google(palette, cx).into_any_element(),
+            Section::TickTick => this.ticktick(palette, cx).into_any_element(),
+            Section::Models => this.models.clone().into_any_element(),
+            Section::Chrome => this.chrome(palette, cx).into_any_element(),
+        };
+        match self.only {
+            Some(only) => vec![section(only, self, cx)],
+            None => {
+                let mut all = Vec::new();
+                for (index, part) in [Section::Google, Section::TickTick, Section::Models, Section::Chrome]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index > 0 {
+                        all.push(rule(palette).into_any_element());
+                    }
+                    all.push(section(part, self, cx));
+                }
+                all
+            }
+        }
+    }
+
     fn google(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
         let count = self.accounts.len();
         let full = count >= MOST_ACCOUNTS;
@@ -419,15 +525,26 @@ impl Connections {
                 .children(add),
         );
         if self.client_stored == Some(false) {
-            section = section.child(
-                ui::serif(
-                    "Google needs your own OAuth client first. Create a Desktop app client in the Google Cloud \
-                     console, then run `maverick google client <client id>` with the secret on standard input. \
-                     The README has the steps.",
+            section = section
+                .child(
+                    ui::serif(
+                        "Google needs an OAuth client first. In the Google Cloud console, create a project, enable \
+                         the Google Calendar, Gmail, Sheets and Drive APIs, set up the OAuth consent screen and add \
+                         yourself as a test user, then create a client of type Desktop app. Paste its ID and secret here.",
+                    )
+                    .text_color(palette.muted)
+                    .max_w(px(620.)),
                 )
-                .text_color(palette.muted)
-                .max_w(px(620.)),
-            );
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.client_id).id("client-id")))
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.client_secret).id("client-secret").mask_toggle()))
+                        .child(
+                            ui::button("save-client", "Save the Google client", ui::primary_face("save", None, palette))
+                                .on_click(cx.listener(|this, _, window, cx| this.save_client(window, cx))),
+                        ),
+                );
         }
         for account in &self.accounts {
             section = section.child(self.profile_row(account, palette, cx));
@@ -613,21 +730,35 @@ impl Connections {
         section
     }
 
-    fn others(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
+    fn chrome(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
         let (chrome, chrome_signal) = match self.browser.read(cx).state() {
             BrowserState::Connected { tabs } => (format!("connected · {} tabs", tabs.len()), Signal::Done),
             BrowserState::Disconnected => ("not connected".to_owned(), Signal::Yours),
         };
-        v_flex()
-            .gap(px(22.))
-            .child(self.models.clone())
-            .child(rule(palette))
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(ui::caps("chrome").text_color(palette.muted))
-                    .child(status_line("chrome-status", &chrome, palette.signal(chrome_signal))),
-            )
+        let mut section = v_flex().gap(px(10.)).child(
+            h_flex()
+                .justify_between()
+                .child(ui::caps("chrome").text_color(palette.muted))
+                .child(status_line("chrome-status", &chrome, palette.signal(chrome_signal))),
+        );
+        if chrome_signal != Signal::Done {
+            let folder = self
+                .browser
+                .read(cx)
+                .extension_dir()
+                .map(|dir| dir.display().to_string());
+            section = section
+                .child(
+                    ui::serif(
+                        "Maverick fills forms through its Chrome extension. Open chrome://extensions in Chrome, \
+                         turn on Developer mode, then drag the extension folder onto that page.",
+                    )
+                    .text_color(palette.muted)
+                    .max_w(px(620.)),
+                )
+                .children(folder.ok().map(|folder| ui::caps(folder).text_color(palette.faint)));
+        }
+        section
     }
 
     fn detail(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
