@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::answers::{Answer, Answers, Kind, Question, Role, Unanswered};
 use crate::ashby;
+use crate::greenhouse;
 use crate::model;
 use crate::page::{Locator, Page, PageError};
 use crate::workday;
@@ -19,6 +20,7 @@ const SETTLE_GAP: Duration = Duration::from_millis(50);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum System {
     Ashby,
+    Greenhouse,
     Workday,
 }
 
@@ -27,6 +29,7 @@ impl System {
     pub fn of(address: &str) -> Option<Self> {
         ashby::is_posting(address)
             .then_some(Self::Ashby)
+            .or_else(|| greenhouse::is_posting(address).then_some(Self::Greenhouse))
             .or_else(|| workday::is_posting(address).then_some(Self::Workday))
     }
 
@@ -34,6 +37,7 @@ impl System {
     pub fn posting_address(self, address: &str) -> Option<String> {
         match self {
             Self::Ashby => ashby::posting_address(address),
+            Self::Greenhouse => greenhouse::posting_address(address),
             Self::Workday => workday::posting_address(address),
         }
     }
@@ -42,6 +46,7 @@ impl System {
     pub fn form_address(self, address: &str) -> Option<String> {
         match self {
             Self::Ashby => ashby::form_address(address),
+            Self::Greenhouse => greenhouse::form_address(address),
             Self::Workday => workday::form_address(address),
         }
     }
@@ -50,6 +55,7 @@ impl System {
     pub fn submitted(self) -> &'static str {
         match self {
             Self::Ashby => ashby::SUBMITTED,
+            Self::Greenhouse => greenhouse::SUBMITTED,
             Self::Workday => workday::SUBMITTED,
         }
     }
@@ -59,6 +65,7 @@ impl System {
     pub async fn fill(self, page: &Page, answers: &Answers) -> Result<Report, FillError> {
         match self {
             Self::Ashby => ashby::fill(page, answers).await,
+            Self::Greenhouse => greenhouse::fill(page, answers).await,
             Self::Workday => workday::fill(page, answers).await,
         }
     }
