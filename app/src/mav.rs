@@ -9,7 +9,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 use jiff::ZonedDateTime;
-use maverick_core::calendar::Event;
+use maverick_core::calendar::{self, Event, Slot, Stretch};
 use maverick_core::mav::{self, Action, Context as Seen, Speaker};
 use maverick_core::ticktick::{self, Board, Change, Entry, NewTask, Priority, Project};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,9 @@ pub struct View {
     /// True when tasks are grouped by date instead of priority.
     #[serde(default)]
     pub by_date: bool,
+    /// True when the calendar shows the coming week instead of one day.
+    #[serde(default)]
+    pub week: bool,
 }
 
 impl View {
@@ -99,8 +102,16 @@ pub struct Mav {
     new_priority: Priority,
     /// Why the last change from the side panel failed.
     rail_problem: Option<String>,
+    /// The day the calendar shows, in days from today: 0 to 6.
+    day: i64,
+    /// The free stretch the user is naming a block for.
+    blocking: Option<Slot>,
+    block_title: Entity<InputState>,
+    /// The event whose delete was clicked once and waits for a second click.
+    deleting: Option<String>,
     _typed: Subscription,
     _added: Subscription,
+    _blocked: Subscription,
 }
 
 impl Mav {
@@ -117,6 +128,12 @@ impl Mav {
                 this.add_task(window, cx);
             }
         });
+        let block_title = cx.new(|cx| InputState::new(window, cx).placeholder("Name the block, then press Enter"));
+        let _blocked = cx.subscribe_in(&block_title, window, |this, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.add_block(window, cx);
+            }
+        });
         Self {
             loaded: Loaded::Not,
             items: Vec::new(),
@@ -128,8 +145,13 @@ impl Mav {
             new_task,
             new_priority: Priority::Medium,
             rail_problem: None,
+            day: 0,
+            blocking: None,
+            block_title,
+            deleting: None,
             _typed,
             _added,
+            _blocked,
         }
     }
 
@@ -221,6 +243,53 @@ impl Mav {
             },
             cx,
         );
+    }
+
+    /// Starts naming a block for a free stretch.
+    fn start_block(&mut self, slot: Slot, window: &mut Window, cx: &mut Context<Self>) {
+        self.blocking = Some(slot);
+        self.block_title.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Adds the named block for the chosen free stretch, to the profile marked for new blocks.
+    fn add_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.block_title.read(cx).value().trim().to_owned();
+        let Some(slot) = self.blocking.take() else {
+            return;
+        };
+        if title.is_empty() {
+            self.blocking = Some(slot);
+            return;
+        }
+        self.block_title.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+        self.write(
+            async move { calendar::add(&title, &slot.start, &slot.end, None).await.map(drop) },
+            cx,
+        );
+    }
+
+    /// Deletes an event on the second click; the first only asks.
+    fn delete_event(&mut self, event: &Event, cx: &mut Context<Self>) {
+        if self.deleting.as_deref() != Some(&event.source.id) {
+            self.deleting = Some(event.source.id.clone());
+            cx.notify();
+            return;
+        }
+        self.deleting = None;
+        let event = event.clone();
+        self.write(async move { calendar::delete(&event).await }, cx);
+    }
+
+    fn show_day(&mut self, day: i64, cx: &mut Context<Self>) {
+        self.day = day.clamp(0, 6);
+        self.blocking = None;
+        self.deleting = None;
+        cx.notify();
     }
 
     fn change_view(&mut self, change: impl FnOnce(&mut View), cx: &mut Context<Self>) {
@@ -582,22 +651,11 @@ impl Mav {
             Loaded::Ready { at, .. } => format!("read at {at}"),
         };
         let body = match &self.loaded {
-            Loaded::Ready { seen, .. } => {
-                let today = seen.now.date();
-                let tomorrow = today.tomorrow().unwrap_or(today);
-                let on = |day| {
-                    seen.events
-                        .iter()
-                        .filter(|event| event.touches(day))
-                        .collect::<Vec<_>>()
-                };
-                v_flex()
-                    .gap(px(20.))
-                    .child(day_section("cal-today", "Today", &on(today), palette))
-                    .child(day_section("cal-tomorrow", "Tomorrow", &on(tomorrow), palette))
-                    .child(div().h(px(1.)).bg(palette.line))
-                    .child(self.tasks(seen, palette, cx))
-            }
+            Loaded::Ready { seen, .. } => v_flex()
+                .gap(px(20.))
+                .child(self.calendar(seen, palette, cx))
+                .child(div().h(px(1.)).bg(palette.line))
+                .child(self.tasks(seen, palette, cx)),
             Loaded::Failed(error) => ui::serif(error.clone()).text_color(palette.signal(Signal::Failed)),
             Loaded::Not | Loaded::Loading => v_flex(),
         };
@@ -631,6 +689,186 @@ impl Mav {
                     ),
             )
             .child(body)
+    }
+
+    /// The calendar part of the side panel: one day with its free time, or the coming week.
+    fn calendar(&self, seen: &Seen, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let week = self.view.week;
+        let day = seen
+            .now
+            .date()
+            .checked_add(jiff::ToSpan::days(self.day))
+            .unwrap_or(seen.now.date());
+        let title = if week {
+            "the coming week".to_owned()
+        } else if self.day == 0 {
+            format!("today · {}", day.strftime("%a %-d %b"))
+        } else {
+            day.strftime("%a %-d %b").to_string()
+        };
+        let nav = |id: &'static str,
+                   word: &'static str,
+                   name: &'static str,
+                   to: i64,
+                   enabled: bool,
+                   cx: &mut Context<Self>| {
+            let face = ui::caps(word)
+                .px(px(4.))
+                .text_color(if enabled { palette.ink } else { palette.line });
+            ui::button(id, name, face)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if enabled {
+                        this.show_day(to, cx);
+                    }
+                }))
+                .into_any_element()
+        };
+        let switch = |id: &'static str, word: &'static str, on: bool, cx: &mut Context<Self>| -> gpui_kit::AnyElement {
+            let face = ui::caps(word)
+                .px(px(8.))
+                .py(px(1.))
+                .text_color(if on { palette.ink } else { palette.faint });
+            let face = if on { face.bg(palette.line) } else { face };
+            ui::button(id, format!("Show one {word}"), face)
+                .on_click(cx.listener(move |this, _, _, cx| this.change_view(|view| view.week = word == "week", cx)))
+                .into_any_element()
+        };
+        let mut section = v_flex().gap(px(6.)).child(
+            h_flex()
+                .justify_between()
+                .child(
+                    h_flex()
+                        .gap(px(4.))
+                        .children((!week).then(|| nav("day-back", "‹", "Previous day", self.day - 1, self.day > 0, cx)))
+                        .child(heading("calendar-day", title, palette.ink))
+                        .children((!week).then(|| nav("day-next", "›", "Next day", self.day + 1, self.day < 6, cx)))
+                        .children(
+                            (!week && self.day > 0).then(|| nav("day-today", "today", "Back to today", 0, true, cx)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .border_1()
+                        .border_color(palette.line)
+                        .child(switch("calendar-day-view", "day", !week, cx))
+                        .child(switch("calendar-week-view", "week", week, cx)),
+                ),
+        );
+        if week {
+            for ahead in 0..7 {
+                let date = seen
+                    .now
+                    .date()
+                    .checked_add(jiff::ToSpan::days(ahead))
+                    .unwrap_or(seen.now.date());
+                let events: Vec<&Event> = seen.events.iter().filter(|event| event.touches(date)).collect();
+                section = section.child(
+                    ui::caps(format!("{} · {}", date.strftime("%a %-d"), events.len()))
+                        .pt(px(4.))
+                        .text_color(palette.muted),
+                );
+                for event in events {
+                    section = section.child(self.event_row(event, palette, cx));
+                }
+            }
+            return section;
+        }
+        let plan = calendar::day_plan(&seen.events, day, &seen.now);
+        if plan.is_empty() {
+            section = section.child(ui::caps("nothing").text_color(palette.faint));
+        }
+        for (index, stretch) in plan.into_iter().enumerate() {
+            section = section.child(match stretch {
+                Stretch::Event(event) => self.event_row(event, palette, cx).into_any_element(),
+                Stretch::Free(slot) => self.free_row(index, slot, palette, cx).into_any_element(),
+            });
+        }
+        section
+    }
+
+    fn event_row(&self, event: &Event, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let asking = self.deleting.as_deref() == Some(&event.source.id);
+        let doomed = event.clone();
+        h_flex()
+            .id(gpui_kit::SharedString::from(format!("event-{}", event.source.id)))
+            .test_support()
+            .role(gpui_kit::Role::Label)
+            .aria_label(format!("{} · {} · {}", event.title, event.hours(), event.profile))
+            .gap(px(10.))
+            .py(px(4.))
+            .border_b_1()
+            .border_color(palette.line)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(2.))
+                    .h(px(16.))
+                    .bg(if event.busy { palette.muted } else { palette.faint }),
+            )
+            .child(
+                ui::serif(event.title.clone())
+                    .text_size(px(13.5))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate(),
+            )
+            .child(ui::caps(event.hours()).flex_none().text_color(palette.faint))
+            .child(ui::caps(event.profile.clone()).flex_none().text_color(palette.faint))
+            .child(
+                ui::button(
+                    gpui_kit::SharedString::from(format!("delete-event-{}", event.source.id)),
+                    if asking {
+                        format!("Really delete {}", event.title)
+                    } else {
+                        format!("Delete {}", event.title)
+                    },
+                    ui::caps(if asking { "sure?" } else { "delete" }).text_color(if asking {
+                        palette.signal(Signal::Failed)
+                    } else {
+                        palette.faint
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.delete_event(&doomed, cx))),
+            )
+    }
+
+    fn free_row(&self, index: usize, slot: Slot, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let naming = self.blocking.as_ref() == Some(&slot);
+        let words = format!(
+            "free {} to {} · {}",
+            slot.start.strftime("%H:%M"),
+            slot.end.strftime("%H:%M"),
+            calendar::length(slot.minutes())
+        );
+        let row = v_flex()
+            .id(("free", index))
+            .test_support()
+            .role(gpui_kit::Role::Label)
+            .aria_label(words.clone())
+            .gap(px(4.))
+            .px(px(8.))
+            .py(px(4.))
+            .border_1()
+            .border_dashed()
+            .border_color(palette.line)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(ui::caps(words).text_color(palette.faint))
+                    .children((!naming).then(|| {
+                        ui::button(
+                            ("add-block", index),
+                            "Add a block here",
+                            ui::caps("+ block").text_color(palette.ink),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| this.start_block(slot.clone(), window, cx)))
+                    })),
+            );
+        if naming {
+            row.child(Input::new(&self.block_title).id("block-title"))
+        } else {
+            row
+        }
     }
 
     /// The TickTick part of the side panel: add a task, and every open task by priority or by date.
@@ -805,47 +1043,23 @@ fn heading(id: &'static str, text: String, color: gpui_kit::Hsla) -> impl IntoEl
         .child(ui::caps(text).text_color(color))
 }
 
-fn day_section(id: &'static str, name: &str, events: &[&Event], palette: &Palette) -> Div {
-    let color = if events.is_empty() {
-        palette.faint
-    } else {
-        palette.muted
-    };
-    v_flex()
-        .gap(px(2.))
-        .child(heading(id, format!("{name} · {}", events.len()), color))
-        .children(events.iter().map(|event| {
-            h_flex()
-                .gap(px(10.))
-                .py(px(4.))
-                .border_b_1()
-                .border_color(palette.line)
-                .child(div().flex_none().w(px(2.)).h(px(16.)).bg(if event.busy {
-                    palette.muted
-                } else {
-                    palette.faint
-                }))
-                .child(
-                    ui::serif(event.title.clone())
-                        .text_size(px(13.5))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate(),
-                )
-                .child(ui::caps(event.hours()).flex_none().text_color(palette.faint))
-        }))
-        .children(events.is_empty().then(|| ui::caps("nothing").text_color(palette.faint)))
-}
-
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, TestAppContext, WindowOptions};
     use jiff::civil::date;
+    use maverick_core::calendar::{Event, Source, Span};
     use maverick_core::mav::{Action, Context as Seen, Reply};
     use maverick_core::ticktick::{Agenda, Due, Entry, NewTask, Priority};
 
-    use super::{Card, Item, Mav, ready};
+    use super::{Card, Item, Loaded, Mav, ready};
+
+    fn at(day: i8, hour: i8) -> jiff::ZonedDateTime {
+        date(2026, 11, day)
+            .at(hour, 0, 0, 0)
+            .in_tz("America/Los_Angeles")
+            .unwrap()
+    }
 
     fn entry(id: &str, title: &str, due: Option<Due>, priority: Priority) -> Entry {
         Entry {
@@ -908,7 +1122,17 @@ mod tests {
                 now,
                 lists: Vec::new(),
                 tasks,
-                events: Vec::new(),
+                events: vec![Event {
+                    title: "Screen".into(),
+                    profile: "Work".into(),
+                    span: Span::At(at(23, 10), at(23, 11)),
+                    busy: true,
+                    source: Source {
+                        account: "w@example.com".into(),
+                        calendar: "primary".into(),
+                        id: "s1".into(),
+                    },
+                }],
                 profiles: Vec::new(),
                 ticktick: Default::default(),
             };
@@ -919,7 +1143,33 @@ mod tests {
             assert_eq!(window.find(("task-group", 0usize)).label(), Some("high · 1"));
             assert_eq!(window.find("task-a").label(), Some("Renew lease · high · Fri 20"));
             assert_eq!(window.find("task-c").label(), Some("Read a book · low · no date"));
-            assert_eq!(window.find("cal-tomorrow").label(), Some("Tomorrow · 0"));
+            assert_eq!(window.find("calendar-day").label(), Some("today · Sun 22 Nov"));
+            assert_eq!(
+                window.find(("free", 0usize)).label(),
+                Some("free 16:12 to 22:00 · 5 h 48 min")
+            );
+            assert!(window.try_find("day-today").is_none());
+
+            mav.update(cx, |mav, cx| mav.show_day(1, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("calendar-day").label(), Some("Mon 23 Nov"));
+            assert_eq!(window.find(("free", 0usize)).label(), Some("free 08:00 to 10:00 · 2 h"));
+            assert_eq!(window.find("event-s1").label(), Some("Screen · 10:00 to 11:00 · Work"));
+            assert!(window.try_find("day-today").is_some());
+
+            // The first delete click only asks.
+            let screen = match &mav.read(cx).loaded {
+                Loaded::Ready { seen, .. } => seen.events[0].clone(),
+                _ => panic!("not read"),
+            };
+            mav.update(cx, |mav, cx| mav.delete_event(&screen, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("delete-event-s1").label(), Some("Really delete Screen"));
+
+            mav.update(cx, |mav, cx| mav.change_view(|view| view.week = true, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("calendar-day").label(), Some("the coming week"));
+            mav.update(cx, |mav, cx| mav.change_view(|view| view.week = false, cx));
             assert_eq!(mav.read(cx).pressing(), Some(1));
 
             mav.update(cx, |mav, cx| mav.change_view(|view| view.by_date = true, cx));
