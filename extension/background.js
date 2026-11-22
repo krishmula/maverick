@@ -3,10 +3,13 @@
 const HOST = "dev.maverick.bridge";
 const RETRY_GAP_MS = 3000;
 const TABS_DEBOUNCE_MS = 50;
+const DEVTOOLS_PROTOCOL = "1.3";
 
 let port = null;
 let lastAttempt = 0;
 let tabsTimer = null;
+// Tabs this extension holds a debugger on. Chrome shows its debugging bar while any are held.
+const debugged = new Set();
 
 function connect() {
   if (port || Date.now() - lastAttempt < RETRY_GAP_MS) return;
@@ -18,7 +21,12 @@ function connect() {
     // Reading lastError stops Chrome from logging an error each time the app is closed.
     void chrome.runtime.lastError;
     if (port === opened) port = null;
+    // Nothing can drive the tabs now, so the debugging bar should not stay up.
+    for (const tabId of debugged) chrome.debugger.detach({ tabId }).catch(() => {});
+    debugged.clear();
   });
+  // The app compares this with the version it ships and asks for a reload when they differ.
+  post(opened, { kind: "hello", version: chrome.runtime.getManifest().version });
   void sendTabs();
 }
 
@@ -64,6 +72,27 @@ async function run(request) {
       await chrome.tabs.update(request.tabId, { active: true });
       await chrome.windows.update(request.windowId, { focused: true });
       return null;
+    case "tabs.create": {
+      const tab = await chrome.tabs.create({ url: request.url, active: request.active });
+      if (request.active) await chrome.windows.update(tab.windowId, { focused: true });
+      return { id: tab.id, windowId: tab.windowId };
+    }
+    case "reload":
+      // Loads the extension again from the folder the app wrote. The answer goes out first.
+      setTimeout(() => chrome.runtime.reload(), 100);
+      return null;
+    case "debugger.attach":
+      if (!debugged.has(request.tabId)) {
+        await chrome.debugger.attach({ tabId: request.tabId }, DEVTOOLS_PROTOCOL);
+        debugged.add(request.tabId);
+      }
+      return null;
+    case "debugger.detach":
+      // Chrome sends no detach event for a detach the extension asked for.
+      if (debugged.delete(request.tabId)) await chrome.debugger.detach({ tabId: request.tabId });
+      return null;
+    case "debugger.send":
+      return (await chrome.debugger.sendCommand({ tabId: request.tabId }, request.command, request.params)) ?? null;
     default:
       throw new Error(`Unknown method: ${request.method}`);
   }
@@ -89,6 +118,14 @@ for (const event of [
 ]) {
   event.addListener(tabsChanged);
 }
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (port && debugged.has(source.tabId)) {
+    post(port, { kind: "event", tabId: source.tabId, method, params: params ?? null });
+  }
+});
+// Fires when the tab closes or the user dismisses the debugging bar.
+chrome.debugger.onDetach.addListener((source) => debugged.delete(source.tabId));
 
 // An open port keeps this service worker alive. While the app is closed the
 // worker sleeps, and this alarm wakes it to try again.

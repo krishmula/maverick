@@ -1,8 +1,12 @@
 //! Everything in Maverick except the window.
 
+pub mod answers;
+pub mod ashby;
 pub mod bridge;
 pub mod extension;
 pub mod jobs;
+pub mod model;
+pub mod page;
 pub mod relay;
 pub mod rules;
 pub mod store;
@@ -21,6 +25,11 @@ pub fn data_dir() -> Option<PathBuf> {
 
 pub fn database_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("maverick.db"))
+}
+
+/// The user's standard answers for application forms.
+pub fn answers_path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("answers.json"))
 }
 
 /// The socket the app listens on and the relay connects to.

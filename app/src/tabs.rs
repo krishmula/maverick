@@ -1,13 +1,17 @@
 //! The searchable list of browser tabs.
 
+use gpui_kit::component::button::Button;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, h_flex};
+use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{App, Context, ElementId, ParentElement as _, SharedString, Styled as _, Task, Window, div};
+use gpui_kit::{App, Context, ElementId, Entity, ParentElement as _, SharedString, Styled as _, Task, Window, div};
+use maverick_core::ashby;
 use maverick_core::bridge::{ConnectionId, Tab};
 
-#[derive(Default)]
+use crate::browser::Browser;
+
 pub struct TabList {
+    browser: Entity<Browser>,
     tabs: Vec<Tab>,
     query: String,
     matches: Vec<Tab>,
@@ -15,6 +19,16 @@ pub struct TabList {
 }
 
 impl TabList {
+    pub fn new(browser: Entity<Browser>) -> Self {
+        Self {
+            browser,
+            tabs: Vec::new(),
+            query: String::new(),
+            matches: Vec::new(),
+            selected: None,
+        }
+    }
+
     pub fn set_tabs(&mut self, tabs: Vec<Tab>) {
         self.tabs = tabs;
         self.matches = matching(&self.tabs, &self.query);
@@ -51,9 +65,18 @@ pub fn host_of(url: &str) -> &str {
 }
 
 pub(crate) fn row_id(connection: ConnectionId, tab_id: i32) -> ElementId {
+    tab_element("tab", connection, tab_id)
+}
+
+/// The button that fills the application form in a tab.
+pub(crate) fn fill_button_id(connection: ConnectionId, tab_id: i32) -> ElementId {
+    tab_element("fill-form", connection, tab_id)
+}
+
+fn tab_element(name: &'static str, connection: ConnectionId, tab_id: i32) -> ElementId {
     // Tab ids repeat across profiles, so the connection is part of the identity.
     let tab_id = u64::from(u32::from_ne_bytes(tab_id.to_ne_bytes()));
-    ElementId::NamedInteger("tab".into(), (u64::from(connection) << 32) | tab_id)
+    ElementId::NamedInteger(name.into(), (u64::from(connection) << 32) | tab_id)
 }
 
 impl ListDelegate for TabList {
@@ -94,6 +117,17 @@ impl ListDelegate for TabList {
                     .text_color(cx.theme().muted_foreground)
                     .child(SharedString::from(host_of(&held.tab.url).to_owned())),
             )
+            .when(ashby::is_posting(&held.tab.url), |row| {
+                let browser = self.browser.clone();
+                let tab = held.clone();
+                row.child(
+                    Button::new(fill_button_id(held.connection, held.tab.id))
+                        .xsmall()
+                        .label("Fill form")
+                        .tooltip("Fill this application with your standard answers. You review it and click Submit.")
+                        .on_click(move |_, _, cx| browser.update(cx, |browser, cx| browser.fill_form(&tab, cx))),
+                )
+            })
             .when(held.tab.active, |row| {
                 row.child(
                     div()

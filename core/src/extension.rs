@@ -29,6 +29,16 @@ pub fn extension_id() -> String {
         .collect()
 }
 
+/// The version of the extension this app ships.
+pub fn version() -> String {
+    #[derive(Deserialize)]
+    struct Manifest {
+        version: String,
+    }
+    let manifest: Manifest = serde_json::from_str(MANIFEST).expect("extension/manifest.json has a version");
+    manifest.version
+}
+
 pub fn native_host_manifest(relay: &Path) -> Value {
     json!({
         "name": NATIVE_HOST,
