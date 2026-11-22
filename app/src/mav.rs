@@ -80,7 +80,7 @@ pub enum Card {
 #[derive(Clone, Debug)]
 pub enum Item {
     Said(Speaker, String),
-    Proposal(Action, Card),
+    Proposal(Box<Action>, Card),
     /// A proposal Maverick could not use, and why.
     Refused(String),
 }
@@ -323,7 +323,7 @@ impl Mav {
         }
         for proposal in reply.proposals {
             self.items.push(match proposal {
-                Ok(action) => Item::Proposal(action, Card::Proposed),
+                Ok(action) => Item::Proposal(Box::new(action), Card::Proposed),
                 Err(why) => Item::Refused(why),
             });
         }
@@ -333,7 +333,7 @@ impl Mav {
     /// Offers a proposal Mav came up with itself, such as a follow-up after an application.
     pub fn suggest(&mut self, why: String, action: Action, cx: &mut Context<Self>) {
         self.items.push(Item::Said(Speaker::Mav, why));
-        self.items.push(Item::Proposal(action, Card::Proposed));
+        self.items.push(Item::Proposal(Box::new(action), Card::Proposed));
         cx.notify();
     }
 
@@ -346,7 +346,7 @@ impl Mav {
         }
         *card = Card::Adding;
         cx.notify();
-        let action = action.clone();
+        let action = (**action).clone();
         let added = self.background.spawn(async move { action.carry_out().await });
         cx.spawn(async move |this, cx| {
             let card = match added.await {
