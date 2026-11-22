@@ -4,15 +4,15 @@
       <stop offset="0" stop-color="#22305E"/>
       <stop offset="1" stop-color="#0A1024"/>
     </linearGradient>
-    <linearGradient id="jet" x1="0" y1="1" x2="1" y2="0">
+    <linearGradient id="jet" x1="0" y1="1" x2="0" y2="0">
       <stop offset="0" stop-color="#FF5A36"/>
       <stop offset="1" stop-color="#FFC24A"/>
     </linearGradient>
-    <linearGradient id="trail" x1="1" y1="0" x2="0" y2="1">
+    <linearGradient id="trail" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
       <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0.68" cy="0.32" r="0.55">
+    <radialGradient id="glow" cx="0.5" cy="0.3" r="0.6">
       <stop offset="0" stop-color="#4C6FD6" stop-opacity="0.45"/>
       <stop offset="1" stop-color="#4C6FD6" stop-opacity="0"/>
     </radialGradient>
@@ -26,12 +26,9 @@
   </g>
   <g clip-path="url(#clip)">
     <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
-    <g transform="translate(548 482) rotate(45) scale(0.92)">
-      <rect x="-14" y="300" width="28" height="460" rx="14" fill="url(#trail)"/>
-      <rect x="-160" y="220" width="20" height="380" rx="10" fill="url(#trail)" opacity="0.7"/>
-      <rect x="140" y="220" width="20" height="380" rx="10" fill="url(#trail)" opacity="0.7"/>
-      <path d="M0 -310 L22 -240 L36 -150 L42 -40 L270 140 L272 190 L52 150 L48 215 L150 275 L150 310 L30 300 L22 330 L-22 330 L-30 300 L-150 310 L-150 275 L-48 215 L-52 150 L-272 190 L-270 140 L-42 -40 L-36 -150 L-22 -240 L0 -310 Z" fill="url(#jet)" stroke="url(#jet)" stroke-width="10" stroke-linejoin="round"/>
-      <path d="M0 -310 L22 -240 L36 -150 L42 -40 L270 140 L272 190 L52 150 L48 215 L150 275 L150 310 L30 300 L22 330 L0 330 Z" fill="#000" opacity="0.10"/>
+    <g transform="translate(512 505) scale(1.12)">
+      <path d="M0.0 -136.7 L309.6 61.3 L307.1 69.2 L208.8 132.1 L151.2 95.2 L86.4 136.7 L0.0 81.4 L-86.4 136.7 L-151.2 95.2 L-208.8 132.1 L-307.1 69.2 L-309.6 61.3 Z" fill="url(#jet)" stroke="url(#jet)" stroke-width="6" stroke-linejoin="round"/>
+      <path d="M0.0 -136.7 L309.6 61.3 L307.1 69.2 L208.8 132.1 L151.2 95.2 L86.4 136.7 L0.0 81.4 Z" fill="#000" opacity="0.12"/>
     </g>
   </g>
   <rect x="100.5" y="100.5" width="823" height="823" rx="185" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
