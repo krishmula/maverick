@@ -7,7 +7,7 @@ use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
 };
-use maverick_core::ashby::{FieldResult, Outcome, Source};
+use maverick_core::apply::{FieldResult, Outcome, Source};
 use maverick_core::bridge::BrowserState;
 
 use crate::browser::{Browser, Fill, Latency};

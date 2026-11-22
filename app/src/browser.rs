@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
-use maverick_core::ashby::{self, Report};
+use maverick_core::apply::{self, Report, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
 use maverick_core::jobs::{Application, posting_address};
 use maverick_core::page::Page;
@@ -240,11 +240,25 @@ impl Browser {
     /// Waits for the user to submit a filled form, then records the application.
     fn watch_for_submit(&mut self, filled: Filled, cx: &mut Context<Self>) {
         let Filled {
-            tab, title, address, ..
+            system,
+            tab,
+            title,
+            address,
+            ..
         } = filled;
         let (bridge, database) = (self.bridge.clone(), self.database.clone());
         let recorded = self.background.spawn(async move {
-            if !submitted(&bridge, tab.connection, tab.tab.id, SUBMIT_CHECK_GAP, SUBMIT_WATCH).await {
+            let confirmation = system.submitted();
+            if !submitted(
+                &bridge,
+                tab.connection,
+                tab.tab.id,
+                confirmation,
+                SUBMIT_CHECK_GAP,
+                SUBMIT_WATCH,
+            )
+            .await
+            {
                 return None;
             }
             let (role, link) = (title.clone(), address.clone());
@@ -310,18 +324,26 @@ enum Target {
 /// A form that was filled and now waits for the user to submit it.
 struct Filled {
     report: Report,
+    system: System,
     tab: Tab,
     title: String,
     /// The posting's address.
     address: String,
 }
 
-/// True once the tab shows Ashby's confirmation. False when the tab closes, Chrome goes away,
-/// or `limit` passes first.
-async fn submitted(bridge: &Bridge, connection: ConnectionId, tab_id: i32, gap: Duration, limit: Duration) -> bool {
+/// True once the tab shows the element at `confirmation`, which an application system shows
+/// after a submission. False when the tab closes, Chrome goes away, or `limit` passes first.
+async fn submitted(
+    bridge: &Bridge,
+    connection: ConnectionId,
+    tab_id: i32,
+    confirmation: &str,
+    gap: Duration,
+    limit: Duration,
+) -> bool {
     let check = Command::HasElement {
         tab_id,
-        selector: ashby::SUBMITTED.to_owned(),
+        selector: confirmation.to_owned(),
     };
     let deadline = tokio::time::Instant::now() + limit;
     while tokio::time::Instant::now() < deadline {
@@ -346,7 +368,7 @@ fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<
         .map_err(said)?
         .into_iter()
         .map(|posting| posting.link)
-        .filter(|link| ashby::posting_address(&posting_address(link)).as_deref() == Some(address))
+        .filter(|link| apply::posting_address(&posting_address(link)).as_deref() == Some(address))
         .collect();
     store
         .record_application(&links, &Application::submitted_today(role, address))
@@ -374,8 +396,9 @@ async fn fill_form(
             (tab, None)
         }
         Target::Posting(address) => {
-            let form =
-                ashby::form_address(&address).ok_or_else(|| format!("{address} is not a posting Maverick can fill"))?;
+            let form = System::of(&address)
+                .and_then(|system| system.form_address(&address))
+                .ok_or_else(|| format!("{address} is not a posting Maverick can fill"))?;
             let connection = *bridge
                 .connections()
                 .first()
@@ -402,18 +425,17 @@ async fn fill_form(
             (Tab { connection, tab }, Some(form))
         }
     };
-    let address = match &form {
-        Some(form) => ashby::posting_address(form),
-        None => ashby::posting_address(&tab.tab.url),
-    }
-    .ok_or("This tab is not on a posting Maverick can fill.")?;
+    let on = form.as_deref().unwrap_or(&tab.tab.url);
+    let not_fillable = "This tab is not on a posting Maverick can fill.";
+    let system = System::of(on).ok_or(not_fillable)?;
+    let address = system.posting_address(on).ok_or(not_fillable)?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
     let report = match form {
         Some(form) => match page.navigate(&form).await {
-            Ok(()) => ashby::fill(&page, &answers).await,
+            Ok(()) => system.fill(&page, &answers).await,
             Err(error) => Err(error.into()),
         },
-        None => ashby::fill(&page, &answers).await,
+        None => system.fill(&page, &answers).await,
     };
     // Chrome's debugging bar goes away with the detach, whether or not the fill worked.
     let detached = page.detach().await;
@@ -421,6 +443,7 @@ async fn fill_form(
     detached.map_err(|error| error.to_string())?;
     Ok(Filled {
         report,
+        system,
         tab,
         title,
         address,
@@ -472,7 +495,7 @@ mod tests {
         }
         let connection = bridge.connections()[0];
         let gap = Duration::from_millis(5);
-        let seen = submitted(&bridge, connection, 31, gap, Duration::from_secs(5)).await;
+        let seen = submitted(&bridge, connection, 31, ".sent", gap, Duration::from_secs(5)).await;
         (seen, chrome.join().unwrap())
     }
 
@@ -489,7 +512,7 @@ mod tests {
                 "id": asked[0]["id"],
                 "method": "tabs.has",
                 "tabId": 31,
-                "selector": ".ashby-application-form-success-container",
+                "selector": ".sent",
             })
         );
     }

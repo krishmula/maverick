@@ -4,7 +4,7 @@ use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{App, Context, ElementId, ParentElement as _, SharedString, Styled as _, Task, Window, div};
-use maverick_core::ashby;
+use maverick_core::apply;
 use maverick_core::jobs::{Application, Posting, Stage, posting_address};
 
 /// A posting whose form Maverick knows how to fill.
@@ -22,7 +22,7 @@ pub struct Job {
 pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job> {
     let applied: Vec<String> = applications
         .iter()
-        .filter_map(|sent| ashby::posting_address(sent.link.as_deref()?))
+        .filter_map(|sent| apply::posting_address(sent.link.as_deref()?))
         .collect();
     let mut jobs: Vec<Job> = postings
         .iter()
@@ -32,7 +32,7 @@ pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job>
                 company: posting.company.clone(),
                 title: posting.title.clone(),
                 score: posting.score,
-                address: ashby::posting_address(&posting_address(&posting.link))?,
+                address: apply::posting_address(&posting_address(&posting.link))?,
             })
         })
         .filter(|job| !applied.contains(&job.address))

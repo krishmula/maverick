@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::ashby::{self, FieldResult, Source};
+use maverick_core::apply::{FieldResult, Outcome, Source};
+use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
 use maverick_core::page::{Locator, Page, PageError};
@@ -386,8 +387,8 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
 
     // A second run finds the standard answers already in place and changes none of them.
     let again = ashby::fill(&page, &answers).await.unwrap().outcomes;
-    let standard = |outcomes: &[ashby::Outcome]| -> Vec<ashby::Outcome> {
-        let by_standard = |outcome: &&ashby::Outcome| {
+    let standard = |outcomes: &[Outcome]| -> Vec<Outcome> {
+        let by_standard = |outcome: &&Outcome| {
             matches!(
                 &outcome.result,
                 FieldResult::Filled {

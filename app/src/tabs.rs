@@ -5,7 +5,7 @@ use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{App, Context, ElementId, Entity, ParentElement as _, SharedString, Styled as _, Task, Window, div};
-use maverick_core::ashby;
+use maverick_core::apply::System;
 use maverick_core::bridge::{ConnectionId, Tab};
 
 use crate::browser::Browser;
@@ -117,7 +117,7 @@ impl ListDelegate for TabList {
                     .text_color(cx.theme().muted_foreground)
                     .child(SharedString::from(host_of(&held.tab.url).to_owned())),
             )
-            .when(ashby::is_posting(&held.tab.url), |row| {
+            .when(System::of(&held.tab.url).is_some(), |row| {
                 let browser = self.browser.clone();
                 let tab = held.clone();
                 row.child(

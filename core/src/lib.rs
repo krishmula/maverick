@@ -1,6 +1,7 @@
 //! Everything in Maverick except the window.
 
 pub mod answers;
+pub mod apply;
 pub mod ashby;
 pub mod bridge;
 pub mod extension;
