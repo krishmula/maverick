@@ -671,7 +671,7 @@ fn past_card(
                 .child(ui::caps(label).w(px(70.)).flex_none().text_color(palette.faint))
                 .child(div().text_size(px(12.)).child(value.clone()))
         }))
-        .child(ui::caps(outcome.to_owned()).text_color(color))
+        .child(ui::caps(outcome).text_color(color))
 }
 
 impl Mav {
