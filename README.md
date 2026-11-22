@@ -84,6 +84,33 @@ Your standard answers live in `~/Library/Application Support/dev.maverick.app/an
 
 A rule answers every question that holds one of its `any` phrases and none of its `not` phrases. A yes or no question takes `yes` or `no`, a date takes `YYYY-MM-DD`, and a question with options takes the text of one option. `location` is optional.
 
+## Fill a Workday application
+
+Maverick also fills applications on Workday sites, at `*.myworkdayjobs.com` and `*.myworkdaysite.com`. A Workday application has several pages, and Maverick fills one page at a time.
+
+1. Choose the job in Maverick, or click **Fill form** on the posting's tab. Maverick opens the application and chooses **Apply Manually**.
+2. Most employers then ask for an account. Maverick stops and tells you so. Sign in to Workday in that tab yourself. Maverick never creates an account, never types a password and never signs in.
+3. On each page of the application, click **Fill form** on the tab's row. Maverick fills the page that is on screen.
+4. Review the page and click **Save and Continue** yourself. Maverick never clicks it, and it never submits.
+
+Maverick fills text fields, the email and the phone number, drop-down lists, radio groups, check boxes and the resume upload. It leaves these for you:
+
+- Search lists, such as "How Did You Hear About Us?" and the country phone code.
+- Dates.
+- The entries of your work history and your education.
+- Every field on the voluntary disclosure and self-identification pages.
+
+Each fill saves the structure of the page to `~/Library/Application Support/dev.maverick.app/captures/workday-<time>.json`: the questions, the kind of each control, and the option labels. The file holds none of your answers. Maverick's Workday support was written without a Workday account, and these files show what real pages look like.
+
+Check every answer before you continue. This is how far each part is verified:
+
+| Part | Verified against |
+|---|---|
+| Posting addresses, the job's details, opening the application, the sign-in stop | Live Workday sites |
+| Reading a page's fields, and filling text, an email, a phone number, a radio group, a check box and a drop-down list | The first page of two live applications that ask for no account, with made-up answers that were never saved |
+| Later pages, a signed-in session, the resume upload, groups of check boxes and long text | A page rebuilt from Workday's public scripts and public notes. No live page |
+| Noticing that you submitted | Nothing. Maverick may not mark a Workday posting as applied |
+
 ## Import the job tracker
 
 The job funnel keeps its records in a local SQLite database at `~/Library/Application Support/dev.maverick.app/maverick.db`. To copy the tracker spreadsheet into it, export the Google Sheet as `.xlsx` and run:
@@ -124,6 +151,16 @@ MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
 	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
 	cargo test -p maverick --test chrome a_live -- --ignored --nocapture
 ```
+
+Three more tests cover Workday. One fills a page rebuilt to look like a Workday application and runs with the first command above. The other two reach live sites and need a posting's address:
+
+```sh
+MAVERICK_E2E_WORKDAY="https://<company>.wd1.myworkdayjobs.com/<site>/job/<place>/<posting id>" \
+	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
+	cargo test -p maverick --test chrome a_live_workday_posting -- --ignored --nocapture
+```
+
+That test reads the job, opens the application and expects the sign-in stop. It types nothing. For a posting whose application asks for no account, set `MAVERICK_E2E_WORKDAY_OPEN` and run `a_live_workday_page`. It fills the first page with made-up answers, uploads nothing and never leaves the page.
 
 ## Layout
 

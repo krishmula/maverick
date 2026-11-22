@@ -1,0 +1,207 @@
+<!doctype html>
+<!--
+  A RECONSTRUCTION of one page of a Workday application, not a copy of one. Nobody signed in to
+  Workday to make it. The markup follows Workday's public page scripts (release 2026.47.19) and
+  the atsfill project's notes on the signed-in wizard. See the top of core/src/workday.rs.
+  Every name and value here is made up.
+-->
+<title>Reconstructed Workday page</title>
+<style>
+  [data-automation-id^="formField-"] { margin: 12px 0; }
+  .box { position: relative; display: inline-block; width: 20px; height: 20px; }
+  .box input { position: absolute; inset: 0; margin: 0; opacity: 0; }
+  .box div { position: absolute; inset: 0; border: 1px solid; pointer-events: none; }
+  /* Not from Workday: the drawn box takes the click here, to try the click on the label. */
+  .box.drawn-over div { pointer-events: auto; }
+  [role="listbox"] { border: 1px solid; margin: 0; padding: 0; list-style: none; width: 240px; background: white; }
+</style>
+<div data-automation-id="applyFlowPage">
+  <h2 data-automation-id="jobTitleHeading">Backend Engineer</h2>
+  <ol data-automation-id="progressBar">
+    <li data-automation-id="progressBarCompletedStep"><div>step 1 of 6</div><label>Create Account/Sign In</label></li>
+    <li data-automation-id="progressBarActiveStep"><div>current step 2 of 6</div><label>My Information</label></li>
+    <li data-automation-id="progressBarInactiveStep"><div>step 3 of 6</div><label>My Experience</label></li>
+  </ol>
+  <div data-automation-id="applyFlowMyInfoPage">
+    <div role="group" aria-labelledby="Legal-Name-section" data-fkit-id="name--legalName">
+      <h4 id="Legal-Name-section">Legal Name</h4>
+      <div data-automation-id="formField-firstName" data-fkit-id="name--legalName--firstName">
+        <label for="name--legalName--firstName"><span>First Name<abbr aria-hidden="true">*</abbr></span></label>
+        <div><input type="text" id="name--legalName--firstName" aria-required="true" value="Prefilled Person"></div>
+      </div>
+    </div>
+
+    <div data-automation-id="formField-countryPhoneCode" data-fkit-id="phoneNumber--countryPhoneCode">
+      <label for="phoneNumber--countryPhoneCode"><span>Country Phone Code<abbr aria-hidden="true">*</abbr></span></label>
+      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect">
+        <div role="listbox" data-automation-id="selectedItemList" aria-label="items selected">
+          <div role="option" data-automation-id="selectedItem">United States of America (+1)</div>
+        </div>
+        <div data-automation-id="multiselectInputContainer"><input type="text" id="phoneNumber--countryPhoneCode" data-automation-id="searchBox"></div>
+      </div>
+    </div>
+
+    <div data-automation-id="formField-phoneNumber" data-fkit-id="phoneNumber--phoneNumber">
+      <label for="phoneNumber--phoneNumber"><span>Phone Number<abbr aria-hidden="true">*</abbr></span></label>
+      <div><input type="text" id="phoneNumber--phoneNumber" aria-required="true" value=""></div>
+    </div>
+
+    <div data-automation-id="formField-countryRegion" data-fkit-id="address--countryRegion">
+      <label for="address--countryRegion"><span>State<abbr aria-hidden="true">*</abbr></span></label>
+      <div>
+        <button type="button" id="address--countryRegion" aria-haspopup="listbox" aria-label="State Select One Required" value="" data-options="Illinois|Ohio">Select One</button>
+        <input type="text" value="" style="display: none">
+      </div>
+    </div>
+
+    <fieldset data-automation-id="formField-candidateIsPreviousWorker" data-fkit-id="previousWorker--candidateIsPreviousWorker">
+      <legend><span>Have you worked for Example Co before?<abbr aria-hidden="true">*</abbr></span></legend>
+      <div>
+        <span class="box"><input type="radio" id="worked-1" name="worked" value="true" aria-checked="false"><div></div></span>
+        <label for="worked-1">Yes</label>
+      </div>
+      <div>
+        <span class="box"><input type="radio" id="worked-2" name="worked" value="false" aria-checked="false"><div></div></span>
+        <label for="worked-2">No</label>
+      </div>
+    </fieldset>
+
+    <div data-automation-id="formField-preferredCheck" data-fkit-id="name--preferredCheck">
+      <span class="box"><input type="checkbox" id="name--preferredCheck" aria-checked="false"><div></div></span>
+      <label for="name--preferredCheck">I have a preferred name</label>
+    </div>
+
+    <fieldset data-automation-id="formField-q1" data-fkit-id="primaryQuestionnaire--q1">
+      <legend><span>Which offices could you work from?</span></legend>
+      <div>
+        <span class="box"><input type="checkbox" id="office-1"><div></div></span>
+        <label for="office-1">Springfield</label>
+      </div>
+      <div>
+        <span class="box"><input type="checkbox" id="office-2"><div></div></span>
+        <label for="office-2">Shelbyville</label>
+      </div>
+      <div>
+        <span class="box drawn-over"><input type="checkbox" id="office-3"><div></div></span>
+        <label for="office-3">Remote</label>
+      </div>
+    </fieldset>
+
+    <div data-automation-id="formField-q2" data-fkit-id="primaryQuestionnaire--q2">
+      <label for="primaryQuestionnaire--q2"><span>Anything else we should know?</span></label>
+      <div><textarea id="primaryQuestionnaire--q2"></textarea></div>
+    </div>
+
+    <div data-automation-id="formField-q3" data-fkit-id="primaryQuestionnaire--q3">
+      <label for="primaryQuestionnaire--q3-dateSectionMonth-input"><span>When can you start?</span></label>
+      <div data-automation-id="dateInputWrapper">
+        <div data-automation-id="dateSectionMonth-display">MM</div>
+        <input type="text" id="primaryQuestionnaire--q3-dateSectionMonth-input" data-automation-id="dateSectionMonth-input" role="spinbutton" value="">
+        <div data-automation-id="dateSectionDay-display">DD</div>
+        <input type="text" id="primaryQuestionnaire--q3-dateSectionDay-input" data-automation-id="dateSectionDay-input" role="spinbutton" value="">
+        <div data-automation-id="dateSectionYear-display">YYYY</div>
+        <input type="text" id="primaryQuestionnaire--q3-dateSectionYear-input" data-automation-id="dateSectionYear-input" role="spinbutton" value="">
+      </div>
+    </div>
+
+    <div data-automation-id="formField-attachments" data-fkit-id="resumeAttachments--attachments">
+      <label for="resumeAttachments--attachments"><span>Resume/CV<abbr aria-hidden="true">*</abbr></span></label>
+      <div data-automation-id="file-upload-drop-zone">
+        <input type="file" id="resumeAttachments--attachments" data-automation-id="file-upload-input-ref">
+        <button type="button" data-automation-id="select-files">Select files</button>
+      </div>
+    </div>
+
+    <div data-automation-id="formField-source" data-fkit-id="source--source">
+      <label for="source--source"><span>How Did You Hear About Us?<abbr aria-hidden="true">*</abbr></span></label>
+      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect">
+        <div data-automation-id="multiselectInputContainer"><input type="text" id="source--source" data-automation-id="searchBox"></div>
+      </div>
+    </div>
+
+    <div role="group" aria-labelledby="Work-Experience-section" data-fkit-id="workExperience-2">
+      <h4 id="Work-Experience-section">Work Experience 1</h4>
+      <div data-automation-id="formField-jobTitle" data-fkit-id="workExperience-2--jobTitle">
+        <label for="workExperience-2--jobTitle"><span>Job Title<abbr aria-hidden="true">*</abbr></span></label>
+        <div><input type="text" id="workExperience-2--jobTitle" value=""></div>
+      </div>
+    </div>
+
+    <div data-automation-id="formField-q4" data-fkit-id="primaryQuestionnaire--q4">
+      <label for="primaryQuestionnaire--q4"><span>Are you legally able to work in this country?</span></label>
+      <div>
+        <button type="button" id="primaryQuestionnaire--q4" aria-haspopup="listbox" value="yes" data-options="Yes|No">Yes</button>
+        <input type="text" value="yes" style="display: none">
+      </div>
+    </div>
+  </div>
+  <div data-automation-id="pageFooter">
+    <button type="button" data-automation-id="pageFooterNextButton">Save and Continue</button>
+  </div>
+</div>
+<script>
+  // What the test reads back: the lists that were opened, and whether the page was left.
+  window.opened = [];
+  document.querySelector('[data-automation-id="pageFooterNextButton"]').addEventListener("click", () => (window.advanced = true));
+
+  // The list as Workday's script draws it: outside the field, with the keyboard focus, naming its
+  // active row. The arrow keys move that row and Enter picks it, as seen on a live page.
+  let menus = 0;
+  // A live list still counts as open for a moment after it is told to close.
+  const close = (button) => {
+    const list = document.getElementById(button.getAttribute("aria-controls") ?? "");
+    setTimeout(() => {
+      list?.remove();
+      button.removeAttribute("aria-expanded");
+      button.removeAttribute("aria-controls");
+    }, 200);
+  };
+  for (const button of document.querySelectorAll('button[aria-haspopup="listbox"]')) {
+    button.addEventListener("click", () => {
+      if (button.getAttribute("aria-expanded") === "true") return close(button);
+      const list = document.createElement("ul");
+      list.id = `menu-${++menus}`;
+      list.setAttribute("role", "listbox");
+      list.tabIndex = -1;
+      const labels = ["Select One", ...button.dataset.options.split("|")];
+      labels.forEach((label, row) => {
+        const option = document.createElement("li");
+        option.id = `${list.id}-row-${row}`;
+        option.setAttribute("role", "option");
+        option.innerHTML = "<div></div>";
+        option.firstChild.textContent = label;
+        list.append(option);
+      });
+      let active = Math.max(0, labels.indexOf(button.textContent));
+      const mark = () => list.setAttribute("aria-activedescendant", list.children[active].id);
+      mark();
+      list.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown") active = Math.min(labels.length - 1, active + 1);
+        else if (event.key === "ArrowUp") active = Math.max(0, active - 1);
+        else if (event.key === "Enter") {
+          button.textContent = labels[active];
+          close(button);
+          button.focus();
+        } else if (event.key === "Escape") {
+          close(button);
+          button.focus();
+        }
+        if (list.isConnected) mark();
+      });
+      document.body.append(list);
+      button.setAttribute("aria-expanded", "true");
+      button.setAttribute("aria-controls", list.id);
+      window.opened.push(button.id);
+      list.focus();
+    });
+  }
+
+  const upload = document.querySelector('input[type="file"]');
+  upload.addEventListener("change", () => {
+    const item = document.createElement("div");
+    item.setAttribute("data-automation-id", "file-upload-item");
+    item.innerHTML = '<div data-automation-id="file-upload-successful"></div><div></div>';
+    item.lastChild.textContent = upload.files[0].name;
+    upload.closest('[data-automation-id^="formField-"]').append(item);
+  });
+</script>

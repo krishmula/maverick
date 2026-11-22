@@ -195,6 +195,9 @@ impl MainView {
                             .child(SharedString::from(format!("The model was not asked: {problem}"))),
                     );
                 }
+                if let Some(note) = &report.note {
+                    lines.push(div().text_color(muted).child(SharedString::from(note.clone())));
+                }
                 for outcome in outcomes {
                     if let FieldResult::Failed(problem) = &outcome.result {
                         lines.push(line(outcome, problem.clone()).text_color(cx.theme().danger));

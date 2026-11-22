@@ -12,6 +12,7 @@ pub mod relay;
 pub mod rules;
 pub mod store;
 pub mod tracker;
+pub mod workday;
 pub mod xlsx;
 
 use std::path::PathBuf;

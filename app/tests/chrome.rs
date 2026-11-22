@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::apply::{FieldResult, Outcome, Source};
+use maverick_core::apply::{FieldResult, FillError, Outcome, Source};
 use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
 use maverick_core::page::{Locator, Page, PageError};
+use maverick_core::workday;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -409,6 +410,330 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
             .ends_with("/application"),
         "the form was not submitted"
     );
+}
+
+/// A page built to look like one page of a Workday application. Nobody signed in to Workday to
+/// make it: see the comment at its top.
+const WORKDAY_PAGE: &str = include_str!("workday_page.html");
+
+/// Most of a Workday application cannot be reached without an account, so this runs the page
+/// filler against `WORKDAY_PAGE`, a reconstruction. It proves the filler against the markup the
+/// sources describe, not against Workday.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
+    let Running {
+        bridge,
+        mut states,
+        scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let form = serve(WORKDAY_PAGE).await;
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    page.navigate(&form).await.unwrap();
+
+    let resume = scratch.path().join("Ada-Example-Resume.pdf");
+    fs::write(&resume, BLANK_PDF).unwrap();
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": resume,
+        "rules": [
+            { "any": ["first name"], "answer": "Ada" },
+            { "any": ["state"], "answer": "illinois" },
+            { "any": ["worked for"], "answer": "no" },
+            { "any": ["preferred name"], "answer": "no" },
+            { "any": ["which offices"], "answer": "remote" },
+            { "any": ["anything else"], "answer": "Nothing to add." },
+            { "any": ["when can you start"], "answer": "2027-01-18" },
+            { "any": ["legally able"], "answer": "yes" },
+        ],
+    }))
+    .unwrap();
+    let job = workday::Job {
+        job: "Backend Engineer, Springfield".into(),
+        description: "Build things.".into(),
+    };
+    let captures = scratch.path().join("captures");
+    let report = workday::fill_page(&page, &answers, job.clone(), Some(&captures))
+        .await
+        .unwrap();
+
+    let left = |kind: &str| format!("left: Maverick cannot fill a {kind} field yet");
+    let told = |outcomes: &[Outcome]| -> Vec<(String, String)> {
+        let result = |outcome: &Outcome| match &outcome.result {
+            FieldResult::Filled { shown, .. } => format!("filled: {shown}"),
+            FieldResult::Left(why) => format!("left: {why}"),
+            FieldResult::Failed(problem) => format!("FAILED: {problem}"),
+        };
+        outcomes
+            .iter()
+            .map(|outcome| (outcome.title.clone(), result(outcome)))
+            .collect()
+    };
+    let expected: Vec<(String, String)> = [
+        ("First Name", "filled: Ada".to_owned()),
+        ("Country Phone Code", left("search list")),
+        ("Phone Number", "filled: 415 555 0100".to_owned()),
+        ("State", "filled: Illinois".to_owned()),
+        ("Have you worked for Example Co before?", "filled: No".to_owned()),
+        ("I have a preferred name", "filled: No".to_owned()),
+        ("Which offices could you work from?", "filled: Remote".to_owned()),
+        ("Anything else we should know?", "filled: Nothing to add.".to_owned()),
+        ("When can you start?", left("date")),
+        ("Resume/CV", "filled: Ada-Example-Resume.pdf".to_owned()),
+        ("How Did You Hear About Us?", left("search list")),
+        ("Job Title", left("repeated entry")),
+        (
+            "Are you legally able to work in this country?",
+            "filled: Yes".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .map(|(title, result)| (title.to_owned(), result))
+    .collect();
+    assert_eq!(told(&report.outcomes), expected);
+    let required: Vec<bool> = report.outcomes.iter().map(|outcome| outcome.required).collect();
+    assert_eq!(
+        required,
+        [
+            true, true, true, true, true, false, false, false, false, true, true, true, false
+        ]
+    );
+
+    // The page holds the answers, each list was opened once to read it, and nothing moved on.
+    let read = page
+        .evaluate(
+            r#"(() => {
+                const value = (id) => document.getElementById(id).value;
+                const ticked = [...document.querySelectorAll("input:checked")].map((input) => input.labels[0].textContent);
+                return {
+                    first: value("name--legalName--firstName"),
+                    phone: value("phoneNumber--phoneNumber"),
+                    state: document.getElementById("address--countryRegion").textContent,
+                    ticked,
+                    more: value("primaryQuestionnaire--q2"),
+                    month: value("primaryQuestionnaire--q3-dateSectionMonth-input"),
+                    title: value("workExperience-2--jobTitle"),
+                    file: document.querySelector('input[type="file"]').files[0].name,
+                    opened: window.opened,
+                    lists: document.querySelectorAll('ul[role="listbox"]').length,
+                    advanced: window.advanced === true,
+                };
+            })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read,
+        json!({
+            "first": "Ada",
+            "phone": "415 555 0100",
+            "state": "Illinois",
+            "ticked": ["No", "Remote"],
+            "more": "Nothing to add.",
+            "month": "",
+            "title": "",
+            "file": "Ada-Example-Resume.pdf",
+            "opened": ["address--countryRegion", "primaryQuestionnaire--q4", "address--countryRegion"],
+            "lists": 0,
+            "advanced": false,
+        })
+    );
+
+    // The capture describes the page and holds nothing a field showed or the fill typed.
+    let note = report.note.expect("a Workday report says where the capture is");
+    let saved: Vec<_> = fs::read_dir(&captures)
+        .unwrap()
+        .map(|file| file.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1);
+    assert!(note.contains(&saved[0].display().to_string()), "{note}");
+    let capture = fs::read_to_string(&saved[0]).unwrap();
+    for private in ["Prefilled Person", "(+1)", "Ada", "415", "Nothing to add"] {
+        assert!(!capture.contains(private), "the capture holds {private:?}");
+    }
+    let capture: serde_json::Value = serde_json::from_str(&capture).unwrap();
+    assert_eq!(capture["page"], "applyFlowMyInfoPage");
+    assert_eq!(capture["step"], "My Information");
+    assert_eq!(capture["structure"]["fields"].as_array().unwrap().len(), 13);
+    assert_eq!(capture["structure"]["fields"][3]["label"], "State*");
+    assert_eq!(
+        capture["structure"]["fields"][3]["controls"][0],
+        json!({
+            "tag": "button",
+            "type": "button",
+            "role": null,
+            "automationId": null,
+            "fkitId": null,
+            "id": "address--countryRegion",
+            "aria": { "aria-haspopup": "listbox", "aria-label": null },
+            "label": "State*",
+            "options": null,
+        })
+    );
+    assert_eq!(
+        capture["read"][3]["kind"],
+        r#"Choice { options: ["Illinois", "Ohio"] }"#
+    );
+    let footer = capture["structure"]["other"].as_array().unwrap();
+    assert!(
+        footer
+            .iter()
+            .any(|control| control["automationId"] == "pageFooterNextButton")
+    );
+
+    // A second run finds every answer in place and changes none of them.
+    let again = workday::fill_page(&page, &answers, job, None).await.unwrap();
+    assert_eq!(told(&again.outcomes), expected);
+    assert_eq!(page.evaluate("window.advanced === true").await.unwrap(), false);
+}
+
+/// Proves the part of Workday that needs no account, on a live posting: the job is read, the
+/// application is opened by way of "Apply Manually", and the sign-in wall is reported.
+/// It types nothing, creates no account and never signs in. Set `MAVERICK_E2E_WORKDAY` to a
+/// posting's address.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME and MAVERICK_E2E_WORKDAY, and reaches a live site"]
+async fn a_live_workday_posting_is_read_and_stops_at_the_sign_in_wall() {
+    let posting = std::env::var("MAVERICK_E2E_WORKDAY").expect("MAVERICK_E2E_WORKDAY");
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": "/nowhere/Ada-Example-Resume.pdf",
+    }))
+    .unwrap();
+
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    page.navigate(&posting).await.unwrap();
+    let job = workday::read_job(&page).await.unwrap();
+    println!("job: {}", job.job);
+    println!("description: {} characters", job.description.len());
+    assert!(!job.job.is_empty() && !job.description.is_empty());
+
+    let wall = Err(FillError::SignInNeeded { system: "Workday" });
+    assert_eq!(workday::fill_saving_captures(&page, &answers, None).await, wall);
+    // The tab is inside the application now, where the user signs in. A second run stops there too.
+    assert_eq!(workday::fill_saving_captures(&page, &answers, None).await, wall);
+    let seen = page
+        .evaluate(
+            r#"({
+                path: location.pathname,
+                wall: document.querySelector('[data-automation-id="signInContent"]') !== null,
+                typed: [...document.querySelectorAll('input[type="text"], input[type="email"], input[type="password"]')]
+                    .map((input) => input.value)
+                    .join(""),
+            })"#,
+        )
+        .await
+        .unwrap();
+    println!("the wall is at {}", seen["path"]);
+    assert!(seen["path"].as_str().unwrap().ends_with("/apply/applyManually"));
+    assert_eq!(seen["wall"], true);
+    assert_eq!(seen["typed"], "", "nothing was typed into the sign-in form");
+    let address = page.evaluate("location.href").await.unwrap();
+    assert_eq!(
+        workday::posting_address(address.as_str().unwrap()),
+        workday::posting_address(&posting),
+        "the wall's address still names the posting"
+    );
+}
+
+/// A few employers show a Workday application without an account. This fills the first page of
+/// one with made-up answers and prints what happened to each field. It uploads nothing, never
+/// clicks "Save and Continue" and never submits, so the employer receives no application.
+/// Set `MAVERICK_E2E_WORKDAY_OPEN` to such a posting's address.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME and MAVERICK_E2E_WORKDAY_OPEN, and reaches a live site"]
+async fn a_live_workday_page_that_needs_no_account_is_filled_and_not_left() {
+    let posting = std::env::var("MAVERICK_E2E_WORKDAY_OPEN").expect("MAVERICK_E2E_WORKDAY_OPEN");
+    let Running {
+        bridge,
+        mut states,
+        scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": "/nowhere/Ada-Example-Resume.pdf",
+        "rules": [
+            { "any": ["first name"], "answer": "Ada" },
+            { "any": ["last name"], "answer": "Example" },
+            { "any": ["address line 1"], "answer": "1 Example Street" },
+            { "any": ["city"], "answer": "Springfield" },
+            { "any": ["postal code"], "answer": "62701" },
+            { "any": ["state"], "answer": "Illinois" },
+            { "any": ["previously employed", "previously worked", "worked for"], "answer": "no" },
+            { "any": ["preferred name"], "answer": "no" },
+        ],
+    }))
+    .unwrap();
+
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    page.navigate(&posting).await.unwrap();
+    let captures = scratch.path().join("captures");
+    let fill = || workday::fill_saving_captures(&page, &answers, Some(&captures));
+    let outcomes = fill().await.unwrap().outcomes;
+    for outcome in &outcomes {
+        let required = if outcome.required { "required" } else { "optional" };
+        match &outcome.result {
+            FieldResult::Filled { shown, .. } => println!("filled  ({required}) {}: {shown}", outcome.title),
+            FieldResult::Left(why) => println!("left    ({required}) {}: {why}", outcome.title),
+            FieldResult::Failed(problem) => println!("FAILED  ({required}) {}: {problem}", outcome.title),
+        }
+    }
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome.result, FieldResult::Failed(_)))
+        .count();
+    assert_eq!(failed, 0, "every field with an answer was entered");
+    let filled = |outcomes: &[Outcome]| -> Vec<Outcome> {
+        let entered = |outcome: &&Outcome| matches!(outcome.result, FieldResult::Filled { .. });
+        outcomes.iter().filter(entered).cloned().collect()
+    };
+    assert!(
+        filled(&outcomes).len() >= 3,
+        "the name, the email and the phone number went in"
+    );
+
+    // A second run finds the answers in place and changes none of them.
+    assert_eq!(filled(&fill().await.unwrap().outcomes), filled(&outcomes));
+    let seen = page
+        .evaluate(
+            r#"({
+                path: location.pathname,
+                open: document.querySelectorAll('button[aria-expanded="true"]').length,
+                errors: document.querySelectorAll('[data-automation-id="errorHeading"]').length,
+            })"#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        seen["path"].as_str().unwrap().ends_with("/apply/applyManually"),
+        "the page was not left"
+    );
+    assert_eq!(seen["open"], 0, "no list was left open");
+    assert_eq!(seen["errors"], 0, "the page was not sent for checking");
+    // The second capture was taken with the answers on the page, and holds none of them.
+    for file in fs::read_dir(&captures).unwrap() {
+        let capture = fs::read_to_string(file.unwrap().path()).unwrap();
+        for private in ["Ada", "ada@example.com", "555", "1 Example Street", "62701"] {
+            assert!(!capture.contains(private), "a capture holds {private:?}");
+        }
+    }
 }
 
 /// A one-page PDF with nothing on it.
