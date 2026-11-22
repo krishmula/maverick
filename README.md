@@ -123,6 +123,9 @@ Your standard answers live in `~/Library/Application Support/dev.maverick.app/an
   "background": [
     "Software Engineer at Example Robotics, 2023 to present.",
     "Built a job queue in Rust that cut nightly batch time from 6 hours to 40 minutes."
+  ],
+  "target": [
+    "Full-time backend or infrastructure jobs, new grad to mid-level, anywhere in the United States."
   ]
 }
 ```
@@ -199,6 +202,26 @@ cargo run --release -p maverick -- check-rules
 ```
 
 The report counts what the rules would skip and lists each posting where the rules and the stored decision disagree.
+
+## Score found postings
+
+Scoring reads the description of each posting still marked found and decides whether it is worth applying to:
+
+```sh
+cargo run --release -p maverick -- score
+```
+
+A run takes these steps, cheapest first:
+
+1. It marks a posting that repeats an earlier posting or an application as a duplicate.
+2. It skips a posting the title and location rules rule out.
+3. It reads the description over plain HTTP, for at most 30 postings. It can read Simplify, Ashby, Greenhouse, Lever, Workday and Amazon postings. For a Simplify copy, it also records the original posting's address, so the Jobs list can fill that posting's form.
+4. A Claude model, run through the `claude` command, scores the fit from 0 to 100 against `background` and `target` in your answers file. It also reads the facts that the rules in code act on: sponsorship, citizenship or clearance, minimum years, frontend focus and US location.
+5. Code decides. A posting is skipped if it requires citizenship or clearance, requires 5 or more years, is mainly frontend, has no US location, or scores under 60. It is apply-ready at 75 or more with no blocking flag, such as "no sponsorship". All other postings go to review. A closed posting is skipped.
+
+A posting that cannot be read or scored stays found, with the reason in its notes, and the next run tries it again. Add `--dry-run` to see the decisions without writing them, and `--limit <count>` to change the cap.
+
+To compare the scorer with the scores the database already holds, run `check-scores [count]`. It scores the newest postings again, writes nothing, and reports how often the two decisions agree.
 
 ## Run the tests
 

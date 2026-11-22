@@ -44,6 +44,15 @@ stored_enum! {
 }
 
 stored_enum! {
+    /// What a posting says about sponsoring a work visa. `Unknown` when it says nothing.
+    Sponsorship {
+        Sponsors => "sponsors",
+        NoSponsorship => "no_sponsorship",
+        Unknown => "unknown",
+    }
+}
+
+stored_enum! {
     ApplicationStatus {
         Pending => "pending",
         Rejected => "rejected",
@@ -76,6 +85,10 @@ pub struct Posting {
     pub variant: Option<String>,
     pub flags: Option<String>,
     pub notes: Option<String>,
+    /// The posting's own address, when `link` is a job board's copy of it. Found while scoring.
+    pub address: Option<String>,
+    /// Found while scoring. `None` for a posting Maverick has not scored.
+    pub sponsorship: Option<Sponsorship>,
 }
 
 /// An application that was submitted.

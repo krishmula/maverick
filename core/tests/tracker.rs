@@ -2,7 +2,7 @@ use std::io::{Cursor, Write};
 
 use jiff::Timestamp;
 use jiff::civil::date;
-use maverick_core::jobs::{Application, ApplicationStatus, HiringPost, Outreach, Posting, Stage};
+use maverick_core::jobs::{Application, ApplicationStatus, HiringPost, Outreach, Posting, Sponsorship, Stage};
 use maverick_core::store::{Store, Summary};
 use maverick_core::tracker::{self, RowProblem, Tracker, TrackerError};
 use zip::ZipWriter;
@@ -306,6 +306,8 @@ fn the_tracker_is_read_from_all_three_tabs() {
                 variant: Some("Backend/Infra".into()),
                 flags: Some("Advisory: relocation needed".into()),
                 notes: Some("Apply-ready (>=75, no blocking flags)".into()),
+                address: None,
+                sponsorship: None,
             },
             Posting {
                 link: "https://links.example.net/b/2".into(),
@@ -320,6 +322,8 @@ fn the_tracker_is_read_from_all_three_tabs() {
                 variant: None,
                 flags: None,
                 notes: None,
+                address: None,
+                sponsorship: None,
             },
         ]
     );
@@ -510,6 +514,8 @@ fn a_submitted_application_marks_its_posting_applied_and_is_recorded_once() {
         variant: None,
         flags: None,
         notes: None,
+        address: None,
+        sponsorship: None,
     };
     let tracker = Tracker {
         postings: vec![
@@ -530,4 +536,52 @@ fn a_submitted_application_marks_its_posting_applied_and_is_recorded_once() {
     let stages: Vec<Stage> = store.postings().unwrap().iter().map(|posting| posting.stage).collect();
     assert_eq!(stages, [Stage::Applied, Stage::Review]);
     assert_eq!(store.applications().unwrap(), [sent]);
+}
+
+#[test]
+fn scoring_decisions_survive_a_reopen_and_a_repeated_import_keeps_the_address() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("maverick.db");
+    let mut store = Store::open(&path).unwrap();
+    let found = Posting {
+        link: "https://board.example.com/p/1".into(),
+        found_at: "2026-11-01T00:00:00Z".parse().unwrap(),
+        source: "Board".into(),
+        company: "Example Co".into(),
+        title: "Backend Engineer".into(),
+        location: None,
+        email_subject: None,
+        stage: Stage::Found,
+        score: None,
+        variant: None,
+        flags: None,
+        notes: None,
+        address: None,
+        sponsorship: None,
+    };
+    let tracker = Tracker {
+        postings: vec![found.clone()],
+        ..Tracker::default()
+    };
+    store.save_tracker(&tracker).unwrap();
+    let scored = Posting {
+        stage: Stage::Review,
+        score: Some(78),
+        variant: Some("Backend/Infra".into()),
+        flags: Some("Blocking: no sponsorship".into()),
+        notes: Some("Review - 78".into()),
+        address: Some("https://jobs.example.com/1".into()),
+        sponsorship: Some(Sponsorship::NoSponsorship),
+        ..found
+    };
+    store.save_decisions(std::slice::from_ref(&scored)).unwrap();
+    drop(store);
+
+    let mut reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.postings().unwrap(), std::slice::from_ref(&scored));
+
+    reopened.save_tracker(&tracker).unwrap();
+    let after_import = &reopened.postings().unwrap()[0];
+    assert_eq!(after_import.address, scored.address);
+    assert_eq!(after_import.sponsorship, scored.sponsorship);
 }

@@ -72,6 +72,13 @@ pub async fn draft(
 }
 
 async fn ask(instructions: &str, request: String, questions: usize) -> Result<Vec<ModelAnswer>, String> {
+    let reply = run(instructions, request, &reply_schema()).await?;
+    answers_in(&reply, questions)
+}
+
+/// Runs one model call whose reply must match `schema`, and returns the command's JSON output.
+/// The model's reply is under `structured_output`.
+pub(crate) async fn run(instructions: &str, request: String, schema: &Value) -> Result<Value, String> {
     let run = Command::new(claude_command())
         .arg("--print")
         .arg(request)
@@ -80,7 +87,7 @@ async fn ask(instructions: &str, request: String, questions: usize) -> Result<Ve
         .args(["--tools", "", "--strict-mcp-config", "--setting-sources", ""])
         .args(["--no-session-persistence", "--disable-slash-commands"])
         .args(["--system-prompt", instructions])
-        .args(["--json-schema", &reply_schema().to_string()])
+        .args(["--json-schema", &schema.to_string()])
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .kill_on_drop(true)
@@ -93,7 +100,13 @@ async fn ask(instructions: &str, request: String, questions: usize) -> Result<Ve
         let said = String::from_utf8_lossy(&output.stderr);
         format!("the claude command failed: {}", said.trim())
     })?;
-    answers_in(&reply, questions)
+    if reply["is_error"] == true {
+        return Err(format!(
+            "the model failed: {}",
+            reply["result"].as_str().unwrap_or("no reason given")
+        ));
+    }
+    Ok(reply)
 }
 
 /// `claude` is often installed where an app started from the Dock does not look.
@@ -155,12 +168,6 @@ fn answers_in(reply: &Value, questions: usize) -> Result<Vec<ModelAnswer>, Strin
         id: usize,
         answer: Option<String>,
         basis: String,
-    }
-    if reply["is_error"] == true {
-        return Err(format!(
-            "the model failed: {}",
-            reply["result"].as_str().unwrap_or("no reason given")
-        ));
     }
     let given: Vec<Given> = serde_json::from_value(reply["structured_output"]["answers"].clone())
         .map_err(|error| format!("the model's reply was not in the agreed form: {error}"))?;
@@ -243,9 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_or_malformed_reply_is_an_error() {
-        let failed = json!({ "is_error": true, "result": "Not logged in" });
-        assert_eq!(answers_in(&failed, 1), Err("the model failed: Not logged in".into()));
+    fn a_malformed_reply_is_an_error() {
         assert!(answers_in(&json!({ "is_error": false, "result": "plain text" }), 1).is_err());
     }
 }

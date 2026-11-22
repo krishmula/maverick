@@ -451,6 +451,8 @@ mod tests {
             variant: None,
             flags: None,
             notes: None,
+            address: None,
+            sponsorship: None,
         }
     }
 

@@ -46,6 +46,30 @@ fn run() -> Result<(), Box<dyn Error>> {
             return cli::import_tracker(Path::new(&file));
         }
         Some("check-rules") => return cli::check_rules(),
+        Some("score") => {
+            let mut limit = maverick_core::score::RUN_CAP;
+            let mut dry_run = false;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--limit" => {
+                        limit = arguments
+                            .next()
+                            .and_then(|count| count.parse().ok())
+                            .ok_or("usage: maverick score [--limit <count>] [--dry-run]")?;
+                    }
+                    _ => return Err("usage: maverick score [--limit <count>] [--dry-run]".into()),
+                }
+            }
+            return cli::score(limit, dry_run);
+        }
+        Some("check-scores") => {
+            let count = match arguments.next() {
+                Some(count) => count.parse().map_err(|_| "usage: maverick check-scores [count]")?,
+                None => 20,
+            };
+            return cli::check_scores(count);
+        }
         Some(other) => return Err(format!("{other:?} is not a maverick command").into()),
         None => {}
     }

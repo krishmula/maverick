@@ -183,6 +183,11 @@ pub fn posting_address(address: &str) -> Option<String> {
     Address::parse(address).map(|at| at.posting_address())
 }
 
+/// The full address of the posting's public job data, which any client can read.
+pub fn job_data_address(address: &str) -> Option<String> {
+    Address::parse(address).map(|at| format!("https://{}{}", at.host, at.job_data()))
+}
+
 /// The address where a posting's application starts.
 pub fn form_address(address: &str) -> Option<String> {
     posting_address(address).map(|posting| format!("{posting}/apply"))

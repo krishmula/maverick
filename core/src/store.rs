@@ -5,13 +5,14 @@ use std::path::Path;
 use rusqlite::types::Type;
 use rusqlite::{Connection, Row, params};
 
-use crate::jobs::{Application, ApplicationStatus, Outreach, Posting, Stage};
+use crate::jobs::{Application, ApplicationStatus, Outreach, Posting, Sponsorship, Stage};
 use crate::tracker::Tracker;
 
 pub use rusqlite::Error as StoreError;
 
 /// One entry per schema version, applied in order. Add a new entry to change the schema. Never edit an old one.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE postings (
         id INTEGER PRIMARY KEY,
         link TEXT NOT NULL UNIQUE,
@@ -51,7 +52,13 @@ const MIGRATIONS: &[&str] = &["
         notes TEXT,
         UNIQUE (post_link, role)
     ) STRICT;
-"];
+",
+    "
+    ALTER TABLE postings ADD COLUMN address TEXT;
+    ALTER TABLE postings ADD COLUMN sponsorship TEXT
+        CHECK (sponsorship IN ('sponsors', 'no_sponsorship', 'unknown'));
+",
+];
 
 pub struct Store {
     db: Connection,
@@ -157,7 +164,32 @@ impl Store {
         write.commit()
     }
 
-    /// Every posting, oldest first.
+    /// Writes what scoring decided: stage, score, variant, flags, notes, address and sponsorship.
+    /// Each posting is found by its link. The fields intake wrote are left as they are.
+    pub fn save_decisions(&mut self, postings: &[Posting]) -> Result<(), StoreError> {
+        let write = self.db.transaction()?;
+        {
+            let mut update = write.prepare(
+                "UPDATE postings SET stage = ?2, score = ?3, variant = ?4, flags = ?5, notes = ?6,
+                     address = ?7, sponsorship = ?8
+                 WHERE link = ?1",
+            )?;
+            for posting in postings {
+                update.execute(params![
+                    posting.link,
+                    posting.stage.as_str(),
+                    posting.score,
+                    posting.variant,
+                    posting.flags,
+                    posting.notes,
+                    posting.address,
+                    posting.sponsorship.map(Sponsorship::as_str),
+                ])?;
+            }
+        }
+        write.commit()
+    }
+
     /// Records an application the user submitted: the postings at `posting_links` become applied,
     /// and the application is added unless one with the same link is already recorded.
     pub fn record_application(&mut self, posting_links: &[String], sent: &Application) -> Result<(), StoreError> {
@@ -184,9 +216,11 @@ impl Store {
         write.commit()
     }
 
+    /// Every posting, oldest first.
     pub fn postings(&self) -> Result<Vec<Posting>, StoreError> {
         let mut select = self.db.prepare(
-            "SELECT link, found_at, source, company, title, location, email_subject, stage, score, variant, flags, notes
+            "SELECT link, found_at, source, company, title, location, email_subject, stage, score, variant, flags, notes,
+                 address, sponsorship
              FROM postings ORDER BY found_at, id",
         )?;
         select
@@ -204,6 +238,11 @@ impl Store {
                     variant: row.get(9)?,
                     flags: row.get(10)?,
                     notes: row.get(11)?,
+                    address: row.get(12)?,
+                    sponsorship: match row.get_ref(13)?.as_str_or_null()? {
+                        Some(_) => Some(stored(row, 13, Sponsorship::parse)?),
+                        None => None,
+                    },
                 })
             })?
             .collect()
