@@ -147,7 +147,7 @@ pub fn posting_address(link: &str) -> String {
     }
 }
 
-fn percent_decoded(text: &str) -> String {
+pub(crate) fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut at = 0;

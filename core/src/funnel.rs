@@ -7,6 +7,7 @@ use jiff::Timestamp;
 use crate::intake;
 use crate::jobs::{Posting, Stage};
 use crate::score::{self, APPLY_READY, Profile, RUN_CAP};
+use crate::sheet::Session;
 use crate::store::Store;
 
 /// The run happens from 8 AM until 11 PM Pacific time, when the user can act on what it finds.
@@ -28,6 +29,8 @@ pub struct Pass {
     pub scored: Vec<Posting>,
     pub waiting: usize,
     pub unreadable: usize,
+    /// Decisions written to the live tracker. `None` when no tracker is linked.
+    pub written: Option<Result<usize, String>>,
 }
 
 impl Pass {
@@ -74,22 +77,55 @@ impl Pass {
         if self.waiting > 0 {
             line.push_str(&format!("; {} wait for the next run", self.waiting));
         }
+        match &self.written {
+            Some(Ok(count)) => line.push_str(&format!("; {count} written to the sheet")),
+            Some(Err(error)) => line.push_str(&format!("; the sheet was not updated ({error})")),
+            None => {}
+        }
         line
     }
 }
 
-/// Pulls new postings into the database at `database`, then scores up to the cap.
+/// Reads the live tracker into the database when one is linked, pulls new postings, scores up
+/// to the cap, and writes every decision back to the sheet.
 /// The store is opened only between network calls, so the app's own connection is never held up.
-pub async fn run_once(database: &Path, profile: Profile) -> Result<Pass, String> {
+pub async fn run_once(database: &Path, profile: Profile, sheet: Option<Session>) -> Result<Pass, String> {
     let said = |error: rusqlite::Error| format!("the database failed: {error}");
+    let mut snapshot = match &sheet {
+        Some(session) => {
+            let snapshot = session.read().await?;
+            Store::open(database)
+                .and_then(|mut store| store.save_tracker(&snapshot.tracker))
+                .map_err(said)?;
+            Some(snapshot)
+        }
+        None => None,
+    };
+
     let known = Store::open(database).and_then(|store| store.postings()).map_err(said)?;
     let pulled = intake::pull(&known, Timestamp::now()).await;
-
-    let mut store = Store::open(database).map_err(said)?;
     let added = match pulled {
-        Ok(found) => Ok(store.add_found(&found).map_err(said)?),
+        Ok(found) => Ok(Store::open(database)
+            .and_then(|mut store| store.add_found(&found))
+            .map_err(said)?),
         Err(error) => Err(error),
     };
+    if let (Some(session), Some(read)) = (&sheet, &snapshot) {
+        // Every posting intake found goes into the sheet, including any an earlier pass could not add.
+        let missing: Vec<Posting> = Store::open(database)
+            .and_then(|store| store.postings())
+            .map_err(said)?
+            .into_iter()
+            .filter(|posting| posting.source == intake::SOURCE && !read.rows.contains_key(&posting.link))
+            .collect();
+        if !missing.is_empty() {
+            session.append_found(read, &missing).await?;
+            // Read again, so the new rows have row numbers for their decisions.
+            snapshot = Some(session.read().await?);
+        }
+    }
+
+    let mut store = Store::open(database).map_err(said)?;
     let plan = score::plan(
         &store.postings().map_err(said)?,
         &store.applications().map_err(said)?,
@@ -103,6 +139,20 @@ pub async fn run_once(database: &Path, profile: Profile) -> Result<Pass, String>
     Store::open(database)
         .and_then(|mut store| store.save_decisions(&scored))
         .map_err(said)?;
+
+    let written = match (&sheet, &snapshot) {
+        (Some(session), Some(snapshot)) => {
+            let decided: Vec<Posting> = plan
+                .duplicates
+                .iter()
+                .chain(&plan.skipped)
+                .chain(&scored)
+                .cloned()
+                .collect();
+            Some(session.write_decisions(snapshot, &decided).await)
+        }
+        _ => None,
+    };
     Ok(Pass {
         added,
         duplicates: plan.duplicates.len(),
@@ -110,6 +160,7 @@ pub async fn run_once(database: &Path, profile: Profile) -> Result<Pass, String>
         scored,
         waiting: plan.waiting,
         unreadable: plan.unreadable,
+        written,
     })
 }
 
@@ -147,6 +198,7 @@ mod tests {
             ],
             waiting: 2,
             unreadable: 0,
+            written: None,
         };
         assert_eq!(
             pass.summary(),
@@ -156,11 +208,13 @@ mod tests {
             added: Err("GitHub answered the Simplify list with status 503".into()),
             scored: Vec::new(),
             waiting: 0,
+            written: Some(Ok(4)),
             ..pass
         };
         assert_eq!(
             failed_pull.summary(),
-            "no new postings (GitHub answered the Simplify list with status 503); 0 scored (0 apply-ready, 0 to review)"
+            "no new postings (GitHub answered the Simplify list with status 503); 0 scored (0 apply-ready, 0 to review); \
+             4 written to the sheet"
         );
     }
 

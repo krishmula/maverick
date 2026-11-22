@@ -203,6 +203,42 @@ cargo run --release -p maverick -- check-rules
 
 The report counts what the rules would skip and lists each posting where the rules and the stored decision disagree.
 
+## Connect Google accounts
+
+Maverick can connect any number of Google accounts and use Sheets, Drive, Gmail and Calendar for each one. It signs in with your own OAuth client, so first create one:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project and enable the Google Sheets, Google Drive, Gmail and Google Calendar APIs.
+2. Set up the OAuth consent screen as **External**, add each account you will connect as a test user, and publish the app. Sign-ins to an app that stays in testing expire after 7 days.
+3. Create a client of type **Desktop app**.
+
+Then store the client and connect each account:
+
+```sh
+maverick google client <client id> < file-with-the-client-secret
+maverick google add      # opens the Google sign-in in your browser; repeat for each account
+maverick google list
+maverick google check    # proves that each account still signs in
+maverick google remove <email>
+```
+
+The client secret and each account's refresh token are kept in the macOS Keychain, under `dev.maverick.google-client` and `dev.maverick.google`. The list of accounts, which holds no secret, is `google-accounts.json` in the data directory. Google warns that the app is not verified. That warning is expected for a client you made yourself.
+
+## Link the live tracker
+
+To use the Google Sheet itself as the tracker in place of the `.xlsx` import, link it by part of its name:
+
+```sh
+maverick tracker link "Tracker"
+```
+
+From then on, each funnel pass does the following:
+
+1. It reads the sheet's three tabs into the database. The sheet is the source of truth.
+2. It adds the postings intake found as new rows in the Found tab.
+3. It scores what is still found and writes each decision back: Status, Score, Variant, Flags and Notes.
+
+A decision goes only into a row whose Status still says Found when Maverick writes. So if another scorer works on the same sheet, Maverick never overwrites its decisions.
+
 ## Find new postings
 
 While the app is open, it runs the funnel every hour from 8 AM to 11 PM Pacific time, starting a minute after launch. Each pass pulls new postings and then scores what is found. The bar shows what the last pass did, and the Jobs list updates. A pass never submits an application.

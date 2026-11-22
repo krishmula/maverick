@@ -16,9 +16,9 @@ use crate::xlsx::{self, Row, Sheet, XlsxError};
 /// The sheet writes times with no zone. They are Pacific time.
 const SHEET_ZONE: &str = "America/Los_Angeles";
 
-const APPLICATIONS: &str = "Sheet1";
-const POSTINGS: &str = "Found";
-const HIRING_POSTS: &str = "Hiring Posts";
+pub const APPLICATIONS: &str = "Sheet1";
+pub const POSTINGS: &str = "Found";
+pub const HIRING_POSTS: &str = "Hiring Posts";
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Tracker {
@@ -56,12 +56,16 @@ impl fmt::Display for TrackerError {
 impl std::error::Error for TrackerError {}
 
 pub fn read(file: impl Read + Seek) -> Result<Tracker, TrackerError> {
-    let sheets = xlsx::read(file).map_err(TrackerError::Unreadable)?;
+    read_sheets(&xlsx::read(file).map_err(TrackerError::Unreadable)?)
+}
+
+/// Reads the tracker from its tabs, wherever they came from: an `.xlsx` export or the live sheet.
+pub fn read_sheets(sheets: &[Sheet]) -> Result<Tracker, TrackerError> {
     let mut unreadable = Vec::new();
-    let applications = Table::open(&sheets, APPLICATIONS, &["Company", "Applied On", "Status", "Notes"])?
+    let applications = Table::open(sheets, APPLICATIONS, &["Company", "Applied On", "Status", "Notes"])?
         .records(&mut unreadable, application);
     let postings = Table::open(
-        &sheets,
+        sheets,
         POSTINGS,
         &[
             "Found at",
@@ -80,7 +84,7 @@ pub fn read(file: impl Read + Seek) -> Result<Tracker, TrackerError> {
     )?
     .records(&mut unreadable, posting);
     let hiring_posts = Table::open(
-        &sheets,
+        sheets,
         HIRING_POSTS,
         &[
             "Found at",

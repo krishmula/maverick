@@ -21,6 +21,14 @@ pub struct Row {
 }
 
 impl Row {
+    /// A row built from another source, such as the Sheets API. `cells` pairs a column, from 0, with its cell.
+    pub fn new(number: u32, cells: impl IntoIterator<Item = (u32, Cell)>) -> Self {
+        Self {
+            number,
+            cells: cells.into_iter().collect(),
+        }
+    }
+
     /// `column` counts from 0, so column A is 0.
     pub fn cell(&self, column: u32) -> Option<&Cell> {
         self.cells.get(&column)
