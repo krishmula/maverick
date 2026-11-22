@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::calendar::{self, Event, Slot};
 use crate::google;
 use crate::providers::{self, Job};
-use crate::ticktick::{self, Agenda, Due, NewTask, Project};
+use crate::ticktick::{self, Agenda, Due, Entry, NewTask, Priority, Project};
 
 const INSTRUCTIONS: &str = "You are Mav, the user's planning assistant. The user tells you what to remember, \
 what to do, or what time to set aside. You see their TickTick lists and tasks, their calendar, and their free time. \
@@ -27,6 +27,9 @@ A block needs a date, a time and an end_time. When the user asks you to find tim
 the earliest stretch that fits, and never one that overlaps an event. \
 list is the exact name of one of the user's lists, or null for their default list. \
 calendar is the exact name of one of the user's Google profiles when they say which calendar a block goes on, such as work or school, otherwise null. \
+To finish, change or delete one of the user's existing tasks, use kind complete, change or delete, set task to its ref such as t3, and title to its current title. \
+For change, set only what changes: date and time for a new due date, priority, rename for a new title, and list to move it to another list; leave the rest null. \
+priority is high, medium, low or none. For a new task, set it only when the user names one. \
 For a question about their schedule or tasks, answer from what you see, with no proposals. \
 In reply, say in one or two short plain sentences what you propose or what you found. No em dashes. \
 Never invent tasks or events.";
@@ -37,6 +40,8 @@ pub struct Context {
     pub now: ZonedDateTime,
     pub lists: Vec<Project>,
     pub agenda: Agenda,
+    /// Every undone task in the lists Mav shows, dated ones first. Mav refers to them as t1, t2, …
+    pub tasks: Vec<Entry>,
     /// The calendar from the start of today through the coming week.
     pub events: Vec<Event>,
     /// The names of the user's Google profiles.
@@ -52,14 +57,16 @@ impl Context {
         let ticktick = async {
             match ticktick::stored_token().await? {
                 Some(token) => {
-                    let (lists, agenda) = tokio::try_join!(ticktick::projects(&token), ticktick::agenda(&token, &now))?;
-                    Ok::<_, String>((lists, agenda))
+                    let (lists, tasks) = ticktick::open_tasks(&token).await?;
+                    let tasks = ticktick::entries(&tasks, &lists, now.time_zone());
+                    Ok::<_, String>((lists, tasks))
                 }
-                None => Ok((Vec::new(), Agenda::default())),
+                None => Ok((Vec::new(), Vec::new())),
             }
         };
         let events = calendar::events(start.timestamp(), end.timestamp(), now.time_zone());
-        let ((lists, agenda), events) = tokio::try_join!(ticktick, events)?;
+        let ((lists, tasks), events) = tokio::try_join!(ticktick, events)?;
+        let agenda = Agenda::from_entries(&tasks, &now);
         let profiles = match google::accounts_path() {
             Some(file) => google::accounts(&file)?
                 .iter()
@@ -71,6 +78,7 @@ impl Context {
             now,
             lists,
             agenda,
+            tasks,
             events,
             profiles,
             ticktick: ticktick::Settings::current(),
@@ -102,22 +110,19 @@ impl Context {
         if !self.profiles.is_empty() {
             let _ = write!(text, "\nGoogle profiles: {}", self.profiles.join(", "));
         }
-        text.push_str("\n\nUndone tasks:\n");
-        let sections = [
-            ("overdue", &self.agenda.overdue),
-            ("today", &self.agenda.today),
-            ("coming", &self.agenda.upcoming),
-        ];
-        for (name, entries) in sections {
-            for entry in entries {
-                let _ = writeln!(
-                    text,
-                    "- [{name}] {} ({}, {})",
-                    entry.title,
-                    entry.due.label(),
-                    entry.list
-                );
-            }
+        text.push_str("\n\nUndone tasks (ref: title, due, list, priority):\n");
+        for (index, entry) in self.tasks.iter().enumerate() {
+            let overdue = self.agenda.overdue.iter().any(|late| late.id == entry.id);
+            let _ = writeln!(
+                text,
+                "- t{}: {} ({}, {}, priority {}{})",
+                index + 1,
+                entry.title,
+                entry.when(),
+                entry.list,
+                entry.priority.name(),
+                if overdue { ", overdue" } else { "" }
+            );
         }
         text.push_str("\nCalendar:\n");
         for event in &self.events {
@@ -168,6 +173,11 @@ pub struct Draft {
     pub remind_minutes_before: Option<i64>,
     /// The Google profile a block goes on.
     pub calendar: Option<String>,
+    /// The ref of an existing task, such as `t3`, for complete, change and delete.
+    pub task: Option<String>,
+    pub priority: Option<String>,
+    /// A new title for a task being changed.
+    pub rename: Option<String>,
 }
 
 /// What Mav says back.
@@ -195,6 +205,18 @@ pub enum Action {
         /// The Google profile it goes to. `None` means the one marked for new blocks.
         profile: Option<String>,
     },
+    Complete {
+        entry: Entry,
+    },
+    Change {
+        entry: Entry,
+        change: ticktick::Change,
+        /// The id and name of the list it moves to.
+        to: Option<(String, String)>,
+    },
+    Delete {
+        entry: Entry,
+    },
 }
 
 impl Action {
@@ -202,6 +224,7 @@ impl Action {
         match self {
             Action::Task { task, .. } => &task.title,
             Action::Block { title, .. } => title,
+            Action::Complete { entry } | Action::Change { entry, .. } | Action::Delete { entry } => &entry.title,
         }
     }
 
@@ -210,6 +233,9 @@ impl Action {
         match self {
             Action::Task { .. } => "TickTick · New task",
             Action::Block { .. } => "Calendar · New block",
+            Action::Complete { .. } => "TickTick · Finish",
+            Action::Change { .. } => "TickTick · Change",
+            Action::Delete { .. } => "TickTick · Delete",
         }
     }
 
@@ -222,8 +248,7 @@ impl Action {
                     "Due",
                     match &task.due {
                         None => "no date".to_owned(),
-                        Some(Due::Day(date)) => date.strftime("%a %-d %b").to_string(),
-                        Some(Due::At(at)) => at.strftime("%a %-d %b · %H:%M").to_string(),
+                        Some(due) => due_label(due),
                     },
                 ));
                 if let Some(minutes) = task.remind_before {
@@ -233,6 +258,28 @@ impl Action {
                         (_, minutes) => format!("{} before", calendar::length(minutes)),
                     };
                     facts.push(("Remind", when));
+                }
+                if task.priority != Priority::None {
+                    facts.push(("Priority", task.priority.name().to_owned()));
+                }
+                facts
+            }
+            Action::Complete { entry } | Action::Delete { entry } => {
+                vec![("List", entry.list.clone()), ("Due", entry.when())]
+            }
+            Action::Change { entry, change, to } => {
+                let mut facts = Vec::new();
+                if let Some(title) = &change.title {
+                    facts.push(("Title", format!("{} → {title}", entry.title)));
+                }
+                if let Some(priority) = change.priority {
+                    facts.push(("Priority", format!("{} → {}", entry.priority.name(), priority.name())));
+                }
+                if let Some(due) = &change.due {
+                    facts.push(("Due", format!("{} → {}", entry.when(), due_label(due))));
+                }
+                if let Some((_, name)) = to {
+                    facts.push(("List", format!("{} → {name}", entry.list)));
                 }
                 facts
             }
@@ -258,11 +305,32 @@ impl Action {
 
     /// Writes the action to TickTick or the calendar. Returns what to tell the user.
     pub async fn carry_out(&self) -> Result<String, String> {
+        let token = || async {
+            ticktick::stored_token()
+                .await?
+                .ok_or_else(|| "TickTick is not connected; connect it under Connections".to_owned())
+        };
         match self {
+            Action::Complete { entry } => {
+                ticktick::complete(&token().await?, &entry.list_id, &entry.id).await?;
+                Ok("Finished in TickTick".to_owned())
+            }
+            Action::Delete { entry } => {
+                ticktick::delete(&token().await?, &entry.list_id, &entry.id).await?;
+                Ok("Deleted from TickTick".to_owned())
+            }
+            Action::Change { entry, change, to } => {
+                let token = token().await?;
+                if !change.is_empty() {
+                    ticktick::change(&token, &entry.id, &entry.list_id, change, &TimeZone::system()).await?;
+                }
+                if let Some((list_id, _)) = to {
+                    ticktick::move_to(&token, &entry.id, &entry.list_id, list_id).await?;
+                }
+                Ok("Changed in TickTick".to_owned())
+            }
             Action::Task { task, list } => {
-                let token = ticktick::stored_token()
-                    .await?
-                    .ok_or("TickTick is not connected; run `maverick ticktick token`")?;
+                let token = token().await?;
                 let zone = match &task.due {
                     Some(Due::At(at)) => at.time_zone().clone(),
                     _ => TimeZone::system(),
@@ -315,7 +383,7 @@ fn schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["task", "block"] },
+                        "kind": { "type": "string", "enum": ["task", "block", "complete", "change", "delete"] },
                         "title": { "type": "string" },
                         "list": maybe("string"),
                         "date": { "type": ["string", "null"], "description": "YYYY-MM-DD" },
@@ -323,8 +391,11 @@ fn schema() -> Value {
                         "end_time": { "type": ["string", "null"], "description": "HH:MM, 24-hour, blocks only" },
                         "remind_minutes_before": maybe("integer"),
                         "calendar": maybe("string"),
+                        "task": { "type": ["string", "null"], "description": "an existing task's ref, such as t3" },
+                        "priority": { "type": ["string", "null"], "enum": ["high", "medium", "low", "none", null] },
+                        "rename": maybe("string"),
                     },
-                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before", "calendar"],
+                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before", "calendar", "task", "priority", "rename"],
                     "additionalProperties": false,
                 },
             },
@@ -337,9 +408,6 @@ fn schema() -> Value {
 /// Turns the model's draft into an action, or says why it cannot be one.
 pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
     let title = draft.title.trim();
-    if title.is_empty() {
-        return Err("Mav proposed something with no title".to_owned());
-    }
     let date = draft
         .date
         .as_deref()
@@ -362,6 +430,9 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
             .map_err(|error| error.to_string())
     };
     match draft.kind.as_str() {
+        "complete" | "change" | "delete" => existing(draft.kind.as_str(), draft, context, date, start, &at),
+        "task" if title.is_empty() => Err("Mav proposed a task with no title".to_owned()),
+        "block" if title.is_empty() => Err("Mav proposed a block with no title".to_owned()),
         "task" => {
             let default = context
                 .ticktick
@@ -381,6 +452,7 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
                 list_id,
                 due,
                 remind_before: draft.remind_minutes_before,
+                priority: priority_of(draft)?.unwrap_or_default(),
             };
             Ok(Action::Task { task, list })
         }
@@ -421,6 +493,91 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
     }
 }
 
+/// `Thu 26 Nov · 18:00`, or `Thu 26 Nov` for a whole day.
+fn due_label(due: &Due) -> String {
+    match due {
+        Due::Day(date) => date.strftime("%a %-d %b").to_string(),
+        Due::At(at) => at.strftime("%a %-d %b · %H:%M").to_string(),
+    }
+}
+
+fn priority_of(draft: &Draft) -> Result<Option<Priority>, String> {
+    draft
+        .priority
+        .as_deref()
+        .map(|name| Priority::named(name).ok_or_else(|| format!("Mav gave a priority Maverick does not know: {name}")))
+        .transpose()
+}
+
+/// Checks a draft that finishes, changes or deletes one of the user's tasks.
+fn existing(
+    kind: &str,
+    draft: &Draft,
+    context: &Context,
+    date: Option<Date>,
+    time: Option<Time>,
+    at: &dyn Fn(Date, Time) -> Result<ZonedDateTime, String>,
+) -> Result<Action, String> {
+    let named = draft.task.as_deref().unwrap_or("none");
+    let entry = named
+        .trim()
+        .trim_start_matches('t')
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| context.tasks.get(number.checked_sub(1)?))
+        .cloned()
+        .ok_or_else(|| format!("Mav pointed at a task Maverick cannot find: {named}"))?;
+    match kind {
+        "complete" => Ok(Action::Complete { entry }),
+        "delete" => Ok(Action::Delete { entry }),
+        _ => {
+            let due = match (date, time) {
+                (Some(date), Some(time)) => Some(Due::At(at(date, time)?)),
+                (Some(date), None) => Some(Due::Day(date)),
+                (None, Some(time)) => {
+                    let day = entry.due.as_ref().map_or(context.now.date(), Due::date);
+                    Some(Due::At(at(day, time)?))
+                }
+                (None, None) => None,
+            };
+            let priority = priority_of(draft)?.filter(|priority| *priority != entry.priority);
+            let title = draft
+                .rename
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty() && *title != entry.title)
+                .map(str::to_owned);
+            let to = match draft.list.as_deref() {
+                None => None,
+                Some(name) => {
+                    let (id, list) = list_named(Some(name), &context.lists);
+                    if list == "Inbox" && !name.trim().eq_ignore_ascii_case("inbox") {
+                        return Err(format!("Mav named a list Maverick does not have: {name}"));
+                    }
+                    let id = if id == "inbox" { inbox_id(context) } else { id };
+                    (id != entry.list_id).then_some((id, list))
+                }
+            };
+            let change = ticktick::Change { title, priority, due };
+            if change.is_empty() && to.is_none() {
+                return Err(format!("Mav proposed a change to {} that changes nothing", entry.title));
+            }
+            Ok(Action::Change { entry, change, to })
+        }
+    }
+}
+
+/// The Inbox's real id, which carries a number after `inbox`, taken from a task in it.
+fn inbox_id(context: &Context) -> String {
+    context
+        .tasks
+        .iter()
+        .map(|task| &task.list_id)
+        .find(|id| id.starts_with("inbox"))
+        .cloned()
+        .unwrap_or_else(|| "inbox".to_owned())
+}
+
 /// The id and name of the list called `name`, ignoring case. An unknown name means the Inbox.
 fn list_named(name: Option<&str>, lists: &[Project]) -> (String, String) {
     name.and_then(|name| {
@@ -452,6 +609,7 @@ pub fn follow_up(posting: &str, applied: &ZonedDateTime, lists: &[Project]) -> O
             list_id,
             due: Some(Due::At(due)),
             remind_before: Some(0),
+            priority: Priority::Medium,
         },
         list,
     })
@@ -486,6 +644,24 @@ mod tests {
                 },
             ],
             agenda: Agenda::default(),
+            tasks: vec![
+                Entry {
+                    id: "a1".into(),
+                    list_id: "inbox42".into(),
+                    title: "Study for the quiz".into(),
+                    list: "Inbox".into(),
+                    due: Some(Due::Day(date(2026, 11, 23))),
+                    priority: Priority::Low,
+                },
+                Entry {
+                    id: "a2".into(),
+                    list_id: "p1".into(),
+                    title: "Renew lease".into(),
+                    list: "Job search".into(),
+                    due: None,
+                    priority: Priority::None,
+                },
+            ],
             events: vec![Event {
                 title: "Screen".into(),
                 profile: "Work".into(),
@@ -590,6 +766,73 @@ mod tests {
     }
 
     #[test]
+    fn existing_tasks_are_finished_changed_and_moved_by_ref() {
+        let context = context();
+        let Ok(Action::Complete { entry }) = check(
+            &Draft {
+                task: Some("t2".into()),
+                ..draft("complete")
+            },
+            &context,
+        ) else {
+            panic!("not a finish")
+        };
+        assert_eq!(entry.title, "Renew lease");
+
+        let raise = Draft {
+            task: Some("t1".into()),
+            priority: Some("high".into()),
+            date: Some("2026-11-26".into()),
+            time: Some("18:00".into()),
+            ..draft("change")
+        };
+        let Ok(action) = check(&raise, &context) else {
+            panic!("not a change")
+        };
+        assert_eq!(
+            action.facts(),
+            [
+                ("Priority", "low → high".to_owned()),
+                ("Due", "Mon 23 → Thu 26 Nov · 18:00".to_owned())
+            ]
+        );
+
+        let move_it = Draft {
+            task: Some("t2".into()),
+            list: Some("inbox".into()),
+            ..draft("change")
+        };
+        let Ok(Action::Change { to, .. }) = check(&move_it, &context) else {
+            panic!("not a move")
+        };
+        assert_eq!(to, Some(("inbox42".to_owned(), "Inbox".to_owned())));
+
+        let same = Draft {
+            task: Some("t1".into()),
+            priority: Some("low".into()),
+            ..draft("change")
+        };
+        assert!(check(&same, &context).unwrap_err().contains("changes nothing"));
+        assert!(
+            check(
+                &Draft {
+                    task: Some("t9".into()),
+                    ..draft("delete")
+                },
+                &context
+            )
+            .unwrap_err()
+            .contains("t9")
+        );
+        let nowhere = Draft {
+            task: Some("t1".into()),
+            list: Some("Gym".into()),
+            ..draft("change")
+        };
+        assert!(check(&nowhere, &context).unwrap_err().contains("Gym"));
+    }
+
+    #[test]
     fn a_task_with_no_list_goes_to_the_default_list() {
         let Ok(Action::Task { task, list }) = check(&draft("task"), &context()) else {
             panic!("not a task")
@@ -625,12 +868,22 @@ mod tests {
     }
 
     #[test]
+    fn the_answer_format_allows_every_kind_check_understands() {
+        let kinds = schema()["properties"]["proposals"]["items"]["properties"]["kind"]["enum"].clone();
+        for kind in ["task", "block", "complete", "change", "delete"] {
+            assert!(kinds.as_array().unwrap().iter().any(|allowed| allowed == kind), "{kind} is not allowed");
+        }
+    }
+
+    #[test]
     fn the_model_sees_lists_tasks_events_and_free_time() {
         let described = context().describe();
         assert!(described.contains("Now: Sunday 2026-11-22 16:00 (America/Los_Angeles)"));
         assert!(described.contains("TickTick lists: Inbox, Job search\n"));
         assert!(described.contains("- Mon 2026-11-23 10:00 to 11:00: Screen [Work]"));
         assert!(described.contains("Google profiles: Work, School"));
+        assert!(described.contains("- t1: Study for the quiz (Mon 23, Inbox, priority low)"));
+        assert!(described.contains("- t2: Renew lease (no date, Job search, priority none)"));
         assert!(described.contains("- Mon 2026-11-23 08:00 to 10:00 (2 h)"));
     }
 

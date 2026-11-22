@@ -5,18 +5,53 @@
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
+    AppContext as _, Context, Div, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 use jiff::ZonedDateTime;
 use maverick_core::calendar::Event;
 use maverick_core::mav::{self, Action, Context as Seen, Speaker};
-use maverick_core::ticktick::{Entry, Project};
+use maverick_core::ticktick::{self, Board, Change, Entry, NewTask, Priority, Project};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::ui::{self, Palette, Signal};
 
-const RAIL_WIDTH: f32 = 360.0;
+const RAIL_WIDTH: f32 = 380.0;
+
+/// How the side panel looks, kept between runs in `mav-view.json`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct View {
+    /// True when the side panel is folded into a strip.
+    #[serde(default)]
+    pub collapsed: bool,
+    /// True when tasks are grouped by date instead of priority.
+    #[serde(default)]
+    pub by_date: bool,
+}
+
+impl View {
+    /// Tests never read or write the user's file.
+    fn file() -> Option<std::path::PathBuf> {
+        if cfg!(test) {
+            return None;
+        }
+        maverick_core::data_dir().map(|dir| dir.join("mav-view.json"))
+    }
+
+    fn load() -> Self {
+        Self::file()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(self) {
+        if let Some(file) = Self::file() {
+            let _ = std::fs::write(file, serde_json::to_string(&self).expect("a view always serializes"));
+        }
+    }
+}
 
 /// What Mav has read from TickTick and the calendar.
 #[derive(Clone, Debug)]
@@ -45,7 +80,7 @@ pub enum Card {
 #[derive(Clone, Debug)]
 pub enum Item {
     Said(Speaker, String),
-    Proposal(Action, Card),
+    Proposal(Box<Action>, Card),
     /// A proposal Maverick could not use, and why.
     Refused(String),
 }
@@ -57,7 +92,15 @@ pub struct Mav {
     thinking: bool,
     input: Entity<InputState>,
     background: Handle,
+    view: View,
+    /// Tasks the user ticked, shown as done until the next read drops them.
+    finished: Vec<String>,
+    new_task: Entity<InputState>,
+    new_priority: Priority,
+    /// Why the last change from the side panel failed.
+    rail_problem: Option<String>,
     _typed: Subscription,
+    _added: Subscription,
 }
 
 impl Mav {
@@ -68,14 +111,122 @@ impl Mav {
                 this.send(window, cx);
             }
         });
+        let new_task = cx.new(|cx| InputState::new(window, cx).placeholder("Add a task"));
+        let _added = cx.subscribe_in(&new_task, window, |this, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.add_task(window, cx);
+            }
+        });
         Self {
             loaded: Loaded::Not,
             items: Vec::new(),
             thinking: false,
             input,
             background,
+            view: View::load(),
+            finished: Vec::new(),
+            new_task,
+            new_priority: Priority::Medium,
+            rail_problem: None,
             _typed,
+            _added,
         }
+    }
+
+    /// Runs one TickTick write from the side panel, then reads everything again.
+    fn write(
+        &mut self,
+        work: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.rail_problem = None;
+        let done = self.background.spawn(work);
+        cx.spawn(async move |this, cx| {
+            let done = done.await.map_err(|error| error.to_string()).and_then(|done| done);
+            this.update(cx, |this, cx| {
+                if let Err(error) = done {
+                    this.rail_problem = Some(error);
+                    this.finished.clear();
+                }
+                this.load(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Finishes a task in one click. It shows as done until the next read drops it.
+    fn finish(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if self.finished.contains(&entry.id) {
+            return;
+        }
+        self.finished.push(entry.id.clone());
+        cx.notify();
+        let (list, id) = (entry.list_id.clone(), entry.id.clone());
+        self.write(
+            async move {
+                let token = ticktick::stored_token().await?.ok_or("TickTick is not connected")?;
+                ticktick::complete(&token, &list, &id).await
+            },
+            cx,
+        );
+    }
+
+    /// Moves a task to the next priority: high, medium, low, none, then high again.
+    fn cycle_priority(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        let next = entry.priority.next();
+        if let Loaded::Ready { seen, .. } = &mut self.loaded
+            && let Some(shown) = seen.tasks.iter_mut().find(|task| task.id == entry.id)
+        {
+            shown.priority = next;
+        }
+        cx.notify();
+        let (list, id) = (entry.list_id.clone(), entry.id.clone());
+        self.write(
+            async move {
+                let token = ticktick::stored_token().await?.ok_or("TickTick is not connected")?;
+                let change = Change {
+                    priority: Some(next),
+                    ..Change::default()
+                };
+                ticktick::change(&token, &id, &list, &change, &jiff::tz::TimeZone::system()).await
+            },
+            cx,
+        );
+    }
+
+    /// Adds the typed task to the default list, with the chosen priority.
+    fn add_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.new_task.read(cx).value().trim().to_owned();
+        if title.is_empty() {
+            return;
+        }
+        self.new_task.update(cx, |input, cx| input.set_value("", window, cx));
+        let list_id = ticktick::Settings::current()
+            .default_list
+            .unwrap_or_else(|| "inbox".to_owned());
+        let task = NewTask {
+            title,
+            list_id,
+            due: None,
+            remind_before: None,
+            priority: self.new_priority,
+        };
+        self.write(
+            async move {
+                let token = ticktick::stored_token().await?.ok_or("TickTick is not connected")?;
+                ticktick::create(&token, &task, &jiff::tz::TimeZone::system())
+                    .await
+                    .map(drop)
+            },
+            cx,
+        );
+    }
+
+    fn change_view(&mut self, change: impl FnOnce(&mut View), cx: &mut Context<Self>) {
+        change(&mut self.view);
+        self.view.save();
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -172,7 +323,7 @@ impl Mav {
         }
         for proposal in reply.proposals {
             self.items.push(match proposal {
-                Ok(action) => Item::Proposal(action, Card::Proposed),
+                Ok(action) => Item::Proposal(Box::new(action), Card::Proposed),
                 Err(why) => Item::Refused(why),
             });
         }
@@ -182,7 +333,7 @@ impl Mav {
     /// Offers a proposal Mav came up with itself, such as a follow-up after an application.
     pub fn suggest(&mut self, why: String, action: Action, cx: &mut Context<Self>) {
         self.items.push(Item::Said(Speaker::Mav, why));
-        self.items.push(Item::Proposal(action, Card::Proposed));
+        self.items.push(Item::Proposal(Box::new(action), Card::Proposed));
         cx.notify();
     }
 
@@ -195,7 +346,7 @@ impl Mav {
         }
         *card = Card::Adding;
         cx.notify();
-        let action = action.clone();
+        let action = (**action).clone();
         let added = self.background.spawn(async move { action.carry_out().await });
         cx.spawn(async move |this, cx| {
             let card = match added.await {
@@ -248,7 +399,11 @@ impl Render for Mav {
             .size_full()
             .items_start()
             .child(self.chat(&palette, cx))
-            .child(self.rail(&palette))
+            .child(if self.view.collapsed {
+                self.strip(&palette, cx).into_any_element()
+            } else {
+                self.rail(&palette, cx).into_any_element()
+            })
     }
 }
 
@@ -399,7 +554,28 @@ impl Mav {
             .child(actions)
     }
 
-    fn rail(&self, palette: &Palette) -> impl IntoElement {
+    /// The folded side panel: a strip with the count of pressing tasks.
+    fn strip(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let pressing = self.pressing().map(|count| count.to_string()).unwrap_or_default();
+        v_flex()
+            .flex_none()
+            .w(px(44.))
+            .h_full()
+            .items_center()
+            .py(px(16.))
+            .gap(px(10.))
+            .child(
+                ui::button(
+                    "expand-rail",
+                    "Show the calendar and TickTick",
+                    ui::quiet_face("‹", palette),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.change_view(|view| view.collapsed = false, cx))),
+            )
+            .child(ui::caps(pressing).text_color(palette.signal(Signal::Failed)))
+    }
+
+    fn rail(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let status = match &self.loaded {
             Loaded::Not | Loaded::Loading => "reading".to_owned(),
             Loaded::Failed(_) => "could not read".to_owned(),
@@ -419,15 +595,8 @@ impl Mav {
                     .gap(px(20.))
                     .child(day_section("cal-today", "Today", &on(today), palette))
                     .child(day_section("cal-tomorrow", "Tomorrow", &on(tomorrow), palette))
-                    .child(section(
-                        "overdue",
-                        "Overdue",
-                        &seen.agenda.overdue,
-                        Some(Signal::Failed),
-                        palette,
-                    ))
-                    .child(section("today", "Due today", &seen.agenda.today, None, palette))
-                    .child(section("upcoming", "Coming week", &seen.agenda.upcoming, None, palette))
+                    .child(div().h(px(1.)).bg(palette.line))
+                    .child(self.tasks(seen, palette, cx))
             }
             Loaded::Failed(error) => ui::serif(error.clone()).text_color(palette.signal(Signal::Failed)),
             Loaded::Not | Loaded::Loading => v_flex(),
@@ -444,7 +613,6 @@ impl Mav {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(ui::caps("calendar and ticktick").text_color(palette.muted))
                     .child(
                         div()
                             .id("mav-status")
@@ -452,10 +620,179 @@ impl Mav {
                             .role(gpui_kit::Role::Label)
                             .aria_label(status.clone())
                             .child(ui::caps(status).text_color(palette.faint)),
+                    )
+                    .child(
+                        ui::button(
+                            "collapse-rail",
+                            "Hide the calendar and TickTick",
+                            ui::quiet_face("collapse ›", palette),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.change_view(|view| view.collapsed = true, cx))),
                     ),
             )
             .child(body)
     }
+
+    /// The TickTick part of the side panel: add a task, and every open task by priority or by date.
+    fn tasks(&self, seen: &Seen, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let by_date = self.view.by_date;
+        let switch = |id: &'static str, word: &'static str, on: bool, cx: &mut Context<Self>| -> gpui_kit::AnyElement {
+            let face = ui::caps(word)
+                .px(px(8.))
+                .py(px(1.))
+                .text_color(if on { palette.ink } else { palette.faint });
+            let face = if on { face.bg(palette.line) } else { face };
+            ui::button(id, format!("Group tasks by {word}"), face)
+                .on_click(cx.listener(move |this, _, _, cx| this.change_view(|view| view.by_date = word == "date", cx)))
+                .into_any_element()
+        };
+        let new_priority = self.new_priority;
+        let mut section = v_flex()
+            .gap(px(8.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(heading(
+                        "ticktick-open",
+                        format!("ticktick · {} open", seen.tasks.len()),
+                        palette.muted,
+                    ))
+                    .child(
+                        h_flex()
+                            .border_1()
+                            .border_color(palette.line)
+                            .child(switch("by-priority", "priority", !by_date, cx))
+                            .child(switch("by-date", "date", by_date, cx)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.new_task).id("new-task")),
+                    )
+                    .child(
+                        ui::button(
+                            "new-task-priority",
+                            format!("New task priority {}", new_priority.name()),
+                            priority_tag(new_priority, palette),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.new_priority = new_priority.next();
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .children(self.rail_problem.clone().map(|problem| {
+                ui::serif(problem)
+                    .text_size(px(13.))
+                    .text_color(palette.signal(Signal::Failed))
+            }));
+        let overdue: Vec<&str> = seen.agenda.overdue.iter().map(|entry| entry.id.as_str()).collect();
+        let groups: Vec<(String, Vec<Entry>)> = if by_date {
+            let undated: Vec<Entry> = seen.tasks.iter().filter(|entry| entry.due.is_none()).cloned().collect();
+            vec![
+                ("overdue".to_owned(), seen.agenda.overdue.clone()),
+                ("today".to_owned(), seen.agenda.today.clone()),
+                ("coming week".to_owned(), seen.agenda.upcoming.clone()),
+                ("no date".to_owned(), undated),
+            ]
+        } else {
+            Board::of(&seen.tasks)
+                .groups()
+                .into_iter()
+                .map(|(priority, entries)| (priority.name().to_owned(), entries.to_vec()))
+                .collect()
+        };
+        for (index, (name, entries)) in groups.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            section = section.child(
+                div()
+                    .id(("task-group", index))
+                    .test_support()
+                    .role(gpui_kit::Role::Label)
+                    .aria_label(format!("{name} · {}", entries.len()))
+                    .pt(px(6.))
+                    .child(ui::caps(format!("{name} · {}", entries.len())).text_color(palette.muted)),
+            );
+            for entry in entries {
+                section = section.child(self.task_row(&entry, overdue.contains(&entry.id.as_str()), palette, cx));
+            }
+        }
+        section
+    }
+
+    fn task_row(&self, entry: &Entry, overdue: bool, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let finished = self.finished.contains(&entry.id);
+        let done = palette.signal(Signal::Done);
+        let mark = div()
+            .size(px(11.))
+            .border_1()
+            .border_color(if finished { done } else { palette.muted });
+        let mark = if finished { mark.bg(done) } else { mark };
+        let (finish, cycle) = (entry.clone(), entry.clone());
+        let when = if finished { "done".to_owned() } else { entry.when() };
+        let when_color = if finished {
+            done
+        } else if overdue {
+            palette.signal(Signal::Failed)
+        } else {
+            palette.faint
+        };
+        let title = ui::serif(entry.title.clone())
+            .text_size(px(13.5))
+            .flex_1()
+            .min_w_0()
+            .truncate();
+        let title = if finished {
+            title.line_through().text_color(palette.faint)
+        } else {
+            title
+        };
+        h_flex()
+            .id(gpui_kit::SharedString::from(format!("task-{}", entry.id)))
+            .test_support()
+            .role(gpui_kit::Role::Label)
+            .aria_label(format!("{} · {} · {}", entry.title, entry.priority.name(), when))
+            .gap(px(10.))
+            .py(px(4.))
+            .border_b_1()
+            .border_color(palette.line)
+            .child(
+                ui::button(
+                    gpui_kit::SharedString::from(format!("finish-{}", entry.id)),
+                    format!("Finish {}", entry.title),
+                    mark,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.finish(&finish, cx))),
+            )
+            .child(title)
+            .child(ui::caps(when).flex_none().text_color(when_color))
+            .child(
+                ui::button(
+                    gpui_kit::SharedString::from(format!("priority-{}", entry.id)),
+                    format!("Change the priority of {}", entry.title),
+                    priority_tag(entry.priority, palette),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.cycle_priority(&cycle, cx))),
+            )
+    }
+}
+
+/// The small priority tag: high in ink, medium muted, low and none faint.
+fn priority_tag(priority: Priority, palette: &Palette) -> Div {
+    let (word, color) = match priority {
+        Priority::High => ("high", palette.ink),
+        Priority::Medium => ("med", palette.muted),
+        Priority::Low => ("low", palette.faint),
+        Priority::None => ("none", palette.faint),
+    };
+    ui::boxed(word, color).w(px(40.)).flex().justify_center()
 }
 
 fn heading(id: &'static str, text: String, color: gpui_kit::Hsla) -> impl IntoElement {
@@ -500,57 +837,24 @@ fn day_section(id: &'static str, name: &str, events: &[&Event], palette: &Palett
         .children(events.is_empty().then(|| ui::caps("nothing").text_color(palette.faint)))
 }
 
-/// One heading and its tasks. An empty section says so, so the user knows it was read.
-fn section(id: &'static str, name: &str, entries: &[Entry], signal: Option<Signal>, palette: &Palette) -> Div {
-    let accent = signal.map_or(palette.muted, |signal| palette.signal(signal));
-    let color = if entries.is_empty() { palette.faint } else { accent };
-    v_flex()
-        .gap(px(2.))
-        .child(heading(id, format!("{name} · {}", entries.len()), color))
-        .children(entries.iter().map(|entry| {
-            h_flex()
-                .gap(px(10.))
-                .py(px(4.))
-                .border_b_1()
-                .border_color(palette.line)
-                .child(div().flex_none().size(px(9.)).border_1().border_color(palette.muted))
-                .child(
-                    ui::serif(entry.title.clone())
-                        .text_size(px(13.5))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate(),
-                )
-                .child(
-                    ui::caps(entry.due.label())
-                        .flex_none()
-                        .text_color(accent)
-                        .font_weight(FontWeight::MEDIUM),
-                )
-        }))
-        .children(
-            entries
-                .is_empty()
-                .then(|| ui::caps("nothing").text_color(palette.faint)),
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, TestAppContext, WindowOptions};
     use jiff::civil::date;
     use maverick_core::mav::{Action, Context as Seen, Reply};
-    use maverick_core::ticktick::{Agenda, Due, Entry, NewTask};
+    use maverick_core::ticktick::{Agenda, Due, Entry, NewTask, Priority};
 
     use super::{Card, Item, Mav, ready};
 
-    fn entry(title: &str, due: Due) -> Entry {
+    fn entry(id: &str, title: &str, due: Option<Due>, priority: Priority) -> Entry {
         Entry {
+            id: id.into(),
+            list_id: "inbox1".into(),
             title: title.into(),
             list: "Inbox".into(),
             due,
-            priority: 0,
+            priority,
         }
     }
 
@@ -561,6 +865,7 @@ mod tests {
                 list_id: "inbox".into(),
                 due: None,
                 remind_before: None,
+                priority: Priority::None,
             },
             list: "Inbox".into(),
         }
@@ -584,17 +889,25 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("mav-status").label(), Some("reading"));
 
+            let now = date(2026, 11, 22)
+                .at(16, 12, 0, 0)
+                .in_tz("America/Los_Angeles")
+                .unwrap();
+            let tasks = vec![
+                entry("a", "Renew lease", Some(Due::Day(date(2026, 11, 20))), Priority::High),
+                entry(
+                    "b",
+                    "Send references",
+                    Some(Due::Day(date(2026, 11, 23))),
+                    Priority::Medium,
+                ),
+                entry("c", "Read a book", None, Priority::Low),
+            ];
             let seen = Seen {
-                now: date(2026, 11, 22)
-                    .at(16, 12, 0, 0)
-                    .in_tz("America/Los_Angeles")
-                    .unwrap(),
+                agenda: Agenda::from_entries(&tasks, &now),
+                now,
                 lists: Vec::new(),
-                agenda: Agenda {
-                    overdue: vec![entry("Renew lease", Due::Day(date(2026, 11, 20)))],
-                    today: Vec::new(),
-                    upcoming: vec![entry("Send references", Due::Day(date(2026, 11, 23)))],
-                },
+                tasks,
                 events: Vec::new(),
                 profiles: Vec::new(),
                 ticktick: Default::default(),
@@ -602,9 +915,23 @@ mod tests {
             mav.update(cx, |mav, cx| mav.set(ready(seen), cx));
             window.render_frame(cx);
             assert_eq!(window.find("mav-status").label(), Some("read at 4:12 PM"));
-            assert_eq!(window.find("overdue").label(), Some("Overdue · 1"));
+            assert_eq!(window.find("ticktick-open").label(), Some("ticktick · 3 open"));
+            assert_eq!(window.find(("task-group", 0usize)).label(), Some("high · 1"));
+            assert_eq!(window.find("task-a").label(), Some("Renew lease · high · Fri 20"));
+            assert_eq!(window.find("task-c").label(), Some("Read a book · low · no date"));
             assert_eq!(window.find("cal-tomorrow").label(), Some("Tomorrow · 0"));
             assert_eq!(mav.read(cx).pressing(), Some(1));
+
+            mav.update(cx, |mav, cx| mav.change_view(|view| view.by_date = true, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find(("task-group", 0usize)).label(), Some("overdue · 1"));
+            assert_eq!(window.find(("task-group", 3usize)).label(), Some("no date · 1"));
+
+            mav.update(cx, |mav, cx| mav.change_view(|view| view.collapsed = true, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("task-a").is_none());
+            assert!(window.try_find("expand-rail").is_some());
+            mav.update(cx, |mav, cx| mav.change_view(|view| view.collapsed = false, cx));
 
             let reply = Reply {
                 text: "I propose a task.".into(),
