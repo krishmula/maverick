@@ -146,8 +146,83 @@ fn outside_us(location: &str) -> bool {
     }
     let lower = location.to_lowercase();
     let in_us = ["united states", "usa", "u.s."].iter().any(|name| lower.contains(name))
-        || lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| word == "us");
+        || lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| word == "us")
+        || location.split([';', '|']).any(names_a_us_place);
     !in_us && !lower.contains("remote") && lower.chars().any(char::is_alphabetic)
+}
+
+/// Two-letter codes of the states, the capital and the territories.
+const STATE_CODES: &[&str] = &[
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA",
+    "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR",
+    "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "PR",
+];
+
+const STATE_NAMES: &[&str] = &[
+    "alabama",
+    "alaska",
+    "arizona",
+    "arkansas",
+    "california",
+    "colorado",
+    "connecticut",
+    "delaware",
+    "district of columbia",
+    "florida",
+    "georgia",
+    "hawaii",
+    "idaho",
+    "illinois",
+    "indiana",
+    "iowa",
+    "kansas",
+    "kentucky",
+    "louisiana",
+    "maine",
+    "maryland",
+    "massachusetts",
+    "michigan",
+    "minnesota",
+    "mississippi",
+    "missouri",
+    "montana",
+    "nebraska",
+    "nevada",
+    "new hampshire",
+    "new jersey",
+    "new mexico",
+    "new york",
+    "north carolina",
+    "north dakota",
+    "ohio",
+    "oklahoma",
+    "oregon",
+    "pennsylvania",
+    "rhode island",
+    "south carolina",
+    "south dakota",
+    "tennessee",
+    "texas",
+    "utah",
+    "vermont",
+    "virginia",
+    "washington",
+    "west virginia",
+    "wisconsin",
+    "wyoming",
+];
+
+/// Short names job boards use for US places without naming a state.
+const US_SHORT_NAMES: &[&str] = &["sf", "nyc", "bay area", "sf bay area", "silicon valley"];
+
+/// True when one place, such as `Charlotte, NC` or `SF`, is in the United States.
+/// Job boards often name the state alone and leave the country out.
+fn names_a_us_place(place: &str) -> bool {
+    let place = place.trim();
+    let last = place.rsplit(',').next().unwrap_or("").trim();
+    STATE_CODES.contains(&last)
+        || STATE_NAMES.contains(&last.to_lowercase().as_str())
+        || US_SHORT_NAMES.contains(&place.to_lowercase().as_str())
 }
 
 /// Lowercase words. Letters, digits, `+` and `#` stay in a word, and so does a hyphen inside one.
@@ -327,6 +402,18 @@ mod tests {
         );
         assert_eq!(prefilter(title, Some("Remote")), None);
         assert_eq!(prefilter(title, Some("Austin, TX, US")), None);
+        for place in [
+            "Charlotte, NC",
+            "SF",
+            "Arlington County, Arlington, VA",
+            "Toronto, ON; Austin, Texas",
+        ] {
+            assert_eq!(prefilter(title, Some(place)), None, "{place}");
+        }
+        assert_eq!(
+            prefilter(title, Some("Toronto, ON, Canada; Waterloo, ON, Canada")),
+            Some(SkipReason::OutsideUs)
+        );
         assert_eq!(prefilter(title, None), None);
     }
 

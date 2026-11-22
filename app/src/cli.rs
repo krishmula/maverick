@@ -286,3 +286,19 @@ pub fn check_scores(count: usize) -> Result<(), Box<dyn Error>> {
     println!("Closed since: {closed}. Could not score: {failed}.");
     Ok(())
 }
+
+/// One funnel pass now, whatever the hour: pulls new postings, then scores what is found.
+pub fn run() -> Result<(), Box<dyn Error>> {
+    let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
+    let profile = profile()?;
+    let pass = runtime()?.block_on(maverick_core::funnel::run_once(&database, profile))?;
+    for posting in &pass.scored {
+        println!("{}", scored_line(posting));
+    }
+    println!(
+        "{} repeats and {} title-rule skips marked; {} with no readable source",
+        pass.duplicates, pass.skipped_by_rules, pass.unreadable
+    );
+    println!("{}", pass.summary());
+    Ok(())
+}

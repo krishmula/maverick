@@ -208,7 +208,11 @@ pub async fn score(posting: Posting, profile: &Profile) -> Posting {
         Err(error) => return not_scored(posting, &format!("could not read the posting: {error}")),
     };
     match read(&posting, &description, profile).await {
-        Ok(reading) => decided(&posting, &reading, description.address),
+        Ok(reading) => {
+            // An address intake already knows is better than one followed from a redirect.
+            let address = posting.address.clone().or(description.address);
+            decided(&posting, &reading, address)
+        }
         Err(error) => not_scored(posting, &error),
     }
 }

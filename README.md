@@ -203,6 +203,20 @@ cargo run --release -p maverick -- check-rules
 
 The report counts what the rules would skip and lists each posting where the rules and the stored decision disagree.
 
+## Find new postings
+
+While the app is open, it runs the funnel every hour from 8 AM to 11 PM Pacific time, starting a minute after launch. Each pass pulls new postings and then scores what is found. The bar shows what the last pass did, and the Jobs list updates. A pass never submits an application.
+
+Intake reads [Simplify's new-grad list](https://github.com/SimplifyJobs/New-Grad-Positions), which is also the source of the SWE List email, about a day earlier than the email. It adds open Software and AI/ML/Data listings from the last 72 hours that the database does not hold yet. It records each one by its Simplify page and keeps the original application address.
+
+To run one pass now at any hour, run:
+
+```sh
+cargo run --release -p maverick -- run
+```
+
+Notify.careers postings still arrive only by email, so they still come in through the tracker import.
+
 ## Score found postings
 
 Scoring reads the description of each posting still marked found and decides whether it is worth applying to:
