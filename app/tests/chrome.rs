@@ -331,10 +331,16 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
             "Can work in an office five days a week.",
             "Current job: Software Engineer at Example Robotics.",
         ],
+        "background": [
+            "Ada Example. Software Engineer at Example Robotics, 2023 to present.",
+            "Built a job queue in Rust that cut nightly batch time from 6 hours to 40 minutes.",
+            "Shipped a retrieval feature for support agents with reranking, judged on a held-out set of 300 tickets.",
+        ],
     }))
     .unwrap();
 
-    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    let tab = titled(&tabs, "First").unwrap();
+    let page = Page::attach(bridge.clone(), &tab).await.unwrap();
     page.navigate(&posting).await.unwrap();
     let report = ashby::fill(&page, &answers).await.unwrap();
     assert_eq!(report.model_problem, None);
@@ -346,6 +352,7 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
                 let by = match by {
                     Source::StandardAnswer => "filled ".to_owned(),
                     Source::Model { basis } => format!("model   [{basis}]"),
+                    Source::Draft { basis } => format!("draft   [{basis}]"),
                 };
                 println!("{by} ({required}) {}: {shown}", outcome.title)
             }
@@ -364,6 +371,18 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
             .any(|outcome| matches!(outcome.result, FieldResult::Filled { .. })),
         "at least one field was filled"
     );
+
+    // The extension can look at the page without the debugger. The form is there and unsent.
+    let has = |selector: &str| {
+        let check = Command::HasElement {
+            tab_id: tab.tab.id,
+            selector: selector.to_owned(),
+        };
+        let bridge = bridge.clone();
+        async move { bridge.request(tab.connection, &check).await.unwrap() }
+    };
+    assert_eq!(has(".ashby-application-form-submit-button").await, true);
+    assert_eq!(has(ashby::SUBMITTED).await, false);
 
     // A second run finds the standard answers already in place and changes none of them.
     let again = ashby::fill(&page, &answers).await.unwrap().outcomes;

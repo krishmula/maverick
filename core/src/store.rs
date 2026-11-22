@@ -158,6 +158,32 @@ impl Store {
     }
 
     /// Every posting, oldest first.
+    /// Records an application the user submitted: the postings at `posting_links` become applied,
+    /// and the application is added unless one with the same link is already recorded.
+    pub fn record_application(&mut self, posting_links: &[String], sent: &Application) -> Result<(), StoreError> {
+        let write = self.db.transaction()?;
+        for link in posting_links {
+            write.execute(
+                "UPDATE postings SET stage = ?1 WHERE link = ?2",
+                params![Stage::Applied.as_str(), link],
+            )?;
+        }
+        write.execute(
+            "INSERT INTO applications (sheet_row, role, link, applied_on, status, notes)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (SELECT 1 FROM applications WHERE link = ?3)",
+            params![
+                sent.sheet_row,
+                sent.role,
+                sent.link,
+                sent.applied_on.to_string(),
+                sent.status.as_str(),
+                sent.notes,
+            ],
+        )?;
+        write.commit()
+    }
+
     pub fn postings(&self) -> Result<Vec<Posting>, StoreError> {
         let mut select = self.db.prepare(
             "SELECT link, found_at, source, company, title, location, email_subject, stage, score, variant, flags, notes

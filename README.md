@@ -51,7 +51,11 @@ Answers come from two places:
 - Your standard answers go in first. They are fixed rules, so the same question always gets the same answer.
 - A Claude model then answers what the rules left, using only the `facts` in your answers file. It runs through the `claude` command you are signed in to, so there is no API key. With no facts in the file, no model is asked.
 
-The model leaves pay questions, essay questions, demographic questions and agreements for you. Maverick lists every answer the model gave, with the fact it used, and every field it left.
+- For essay questions, the model writes a draft from the `background` in your answers file, which holds your resume as text, and from the job description. Read each draft before you submit. With no background in the file, essays are left for you.
+
+The model leaves pay questions, demographic questions and agreements for you. Maverick lists every answer and every draft the model gave, with what it used, and every field it left.
+
+After a fill, Maverick watches the tab for Ashby's confirmation. When you submit, it marks the posting as applied in the local database, records the application, and takes the job off the list. The watch stops after 30 minutes or when the tab closes.
 
 Your standard answers live in `~/Library/Application Support/dev.maverick.app/answers.json`. The file is read on every fill:
 
@@ -70,6 +74,10 @@ Your standard answers live in `~/Library/Application Support/dev.maverick.app/an
   "facts": [
     "Lives in Springfield, Illinois, in the Central time zone.",
     "Citizen of Canada. Will need visa sponsorship in the future."
+  ],
+  "background": [
+    "Software Engineer at Example Robotics, 2023 to present.",
+    "Built a job queue in Rust that cut nightly batch time from 6 hours to 40 minutes."
   ]
 }
 ```

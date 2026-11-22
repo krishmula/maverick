@@ -36,16 +36,50 @@ pub struct ModelAnswer {
     pub basis: String,
 }
 
-/// Answers `questions` in order. `job` says which posting the form belongs to.
+const ESSAY_INSTRUCTIONS: &str = "You draft answers to the written questions on a job application, \
+for the applicant described by the resume and the facts. Write in the first person, as the applicant. \
+Use only what the resume and the facts say. Never invent experience, employers, projects, tools or numbers. \
+Tie the answer to the job where the job description gives a reason to. \
+Write 60 to 130 words unless the question asks for another length. \
+Use plain, specific sentences. No em dashes, no bullet lists, no greeting and no sign-off. \
+Answer null when the resume does not cover what the question asks, \
+or when the field asks no specific question, such as 'Additional information' or 'Cover letter'. \
+In basis, name the part of the resume you used in one short sentence.";
+
+/// Answers factual `questions` in order, from the user's facts. `job` says which posting the form belongs to.
 pub async fn answer(facts: &[String], job: &str, questions: &[&Question]) -> Result<Vec<ModelAnswer>, String> {
+    ask(INSTRUCTIONS, request(facts, job, questions), questions.len()).await
+}
+
+/// Drafts answers to essay `questions` in order, from the user's resume.
+pub async fn draft(
+    background: &[String],
+    facts: &[String],
+    job: &str,
+    description: &str,
+    questions: &[&Question],
+) -> Result<Vec<ModelAnswer>, String> {
+    let mut asked = String::from("The applicant's resume:\n");
+    for line in background {
+        let _ = writeln!(asked, "{line}");
+    }
+    let _ = write!(
+        asked,
+        "\n{}\nThe job description:\n{description}\n",
+        request(facts, job, questions)
+    );
+    ask(ESSAY_INSTRUCTIONS, asked, questions.len()).await
+}
+
+async fn ask(instructions: &str, request: String, questions: usize) -> Result<Vec<ModelAnswer>, String> {
     let run = Command::new(claude_command())
         .arg("--print")
-        .arg(request(facts, job, questions))
+        .arg(request)
         .args(["--model", MODEL, "--output-format", "json"])
         // No tools, no project or user settings, no saved session: one question in, one answer out.
         .args(["--tools", "", "--strict-mcp-config", "--setting-sources", ""])
         .args(["--no-session-persistence", "--disable-slash-commands"])
-        .args(["--system-prompt", INSTRUCTIONS])
+        .args(["--system-prompt", instructions])
         .args(["--json-schema", &reply_schema().to_string()])
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
@@ -59,7 +93,7 @@ pub async fn answer(facts: &[String], job: &str, questions: &[&Question]) -> Res
         let said = String::from_utf8_lossy(&output.stderr);
         format!("the claude command failed: {}", said.trim())
     })?;
-    answers_in(&reply, questions.len())
+    answers_in(&reply, questions)
 }
 
 /// `claude` is often installed where an app started from the Dock does not look.

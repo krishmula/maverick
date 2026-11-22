@@ -7,8 +7,10 @@ use std::time::Duration;
 use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
 use maverick_core::ashby::{self, Report};
-use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, Tab};
+use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
+use maverick_core::jobs::{Application, posting_address};
 use maverick_core::page::Page;
+use maverick_core::store::Store;
 use tokio::runtime::Handle;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,11 +29,30 @@ pub enum Fill {
     Failed { title: String, reason: String },
 }
 
+/// An application the user submitted in this run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Applied {
+    pub title: String,
+    /// The posting's address.
+    pub address: String,
+    /// Why the local database could not record it, when it could not.
+    pub not_saved: Option<String>,
+}
+
+/// How often a filled form is checked for a submission, and for how long.
+const SUBMIT_CHECK_GAP: Duration = Duration::from_secs(2);
+const SUBMIT_WATCH: Duration = Duration::from_secs(30 * 60);
+
 pub struct Browser {
     bridge: Arc<Bridge>,
     background: Handle,
     extension_dir: Result<PathBuf, String>,
     answers_file: Option<PathBuf>,
+    database: Option<PathBuf>,
+    applied: Vec<Applied>,
+    /// The connections the last latency measurement covered.
+    measured: Vec<ConnectionId>,
+    measures: u64,
     extension_is_outdated: bool,
     fill: Fill,
     state: BrowserState,
@@ -46,6 +67,7 @@ impl Browser {
         background: Handle,
         extension_dir: Result<PathBuf, String>,
         answers_file: Option<PathBuf>,
+        database: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut states = bridge.subscribe();
@@ -63,6 +85,10 @@ impl Browser {
             background,
             extension_dir,
             answers_file,
+            database,
+            applied: Vec::new(),
+            measured: Vec::new(),
+            measures: 0,
             extension_is_outdated: false,
             fill: Fill::Idle,
             latency: Latency::Measuring,
@@ -71,6 +97,7 @@ impl Browser {
         };
         if browser.is_connected() {
             browser.extension_is_outdated = browser.bridge.extension_is_outdated();
+            browser.measured = browser.bridge.connections();
             browser.measure(cx);
         }
         browser
@@ -96,6 +123,8 @@ impl Browser {
 
     pub fn measure(&mut self, cx: &mut Context<Self>) {
         self.latency = Latency::Measuring;
+        self.measures += 1;
+        let measure = self.measures;
         cx.notify();
         let bridge = self.bridge.clone();
         let pinged = self.background.spawn(async move { bridge.slowest_ping().await });
@@ -106,8 +135,11 @@ impl Browser {
                 Err(error) => Latency::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
-                this.latency = latency;
-                cx.notify();
+                // An older measurement can finish last, for example one cut off by a reconnect.
+                if this.measures == measure {
+                    this.latency = latency;
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -144,6 +176,11 @@ impl Browser {
         self.extension_is_outdated
     }
 
+    /// The applications the user submitted in this run, oldest first.
+    pub fn applied(&self) -> &[Applied] {
+        &self.applied
+    }
+
     pub fn fill(&self) -> &Fill {
         &self.fill
     }
@@ -164,23 +201,73 @@ impl Browser {
         }
         self.fill = Fill::Running { title: title.clone() };
         cx.notify();
-        let filled = self
-            .background
-            .spawn(fill_form(self.bridge.clone(), target, self.answers_file.clone()));
+        let filled = self.background.spawn(fill_form(
+            self.bridge.clone(),
+            title.clone(),
+            target,
+            self.answers_file.clone(),
+        ));
         cx.spawn(async move |this, cx| {
-            let fill = match filled.await {
-                Ok(Ok(report)) => Fill::Done { title, report },
-                Ok(Err(reason)) => Fill::Failed { title, reason },
-                Err(error) => Fill::Failed {
-                    title,
-                    reason: error.to_string(),
-                },
+            let (fill, filled) = match filled.await {
+                Ok(Ok(filled)) => (
+                    Fill::Done {
+                        title: title.clone(),
+                        report: filled.report.clone(),
+                    },
+                    Some(filled),
+                ),
+                Ok(Err(reason)) => (Fill::Failed { title, reason }, None),
+                Err(error) => (
+                    Fill::Failed {
+                        title,
+                        reason: error.to_string(),
+                    },
+                    None,
+                ),
             };
             this.update(cx, |this, cx| {
                 this.fill = fill;
+                if let Some(filled) = filled {
+                    this.watch_for_submit(filled, cx);
+                }
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Waits for the user to submit a filled form, then records the application.
+    fn watch_for_submit(&mut self, filled: Filled, cx: &mut Context<Self>) {
+        let Filled {
+            tab, title, address, ..
+        } = filled;
+        let (bridge, database) = (self.bridge.clone(), self.database.clone());
+        let recorded = self.background.spawn(async move {
+            if !submitted(&bridge, tab.connection, tab.tab.id, SUBMIT_CHECK_GAP, SUBMIT_WATCH).await {
+                return None;
+            }
+            let (role, link) = (title.clone(), address.clone());
+            let saved = tokio::task::spawn_blocking(move || record_applied(database.as_deref(), &role, &link)).await;
+            let not_saved = match saved {
+                Ok(Ok(())) => None,
+                Ok(Err(reason)) => Some(reason),
+                Err(stopped) => Some(stopped.to_string()),
+            };
+            Some(Applied {
+                title,
+                address,
+                not_saved,
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(applied)) = recorded.await {
+                this.update(cx, |this, cx| {
+                    this.applied.push(applied);
+                    cx.notify();
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -197,11 +284,16 @@ impl Browser {
     }
 
     fn set_state(&mut self, state: BrowserState, cx: &mut Context<Self>) {
-        let was_connected = self.is_connected();
         self.state = state;
         self.extension_is_outdated = self.is_connected() && self.bridge.extension_is_outdated();
-        if self.is_connected() && !was_connected {
-            self.measure(cx);
+        // States can arrive merged, so a reconnect may never show as a disconnect.
+        // A changed set of connections is the reliable sign that the link is new.
+        let connections = self.bridge.connections();
+        if connections != self.measured {
+            self.measured = connections;
+            if self.is_connected() {
+                self.measure(cx);
+            }
         }
         cx.notify();
     }
@@ -215,7 +307,58 @@ enum Target {
     Posting(String),
 }
 
-async fn fill_form(bridge: Arc<Bridge>, target: Target, answers_file: Option<PathBuf>) -> Result<Report, String> {
+/// A form that was filled and now waits for the user to submit it.
+struct Filled {
+    report: Report,
+    tab: Tab,
+    title: String,
+    /// The posting's address.
+    address: String,
+}
+
+/// True once the tab shows Ashby's confirmation. False when the tab closes, Chrome goes away,
+/// or `limit` passes first.
+async fn submitted(bridge: &Bridge, connection: ConnectionId, tab_id: i32, gap: Duration, limit: Duration) -> bool {
+    let check = Command::HasElement {
+        tab_id,
+        selector: ashby::SUBMITTED.to_owned(),
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(gap).await;
+        match bridge.request(connection, &check).await {
+            Ok(shown) if shown == true => return true,
+            // A slow answer says nothing about the page.
+            Ok(_) | Err(BridgeError::Timeout) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Marks the posting applied in the local database and adds the application.
+fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<(), String> {
+    let database = database.ok_or("This system has no application data directory.")?;
+    let said = |error: maverick_core::store::StoreError| error.to_string();
+    let mut store = Store::open(database).map_err(said)?;
+    let links: Vec<String> = store
+        .postings()
+        .map_err(said)?
+        .into_iter()
+        .map(|posting| posting.link)
+        .filter(|link| ashby::posting_address(&posting_address(link)).as_deref() == Some(address))
+        .collect();
+    store
+        .record_application(&links, &Application::submitted_today(role, address))
+        .map_err(said)
+}
+
+async fn fill_form(
+    bridge: Arc<Bridge>,
+    title: String,
+    target: Target,
+    answers_file: Option<PathBuf>,
+) -> Result<Filled, String> {
     let answers_file = answers_file.ok_or("This system has no application data directory.")?;
     // Read on every run, so an edit to the file counts at once.
     let answers = Answers::load(&answers_file)?;
@@ -259,6 +402,11 @@ async fn fill_form(bridge: Arc<Bridge>, target: Target, answers_file: Option<Pat
             (Tab { connection, tab }, Some(form))
         }
     };
+    let address = match &form {
+        Some(form) => ashby::posting_address(form),
+        None => ashby::posting_address(&tab.tab.url),
+    }
+    .ok_or("This tab is not on a posting Maverick can fill.")?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
     let report = match form {
         Some(form) => match page.navigate(&form).await {
@@ -271,5 +419,98 @@ async fn fill_form(bridge: Arc<Bridge>, target: Target, answers_file: Option<Pat
     let detached = page.detach().await;
     let report = report.map_err(|error| error.to_string())?;
     detached.map_err(|error| error.to_string())?;
-    Ok(report)
+    Ok(Filled {
+        report,
+        tab,
+        title,
+        address,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use maverick_core::bridge;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// Answers each page check from `answers`, in order, as the extension would.
+    fn fake_chrome(socket: &Path, answers: Vec<Value>) -> std::thread::JoinHandle<Vec<Value>> {
+        let mut chrome = UnixStream::connect(socket).unwrap();
+        std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for answer in answers {
+                let mut length = [0u8; 4];
+                chrome.read_exact(&mut length).unwrap();
+                let mut body = vec![0u8; u32::from_ne_bytes(length) as usize];
+                chrome.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let mut reply = answer;
+                reply["id"] = request["id"].clone();
+                let reply = serde_json::to_vec(&reply).unwrap();
+                chrome
+                    .write_all(&u32::try_from(reply.len()).unwrap().to_ne_bytes())
+                    .unwrap();
+                chrome.write_all(&reply).unwrap();
+                asked.push(request);
+            }
+            asked
+        })
+    }
+
+    async fn watch(answers: Vec<Value>) -> (bool, Vec<Value>) {
+        let scratch = tempfile::tempdir().unwrap();
+        let socket = scratch.path().join("bridge.sock");
+        let bridge = Bridge::new();
+        tokio::spawn(bridge.clone().serve(bridge::bind(&socket).unwrap()));
+        let chrome = fake_chrome(&socket, answers);
+        while bridge.connections().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let connection = bridge.connections()[0];
+        let gap = Duration::from_millis(5);
+        let seen = submitted(&bridge, connection, 31, gap, Duration::from_secs(5)).await;
+        (seen, chrome.join().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watch_ends_when_the_confirmation_shows() {
+        let no = json!({ "kind": "result", "value": false });
+        let yes = json!({ "kind": "result", "value": true });
+        let (seen, asked) = watch(vec![no.clone(), no, yes]).await;
+        assert!(seen);
+        assert_eq!(asked.len(), 3);
+        assert_eq!(
+            asked[0],
+            json!({
+                "id": asked[0]["id"],
+                "method": "tabs.has",
+                "tabId": 31,
+                "selector": ".ashby-application-form-success-container",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watch_gives_up_when_the_tab_is_gone() {
+        let no = json!({ "kind": "result", "value": false });
+        let gone = json!({ "kind": "error", "message": "No tab with id: 31" });
+        assert!(!watch(vec![no, gone]).await.0);
+    }
+
+    #[test]
+    fn a_submitted_application_is_saved_under_the_posting_address() {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let address = "https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb9455";
+        record_applied(Some(&database), "Backend Engineer at Example Co", address).unwrap();
+        let saved = Store::open(&database).unwrap().applications().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].link.as_deref(), Some(address));
+        assert_eq!(saved[0].role.as_deref(), Some("Backend Engineer at Example Co"));
+        assert!(record_applied(None, "x", address).is_err());
+    }
 }

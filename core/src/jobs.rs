@@ -81,14 +81,32 @@ pub struct Posting {
 /// An application that was submitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Application {
-    /// The row in the tracker sheet. It identifies an application that came from the sheet.
-    pub sheet_row: u32,
+    /// The row in the tracker sheet. `None` for an application Maverick recorded itself.
+    pub sheet_row: Option<u32>,
     /// Company and role as one line. The sheet export can lose it, so it may be absent.
     pub role: Option<String>,
     pub link: Option<String>,
     pub applied_on: Date,
     pub status: ApplicationStatus,
     pub notes: Option<String>,
+}
+
+impl Application {
+    /// An application the user just submitted through Maverick.
+    pub fn submitted_today(role: &str, link: &str) -> Self {
+        Self {
+            sheet_row: None,
+            role: Some(role.to_owned()),
+            link: Some(link.to_owned()),
+            // The tracker keeps its dates in Pacific time, so this does too.
+            applied_on: Timestamp::now()
+                .in_tz("America/Los_Angeles")
+                .expect("the time zone database has Pacific time")
+                .date(),
+            status: ApplicationStatus::Pending,
+            notes: Some("Submitted with Maverick".to_owned()),
+        }
+    }
 }
 
 /// A post where someone says they are hiring. `post_link` and `role` together identify it.

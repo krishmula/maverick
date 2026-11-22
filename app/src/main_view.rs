@@ -34,8 +34,21 @@ impl MainView {
         let jobs = cx.new(|cx| ListState::new(JobList::new(jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let _subscriptions = vec![
-            cx.observe_in(&browser, window, |this, _, window, cx| {
+            cx.observe_in(&browser, window, |this, browser, window, cx| {
                 this.show_current_tabs(window, cx);
+                // A job leaves the list once its application went through.
+                let applied: Vec<String> = browser
+                    .read(cx)
+                    .applied()
+                    .iter()
+                    .map(|sent| sent.address.clone())
+                    .collect();
+                this.jobs.update(cx, |jobs, cx| {
+                    for address in &applied {
+                        jobs.delegate_mut().remove(address);
+                    }
+                    cx.notify();
+                });
                 cx.notify();
             }),
             cx.subscribe_in(&tabs, window, |this, tabs, event: &ListEvent, window, cx| {
@@ -201,6 +214,14 @@ impl MainView {
                     {
                         lines.push(line(outcome, format!("the model answered {shown:?}. {basis}")));
                     }
+                    if let FieldResult::Filled {
+                        by: Source::Draft { basis },
+                        ..
+                    } = &outcome.result
+                    {
+                        let note = format!("the model drafted this. Read it before you submit. {basis}");
+                        lines.push(line(outcome, note));
+                    }
                 }
                 (
                     format!(
@@ -340,6 +361,17 @@ impl Render for MainView {
                      Open chrome://extensions and click the reload arrow on Maverick Bridge.",
                     )
             }))
+            .children(self.browser.read(cx).applied().last().map(|sent| {
+                let note = match &sent.not_saved {
+                    None => format!("Submitted: {}. Marked as applied.", sent.title),
+                    Some(reason) => format!("Submitted: {}. It could not be saved: {reason}", sent.title),
+                };
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_color(cx.theme().success)
+                    .child(SharedString::from(note))
+            }))
             .children(self.fill_report(cx))
             .child(if connected {
                 div()
@@ -437,8 +469,9 @@ mod tests {
         cx.update(gpui_kit::init);
         let extension_dir = PathBuf::from("/data/maverick/extension");
         let background = runtime.handle().clone();
-        let browser =
-            cx.update(|cx| cx.new(|cx| Browser::new(bridge.clone(), background, Ok(extension_dir), answers_file, cx)));
+        let browser = cx.update(|cx| {
+            cx.new(|cx| Browser::new(bridge.clone(), background, Ok(extension_dir), answers_file, None, cx))
+        });
         let shown = browser.clone();
         let (window, _view) = cx.update(|cx| {
             let options = WindowOptions {

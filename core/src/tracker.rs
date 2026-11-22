@@ -179,7 +179,7 @@ impl<'a> Record<'a> {
 
 fn application(record: &Record<'_>) -> Result<Application, String> {
     Ok(Application {
-        sheet_row: record.row.number,
+        sheet_row: Some(record.row.number),
         role: record.owned("Company"),
         link: record
             .cell("Company")

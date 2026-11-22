@@ -257,7 +257,7 @@ fn the_tracker_is_read_from_all_three_tabs() {
         tracker.applications,
         [
             Application {
-                sheet_row: 2,
+                sheet_row: Some(2),
                 role: Some("Example Co Software Engineer".into()),
                 link: None,
                 applied_on: date(2026, 9, 1),
@@ -265,7 +265,7 @@ fn the_tracker_is_read_from_all_three_tabs() {
                 notes: None,
             },
             Application {
-                sheet_row: 3,
+                sheet_row: Some(3),
                 role: Some("Acme Backend Engineer".into()),
                 link: Some("https://jobs.example.com/acme/1?a=1&b=2".into()),
                 applied_on: date(2026, 9, 2),
@@ -273,7 +273,7 @@ fn the_tracker_is_read_from_all_three_tabs() {
                 notes: Some("Applied through the company site.".into()),
             },
             Application {
-                sheet_row: 4,
+                sheet_row: Some(4),
                 role: Some("Zed — Infra Engineer".into()),
                 link: Some("https://jobs.example.com/zed/2".into()),
                 applied_on: date(2026, 11, 16),
@@ -281,7 +281,7 @@ fn the_tracker_is_read_from_all_three_tabs() {
                 notes: None,
             },
             Application {
-                sheet_row: 5,
+                sheet_row: Some(5),
                 role: None,
                 link: None,
                 applied_on: date(2026, 11, 21),
@@ -388,7 +388,7 @@ fn a_row_that_cannot_be_read_is_reported_and_the_rest_are_kept() {
             },
         ]
     );
-    let kept_rows: Vec<u32> = tracker.applications.iter().map(|sent| sent.sheet_row).collect();
+    let kept_rows: Vec<u32> = tracker.applications.iter().filter_map(|sent| sent.sheet_row).collect();
     assert_eq!(kept_rows, [2, 4, 5]);
     let kept_links: Vec<&str> = tracker.postings.iter().map(|found| found.link.as_str()).collect();
     assert_eq!(kept_links, ["https://links.example.net/b/2"]);
@@ -491,4 +491,43 @@ fn a_repeated_import_changes_nothing_and_an_edited_row_updates_in_place() {
     drop(store);
     let reopened = Store::open(&scratch.path().join("maverick.db")).unwrap();
     assert_eq!(reopened.summary().unwrap(), edited);
+}
+
+#[test]
+fn a_submitted_application_marks_its_posting_applied_and_is_recorded_once() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+    let posting = |link: &str| Posting {
+        link: link.into(),
+        found_at: "2026-11-01T00:00:00Z".parse().unwrap(),
+        source: "Notify".into(),
+        company: "Example Co".into(),
+        title: "Backend Engineer".into(),
+        location: None,
+        email_subject: None,
+        stage: Stage::Review,
+        score: Some(80),
+        variant: None,
+        flags: None,
+        notes: None,
+    };
+    let tracker = Tracker {
+        postings: vec![
+            posting("https://jobs.example.com/1"),
+            posting("https://jobs.example.com/2"),
+        ],
+        ..Tracker::default()
+    };
+    store.save_tracker(&tracker).unwrap();
+
+    let sent = Application::submitted_today("Backend Engineer at Example Co", "https://jobs.example.com/1");
+    for _ in 0..2 {
+        store
+            .record_application(&["https://jobs.example.com/1".to_owned()], &sent)
+            .unwrap();
+    }
+
+    let stages: Vec<Stage> = store.postings().unwrap().iter().map(|posting| posting.stage).collect();
+    assert_eq!(stages, [Stage::Applied, Stage::Review]);
+    assert_eq!(store.applications().unwrap(), [sent]);
 }

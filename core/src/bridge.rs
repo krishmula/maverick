@@ -63,6 +63,9 @@ pub enum Command {
     /// Opens a tab. The result holds the new tab's `id` and `windowId`.
     #[serde(rename = "tabs.create")]
     OpenTab { url: String, active: bool },
+    /// Says whether a tab's page has an element. It works only on sites the extension may read.
+    #[serde(rename = "tabs.has", rename_all = "camelCase")]
+    HasElement { tab_id: i32, selector: String },
     /// Loads the extension again from disk.
     #[serde(rename = "reload")]
     ReloadExtension,
