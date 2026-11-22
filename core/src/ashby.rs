@@ -3,131 +3,25 @@
 //! Ashby's own API lists a posting's fields, so the plan comes from that list and
 //! not from guesses about the page.
 
-use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::answers::{Answer, Answers, Kind, Question, Role, Unanswered};
-use crate::model;
-use crate::page::{Key, Locator, Page, PageError};
+use crate::answers::{Answer, Answers, Kind, Question, Role};
+use crate::apply::{
+    self, Enter, Field, FillError, Form, Problem, Report, during, expect_value, plain_text, quoted, settles, text_of,
+};
+use crate::page::{Key, Locator, Page};
 
 const HOST: &str = "https://jobs.ashbyhq.com/";
 const FORM_WAIT: Duration = Duration::from_secs(20);
 const OPTIONS_WAIT: Duration = Duration::from_secs(8);
 const UPLOAD_WAIT: Duration = Duration::from_secs(30);
-/// How long the page gets to show an answer after it was entered.
-const SETTLE_WAIT: Duration = Duration::from_secs(3);
-const SETTLE_GAP: Duration = Duration::from_millis(50);
 
 const FORM_QUERY: &str = "query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) { \
     jobPosting(organizationHostedJobsPageName: $organizationHostedJobsPageName, jobPostingId: $jobPostingId) { \
     title locationName descriptionHtml applicationForm { sections { fieldEntries { ... on FormFieldEntry { field isRequired } } } } } }";
-
-#[derive(Debug, PartialEq)]
-pub enum AshbyError {
-    /// The tab is not on an Ashby posting.
-    NotAPosting(String),
-    /// Ashby no longer lists the posting.
-    Closed,
-    UnexpectedForm(String),
-    Page(PageError),
-    /// The link to the tab broke. `during` says what the filler was doing.
-    Interrupted {
-        during: String,
-        error: PageError,
-    },
-}
-
-impl fmt::Display for AshbyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotAPosting(address) => write!(f, "{address} is not a posting on jobs.ashbyhq.com"),
-            Self::Closed => f.write_str("this posting is closed"),
-            Self::UnexpectedForm(problem) => {
-                write!(f, "Ashby described the form in a way Maverick cannot read: {problem}")
-            }
-            Self::Page(error) => write!(f, "{error}"),
-            Self::Interrupted { during, error } => write!(f, "{error} This happened while {during}."),
-        }
-    }
-}
-
-impl std::error::Error for AshbyError {}
-
-fn during(step: impl Into<String>) -> impl FnOnce(PageError) -> AshbyError {
-    let during = step.into();
-    move |error| AshbyError::Interrupted { during, error }
-}
-
-impl From<PageError> for AshbyError {
-    fn from(error: PageError) -> Self {
-        Self::Page(error)
-    }
-}
-
-/// One field of the form.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Field {
-    /// Ashby's name for the field. The page uses it as the element id.
-    pub path: String,
-    pub required: bool,
-    pub question: Question,
-}
-
-/// What happened to one field.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Outcome {
-    pub title: String,
-    pub required: bool,
-    pub result: FieldResult,
-}
-
-/// What a fill did, field by field.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Report {
-    pub outcomes: Vec<Outcome>,
-    /// Why the model could not be asked, when it could not. The standard answers still went in.
-    pub model_problem: Option<String>,
-}
-
-/// Where an answer came from.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Source {
-    StandardAnswer,
-    /// A model worked it out from the user's facts. `basis` is the fact it says it used.
-    Model {
-        basis: String,
-    },
-    /// A model drafted it from the user's resume. The user should read it before submitting.
-    Draft {
-        basis: String,
-    },
-}
-
-/// The posting's form as Ashby describes it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Form {
-    /// The job's title and place, for the model's context.
-    pub job: String,
-    /// The job description as plain text.
-    pub description: String,
-    pub fields: Vec<Field>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum FieldResult {
-    Filled {
-        /// What the field shows now.
-        shown: String,
-        by: Source,
-    },
-    /// Left as it was, for the user to answer.
-    Left(Unanswered),
-    /// The answer was known and could not be entered.
-    Failed(String),
-}
 
 /// The element Ashby shows in place of the form once an application went through.
 pub const SUBMITTED: &str = ".ashby-application-form-success-container";
@@ -135,37 +29,6 @@ pub const SUBMITTED: &str = ".ashby-application-form-success-container";
 /// The posting's address without anything a tracker or a campaign added to it.
 pub fn posting_address(address: &str) -> Option<String> {
     posting_path(address).map(|(posting, _)| format!("{HOST}{posting}"))
-}
-
-/// HTML as plain text: tags go, block ends become line breaks, and common entities are read.
-fn plain_text(html: &str) -> String {
-    let mut text = String::new();
-    let mut rest = html;
-    while let Some(open) = rest.find('<') {
-        text.push_str(&rest[..open]);
-        let Some(close) = rest[open..].find('>') else {
-            rest = "";
-            break;
-        };
-        let tag = rest[open + 1..open + close].to_lowercase();
-        if ["/p", "/li", "/h1", "/h2", "/h3", "/h4", "/div", "br", "br/", "br /"].contains(&tag.as_str()) {
-            text.push('\n');
-        }
-        rest = &rest[open + close + 1..];
-    }
-    text.push_str(rest);
-    let text = [
-        ("&nbsp;", " "),
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-        ("&quot;", "\""),
-        ("&#39;", "'"),
-        ("&amp;", "&"),
-    ]
-    .iter()
-    .fold(text, |text, (entity, plain)| text.replace(entity, plain));
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
-    lines.join("\n")
 }
 
 /// True for an address this module can fill.
@@ -192,7 +55,7 @@ fn posting_path(address: &str) -> Option<(&str, bool)> {
 }
 
 /// Reads the form out of Ashby's reply to `FORM_QUERY`.
-pub fn form(reply: &Value) -> Result<Form, AshbyError> {
+pub fn form(reply: &Value) -> Result<Form, FillError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Reply {
@@ -245,8 +108,8 @@ pub fn form(reply: &Value) -> Result<Form, AshbyError> {
         is_archived: bool,
     }
 
-    let reply = Reply::deserialize(reply).map_err(|error| AshbyError::UnexpectedForm(error.to_string()))?;
-    let posting = reply.data.job_posting.ok_or(AshbyError::Closed)?;
+    let reply = Reply::deserialize(reply).map_err(|error| FillError::UnexpectedForm(error.to_string()))?;
+    let posting = reply.data.job_posting.ok_or(FillError::Closed)?;
     let mut fields = Vec::new();
     for entry in posting
         .application_form
@@ -262,7 +125,7 @@ pub fn form(reply: &Value) -> Result<Form, AshbyError> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
         {
-            return Err(AshbyError::UnexpectedForm(format!("the field path {:?}", field.path)));
+            return Err(FillError::UnexpectedForm(format!("the field path {:?}", field.path)));
         }
         let options = || {
             field
@@ -316,13 +179,13 @@ pub fn form(reply: &Value) -> Result<Form, AshbyError> {
 /// The tab must be on an Ashby posting or its form.
 ///
 /// The standard answers go in first. A model then answers what they left, from the user's facts.
-pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, AshbyError> {
+pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
     let address = page
         .evaluate("location.href")
         .await
         .map_err(during("reading the tab's address"))?;
     let address = address.as_str().unwrap_or_default();
-    let (posting, on_form) = posting_path(address).ok_or_else(|| AshbyError::NotAPosting(address.to_owned()))?;
+    let (posting, on_form) = posting_path(address).ok_or_else(|| FillError::NotAPosting(address.to_owned()))?;
     if !on_form {
         page.navigate(&format!("{HOST}{posting}/application"))
             .await
@@ -343,136 +206,25 @@ pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, AshbyError> 
             .map_err(during("waiting for the form to appear"))?;
     }
 
-    let planned: Vec<Result<Answer, Unanswered>> = fields.iter().map(|field| answers.answer(&field.question)).collect();
-    // Questions the standard answers left. Essays go to their own model call.
-    let open = |essays: bool| -> Vec<usize> {
-        (0..fields.len())
-            .filter(|&index| {
-                let kind = &fields[index].question.kind;
-                let supported = !matches!(kind, Kind::File | Kind::Unsupported(_));
-                planned[index].is_err() && supported && matches!(kind, Kind::LongText) == essays
-            })
-            .collect()
-    };
-    let (factual, essays) = (open(false), open(true));
-    let mut results: Vec<Option<FieldResult>> = vec![None; fields.len()];
-
-    // Drafting takes the model longest, so it starts first and runs beside everything else.
-    let drafting = (!answers.background.is_empty() && !essays.is_empty()).then(|| {
-        let (background, facts, job) = (answers.background.clone(), answers.facts.clone(), job.clone());
-        let questions: Vec<Question> = essays.iter().map(|&index| fields[index].question.clone()).collect();
-        tokio::spawn(async move {
-            let questions: Vec<&Question> = questions.iter().collect();
-            model::draft(&background, &facts, &job, &description, &questions).await
-        })
-    });
-    // The model works out the factual answers while the standard answers go in.
-    let asking = async {
-        if answers.facts.is_empty() || factual.is_empty() {
-            return None;
-        }
-        let questions: Vec<&Question> = factual.iter().map(|&index| &fields[index].question).collect();
-        Some(model::answer(&answers.facts, &job, &questions).await)
-    };
-    let entering = async {
-        // The resume goes first, because Ashby can fill other fields from it.
-        let resume_first = (0..fields.len()).filter(|&index| fields[index].question.role == Some(Role::Resume));
-        let rest = (0..fields.len()).filter(|&index| fields[index].question.role != Some(Role::Resume));
-        for index in resume_first.chain(rest) {
-            if let Ok(answer) = &planned[index] {
-                results[index] = Some(entered(page, &fields[index], answer, Source::StandardAnswer).await?);
-            }
-        }
-        Ok::<_, AshbyError>(())
-    };
-    let (said, entered_standard) = tokio::join!(asking, entering);
-    entered_standard?;
-
-    let mut model_problem = None;
-    let drafted = match drafting {
-        Some(drafting) => Some(drafting.await.unwrap_or_else(|stopped| Err(stopped.to_string()))),
-        None => None,
-    };
-    let from_model: [FromModel<'_>; 2] = [
-        (&factual, said, |basis| Source::Model { basis }),
-        (&essays, drafted, |basis| Source::Draft { basis }),
-    ];
-    for (asked, said, by) in from_model {
-        match said {
-            None => {}
-            Some(Err(problem)) => model_problem = Some(problem),
-            Some(Ok(said)) => {
-                for (&index, said) in asked.iter().zip(said) {
-                    let Some(stated) = said.answer else { continue };
-                    results[index] = Some(match fields[index].question.kind.answer_from(&stated) {
-                        Ok(answer) => entered(page, &fields[index], &answer, by(said.basis)).await?,
-                        Err(why) => FieldResult::Left(why),
-                    });
-                }
-            }
-        }
-    }
-
-    let outcomes = fields
-        .into_iter()
-        .zip(results)
-        .zip(planned)
-        .map(|((field, result), planned)| Outcome {
-            title: field.question.title,
-            required: field.required,
-            result: match (result, planned) {
-                (Some(result), _) => result,
-                (None, Err(why)) => FieldResult::Left(why),
-                (None, Ok(_)) => unreachable!("every planned answer was entered above"),
-            },
-        })
-        .collect();
-    Ok(Report {
-        outcomes,
-        model_problem,
-    })
+    apply::fill_form(
+        page,
+        answers,
+        Form {
+            job,
+            description,
+            fields,
+        },
+        &Ashby,
+    )
+    .await
 }
 
-/// The fields a model call was asked about, what it said, and how to label its answers.
-type FromModel<'a> = (
-    &'a Vec<usize>,
-    Option<Result<Vec<model::ModelAnswer>, String>>,
-    fn(String) -> Source,
-);
+/// How answers go into an Ashby form.
+struct Ashby;
 
-/// Enters one answer. An error means the link to the tab is gone, so no later field can work either.
-async fn entered(page: &Page, field: &Field, answer: &Answer, by: Source) -> Result<FieldResult, AshbyError> {
-    match enter(page, field, answer).await {
-        Ok(shown) => Ok(FieldResult::Filled { shown, by }),
-        Err(Problem::Page(PageError::Bridge(error))) => Err(during(format!("filling {:?}", field.question.title))(
-            PageError::Bridge(error),
-        )),
-        Err(problem) => Ok(FieldResult::Failed(problem.to_string())),
-    }
-}
-
-/// Why a known answer could not be entered.
-enum Problem {
-    Page(PageError),
-    /// The field does not show what was entered.
-    Shows(String),
-    Mismatch(&'static str),
-}
-
-impl fmt::Display for Problem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Page(error) => write!(f, "{error}"),
-            Self::Shows(shown) if shown.is_empty() => f.write_str("the field stayed empty"),
-            Self::Shows(shown) => write!(f, "the field shows {shown:?} instead"),
-            Self::Mismatch(problem) => f.write_str(problem),
-        }
-    }
-}
-
-impl From<PageError> for Problem {
-    fn from(error: PageError) -> Self {
-        Self::Page(error)
+impl Enter for Ashby {
+    async fn enter(&self, page: &Page, field: &Field, answer: &Answer) -> Result<String, Problem> {
+        enter(page, field, answer).await
     }
 }
 
@@ -589,36 +341,6 @@ async fn check(page: &Page, path: &str, option: &str) -> Result<(), Problem> {
     }
 }
 
-async fn expect_value(page: &Page, input: &Locator, expected: &str) -> Result<String, Problem> {
-    let value = format!("({})?.value ?? ''", input.as_script());
-    if settles(page, &format!("({value}) === {}", quoted(expected))).await? {
-        return Ok(expected.to_owned());
-    }
-    let shown = page.evaluate(&value).await?;
-    Err(Problem::Shows(shown.as_str().unwrap_or_default().to_owned()))
-}
-
-/// Waits a short time for a JavaScript condition to hold. The page redraws after input, not during it.
-async fn settles(page: &Page, condition: &str) -> Result<bool, PageError> {
-    let deadline = Instant::now() + SETTLE_WAIT;
-    loop {
-        if page.evaluate(condition).await? == true {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(SETTLE_GAP).await;
-    }
-}
-
-async fn text_of(page: &Page, element: &Locator) -> Result<String, PageError> {
-    let text = page
-        .evaluate(&format!("({})?.textContent.trim() ?? ''", element.as_script()))
-        .await?;
-    Ok(text.as_str().unwrap_or_default().to_owned())
-}
-
 /// The question's heading. Every kind of field has one.
 fn heading(path: &str) -> Locator {
     Locator::css(&format!("label[for=\"{path}\"]"))
@@ -648,11 +370,6 @@ fn form_request() -> String {
             return await reply.json();
         }})()"#
     )
-}
-
-/// A string as a JavaScript literal.
-fn quoted(text: &str) -> String {
-    serde_json::to_string(text).expect("a string is plain JSON")
 }
 
 #[cfg(test)]
@@ -752,19 +469,16 @@ mod tests {
 
     #[test]
     fn a_posting_ashby_no_longer_lists_is_closed() {
-        assert_eq!(
-            form(&json!({ "data": { "jobPosting": null } })),
-            Err(AshbyError::Closed)
-        );
+        assert_eq!(form(&json!({ "data": { "jobPosting": null } })), Err(FillError::Closed));
     }
 
     #[test]
     fn a_field_path_that_could_break_a_selector_is_refused() {
         let hostile = reply(vec![entry("a\"] , body [x=\"", "Name", "String", true)]);
-        assert!(matches!(form(&hostile), Err(AshbyError::UnexpectedForm(_))));
+        assert!(matches!(form(&hostile), Err(FillError::UnexpectedForm(_))));
         assert!(matches!(
             form(&json!({ "errors": [] })),
-            Err(AshbyError::UnexpectedForm(_))
+            Err(FillError::UnexpectedForm(_))
         ));
     }
 }

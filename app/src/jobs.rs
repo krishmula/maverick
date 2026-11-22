@@ -1,20 +1,28 @@
 //! The list of postings Maverick can apply to.
 
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, h_flex};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{App, Context, ElementId, ParentElement as _, SharedString, Styled as _, Task, Window, div};
-use maverick_core::ashby;
+use gpui_kit::component::{IndexPath, h_flex, v_flex};
+use gpui_kit::{App, Context, Div, ElementId, Entity, ParentElement as _, Styled as _, Task, Window, px};
+use maverick_core::apply::{self, System};
 use maverick_core::jobs::{Application, Posting, Stage, posting_address};
 
+use crate::browser::{Browser, Fill, Subject};
+use crate::report::Tally;
+use crate::ui::{self, Palette, Signal};
+
 /// A posting whose form Maverick knows how to fill.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Job {
     pub company: String,
     pub title: String,
     pub score: Option<u8>,
     /// The posting's own address, not a tracking link to it.
     pub address: String,
+    pub location: Option<String>,
+    /// Where intake found the posting, such as a job alert.
+    pub source: String,
+    /// The day intake found it, as the user reads a date.
+    pub found_on: String,
 }
 
 /// The postings still waiting for an application, best score first.
@@ -22,7 +30,7 @@ pub struct Job {
 pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job> {
     let applied: Vec<String> = applications
         .iter()
-        .filter_map(|sent| ashby::posting_address(sent.link.as_deref()?))
+        .filter_map(|sent| apply::posting_address(sent.link.as_deref()?))
         .collect();
     let mut jobs: Vec<Job> = postings
         .iter()
@@ -32,7 +40,10 @@ pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job>
                 company: posting.company.clone(),
                 title: posting.title.clone(),
                 score: posting.score,
-                address: ashby::posting_address(&posting_address(&posting.link))?,
+                address: apply::posting_address(&posting_address(&posting.link))?,
+                location: posting.location.clone(),
+                source: posting.source.clone(),
+                found_on: posting.found_at.strftime("%b %-d, %Y").to_string(),
             })
         })
         .filter(|job| !applied.contains(&job.address))
@@ -42,8 +53,8 @@ pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job>
     jobs
 }
 
-#[derive(Default)]
 pub struct JobList {
+    browser: Entity<Browser>,
     jobs: Vec<Job>,
     query: String,
     matches: Vec<Job>,
@@ -53,11 +64,14 @@ pub struct JobList {
 }
 
 impl JobList {
-    pub fn new(jobs: Vec<Job>) -> Self {
+    pub fn new(browser: Entity<Browser>, jobs: Vec<Job>) -> Self {
         Self {
+            browser,
             matches: jobs.clone(),
             jobs,
-            ..Self::default()
+            query: String::new(),
+            selected: None,
+            opened: Vec::new(),
         }
     }
 
@@ -65,8 +79,25 @@ impl JobList {
         self.matches.get(ix.row)
     }
 
+    pub fn selected_job(&self) -> Option<&Job> {
+        self.job_at(self.selected?)
+    }
+
+    /// The best jobs the search still shows, without the one at `except`.
+    pub fn best(&self, count: usize, except: Option<&str>) -> impl Iterator<Item = &Job> {
+        self.matches
+            .iter()
+            .filter(move |job| Some(job.address.as_str()) != except)
+            .take(count)
+    }
+
     pub fn len(&self) -> usize {
         self.jobs.len()
+    }
+
+    /// How many jobs the search still shows.
+    pub fn shown(&self) -> usize {
+        self.matches.len()
     }
 
     pub fn mark_opened(&mut self, address: &str) {
@@ -78,6 +109,33 @@ impl JobList {
         self.jobs.retain(|job| job.address != address);
         self.matches = matching(&self.jobs, &self.query);
     }
+
+    /// What the row says about the job beyond its name: how its fill went, or that it was opened.
+    fn mark(&self, job: &Job, palette: &Palette, cx: &App) -> Option<Div> {
+        let fill = self.browser.read(cx).fill_of(&Subject::Posting(job.address.clone()));
+        match fill {
+            Some(Fill::Running { .. }) => Some(ui::boxed("filling", palette.muted)),
+            Some(Fill::Failed { .. }) => Some(ui::chip(Signal::Failed, "failed", palette)),
+            Some(Fill::Done { report, .. }) => Some(match Tally::of(report) {
+                Tally { failed: 1.., .. } => ui::chip(Signal::Failed, "failed", palette),
+                Tally { yours: 0, .. } => ui::chip(Signal::Done, "filled", palette),
+                Tally { yours, .. } => ui::chip(Signal::Yours, format!("{yours} yours"), palette),
+            }),
+            Some(Fill::Idle) | None => self
+                .opened
+                .contains(&job.address)
+                .then(|| ui::chip(Signal::Done, "opened", palette)),
+        }
+    }
+}
+
+/// The application system a posting is on, as the user knows it.
+pub fn system_name(address: &str) -> Option<&'static str> {
+    Some(match System::of(address)? {
+        System::Ashby => "Ashby",
+        System::Greenhouse => "Greenhouse",
+        System::Workday => "Workday",
+    })
 }
 
 fn matching(jobs: &[Job], query: &str) -> Vec<Job> {
@@ -110,49 +168,29 @@ impl ListDelegate for JobList {
 
     fn render_item(&mut self, ix: IndexPath, _: &mut Window, cx: &mut Context<ListState<Self>>) -> Option<ListItem> {
         let job = self.matches.get(ix.row)?;
-        let muted = cx.theme().muted_foreground;
+        let palette = Palette::of(cx);
+        let selected = self.selected == Some(ix);
+        let tone = match job.score {
+            _ if selected => palette.ink,
+            Some(score) if score < 60 => palette.faint,
+            _ => palette.muted,
+        };
+        let from = match system_name(&job.address) {
+            Some(system) => format!("{} / {system}", job.company),
+            None => job.company.clone(),
+        };
         let row = h_flex()
             .gap_3()
+            .child(ui::score(job.score, 19.).w(px(30.)).text_color(tone))
             .child(
-                div()
-                    .flex_none()
-                    .w_8()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(SharedString::from(
-                        job.score.map(|score| score.to_string()).unwrap_or_default(),
-                    )),
-            )
-            .child(
-                div()
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(job.title.clone())),
+                    .child(ui::serif(job.title.clone()).truncate().text_color(tone))
+                    .child(ui::caps(from).truncate().text_color(palette.faint)),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .max_w_2_5()
-                    .truncate()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(SharedString::from(job.company.clone())),
-            )
-            .when(self.opened.contains(&job.address), |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().success)
-                        .child("Opened"),
-                )
-            });
-        Some(
-            ListItem::new(job_row_id(ix.row))
-                .selected(self.selected == Some(ix))
-                .child(row),
-        )
+            .children(self.mark(job, &palette, cx));
+        Some(ui::row(job_row_id(ix.row), selected, row, &palette))
     }
 
     fn render_empty(&mut self, _: &mut Window, cx: &mut Context<ListState<Self>>) -> impl gpui_kit::IntoElement {
@@ -161,10 +199,7 @@ impl ListDelegate for JobList {
         } else {
             format!("No job matches \"{}\".", self.query)
         };
-        div()
-            .p_3()
-            .text_color(cx.theme().muted_foreground)
-            .child(SharedString::from(message))
+        ui::serif(message).p_4().text_color(Palette::of(cx).muted)
     }
 
     fn set_selected_index(&mut self, ix: Option<IndexPath>, _: &mut Window, cx: &mut Context<ListState<Self>>) {

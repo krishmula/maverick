@@ -79,6 +79,9 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Role {
     Name,
+    /// A form that asks for the name in two fields marks each of them.
+    FirstName,
+    LastName,
     Resume,
 }
 
@@ -165,11 +168,21 @@ impl Answers {
             Some(stated) => stated,
             None => match (&question.kind, question.role) {
                 (Kind::Text, Some(Role::Name)) if !asks_for_part_of_a_name(&question.title) => &self.name,
+                (Kind::Text, Some(Role::FirstName)) => self.name_parts().0,
+                (Kind::Text, Some(Role::LastName)) => self.name_parts().1.ok_or(Unanswered::NoRule)?,
                 (Kind::Location, _) => self.location.as_deref().ok_or(Unanswered::NoRule)?,
                 _ => return Err(Unanswered::NoRule),
             },
         };
         question.kind.answer_from(stated)
+    }
+
+    /// The first word of the name, and the rest of it as the last name. A name of one word has no last name.
+    fn name_parts(&self) -> (&str, Option<&str>) {
+        match self.name.trim().split_once(char::is_whitespace) {
+            Some((first, last)) => (first, Some(last.trim_start())),
+            None => (self.name.trim(), None),
+        }
     }
 
     /// The answer every matching rule agrees on, if any rule matches.
@@ -275,6 +288,48 @@ mod tests {
         assert_eq!(name("Name"), Ok(Answer::Text("Ada Example".into())));
         assert_eq!(name("Legal Name"), Ok(Answer::Text("Ada Byron Example".into())));
         assert_eq!(name("Legal First Name"), Err(Unanswered::NoRule));
+    }
+
+    #[test]
+    fn a_form_with_two_name_fields_gets_the_name_in_two_parts() {
+        let part = |answers: &Answers, title: &str, role| {
+            answers.answer(&Question {
+                title: title.into(),
+                kind: Kind::Text,
+                role: Some(role),
+            })
+        };
+        let mut answers = answers();
+        assert_eq!(
+            part(&answers, "First Name", Role::FirstName),
+            Ok(Answer::Text("Ada".into()))
+        );
+        assert_eq!(
+            part(&answers, "Last Name", Role::LastName),
+            Ok(Answer::Text("Example".into()))
+        );
+        // A rule that covers the title wins, as it does for every other question.
+        assert_eq!(
+            part(&answers, "Legal Name", Role::FirstName),
+            Ok(Answer::Text("Ada Byron Example".into()))
+        );
+
+        answers.name = "Ada  Byron Example".into();
+        assert_eq!(
+            part(&answers, "First Name", Role::FirstName),
+            Ok(Answer::Text("Ada".into()))
+        );
+        assert_eq!(
+            part(&answers, "Last Name", Role::LastName),
+            Ok(Answer::Text("Byron Example".into()))
+        );
+
+        answers.name = "Ada".into();
+        assert_eq!(
+            part(&answers, "First Name", Role::FirstName),
+            Ok(Answer::Text("Ada".into()))
+        );
+        assert_eq!(part(&answers, "Last Name", Role::LastName), Err(Unanswered::NoRule));
     }
 
     #[test]

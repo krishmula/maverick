@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
-use maverick_core::ashby::{self, Report};
+use maverick_core::apply::{self, Report, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
 use maverick_core::jobs::{Application, posting_address};
 use maverick_core::page::Page;
@@ -27,6 +27,14 @@ pub enum Fill {
     Running { title: String },
     Done { title: String, report: Report },
     Failed { title: String, reason: String },
+}
+
+/// What a fill run is about, so a view can tell whether the run belongs to the row it shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Subject {
+    /// A posting from the jobs list, by its address.
+    Posting(String),
+    Tab(ConnectionId, i32),
 }
 
 /// An application the user submitted in this run.
@@ -55,6 +63,9 @@ pub struct Browser {
     measures: u64,
     extension_is_outdated: bool,
     fill: Fill,
+    subject: Option<Subject>,
+    /// The tab the last finished fill left its form in.
+    filled_tab: Option<Tab>,
     state: BrowserState,
     latency: Latency,
     failure: Option<String>,
@@ -91,6 +102,8 @@ impl Browser {
             measures: 0,
             extension_is_outdated: false,
             fill: Fill::Idle,
+            subject: None,
+            filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
             _watch,
@@ -181,25 +194,41 @@ impl Browser {
         &self.applied
     }
 
+    #[cfg(test)]
     pub fn fill(&self) -> &Fill {
         &self.fill
     }
 
+    /// The latest fill run, when it is about `subject`.
+    pub fn fill_of(&self, subject: &Subject) -> Option<&Fill> {
+        (self.subject.as_ref() == Some(subject) && self.fill != Fill::Idle).then_some(&self.fill)
+    }
+
+    /// Brings the tab with the last filled form forward, so the user can review it and submit.
+    pub fn review(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.filled_tab.clone() {
+            self.activate(&tab, cx);
+        }
+    }
+
     /// Fills the application form in a tab with the standard answers. It never submits the form.
     pub fn fill_form(&mut self, tab: &Tab, cx: &mut Context<Self>) {
-        self.start_fill(tab.tab.title.clone(), Target::Tab(tab.clone()), cx);
+        let subject = Subject::Tab(tab.connection, tab.tab.id);
+        self.start_fill(tab.tab.title.clone(), subject, Target::Tab(tab.clone()), cx);
     }
 
     /// Opens a posting's application form in a new tab and fills it. It never submits the form.
     pub fn apply(&mut self, title: String, address: String, cx: &mut Context<Self>) {
-        self.start_fill(title, Target::Posting(address), cx);
+        self.start_fill(title, Subject::Posting(address.clone()), Target::Posting(address), cx);
     }
 
-    fn start_fill(&mut self, title: String, target: Target, cx: &mut Context<Self>) {
+    fn start_fill(&mut self, title: String, subject: Subject, target: Target, cx: &mut Context<Self>) {
         if matches!(self.fill, Fill::Running { .. }) {
             return;
         }
         self.fill = Fill::Running { title: title.clone() };
+        self.subject = Some(subject);
+        self.filled_tab = None;
         cx.notify();
         let filled = self.background.spawn(fill_form(
             self.bridge.clone(),
@@ -228,6 +257,7 @@ impl Browser {
             this.update(cx, |this, cx| {
                 this.fill = fill;
                 if let Some(filled) = filled {
+                    this.filled_tab = Some(filled.tab.clone());
                     this.watch_for_submit(filled, cx);
                 }
                 cx.notify();
@@ -240,11 +270,25 @@ impl Browser {
     /// Waits for the user to submit a filled form, then records the application.
     fn watch_for_submit(&mut self, filled: Filled, cx: &mut Context<Self>) {
         let Filled {
-            tab, title, address, ..
+            system,
+            tab,
+            title,
+            address,
+            ..
         } = filled;
         let (bridge, database) = (self.bridge.clone(), self.database.clone());
         let recorded = self.background.spawn(async move {
-            if !submitted(&bridge, tab.connection, tab.tab.id, SUBMIT_CHECK_GAP, SUBMIT_WATCH).await {
+            let confirmation = system.submitted();
+            if !submitted(
+                &bridge,
+                tab.connection,
+                tab.tab.id,
+                confirmation,
+                SUBMIT_CHECK_GAP,
+                SUBMIT_WATCH,
+            )
+            .await
+            {
                 return None;
             }
             let (role, link) = (title.clone(), address.clone());
@@ -275,6 +319,7 @@ impl Browser {
     pub fn dismiss_fill(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.fill, Fill::Running { .. }) {
             self.fill = Fill::Idle;
+            self.subject = None;
             cx.notify();
         }
     }
@@ -310,18 +355,26 @@ enum Target {
 /// A form that was filled and now waits for the user to submit it.
 struct Filled {
     report: Report,
+    system: System,
     tab: Tab,
     title: String,
     /// The posting's address.
     address: String,
 }
 
-/// True once the tab shows Ashby's confirmation. False when the tab closes, Chrome goes away,
-/// or `limit` passes first.
-async fn submitted(bridge: &Bridge, connection: ConnectionId, tab_id: i32, gap: Duration, limit: Duration) -> bool {
+/// True once the tab shows the element at `confirmation`, which an application system shows
+/// after a submission. False when the tab closes, Chrome goes away, or `limit` passes first.
+async fn submitted(
+    bridge: &Bridge,
+    connection: ConnectionId,
+    tab_id: i32,
+    confirmation: &str,
+    gap: Duration,
+    limit: Duration,
+) -> bool {
     let check = Command::HasElement {
         tab_id,
-        selector: ashby::SUBMITTED.to_owned(),
+        selector: confirmation.to_owned(),
     };
     let deadline = tokio::time::Instant::now() + limit;
     while tokio::time::Instant::now() < deadline {
@@ -346,7 +399,7 @@ fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<
         .map_err(said)?
         .into_iter()
         .map(|posting| posting.link)
-        .filter(|link| ashby::posting_address(&posting_address(link)).as_deref() == Some(address))
+        .filter(|link| apply::posting_address(&posting_address(link)).as_deref() == Some(address))
         .collect();
     store
         .record_application(&links, &Application::submitted_today(role, address))
@@ -374,8 +427,9 @@ async fn fill_form(
             (tab, None)
         }
         Target::Posting(address) => {
-            let form =
-                ashby::form_address(&address).ok_or_else(|| format!("{address} is not a posting Maverick can fill"))?;
+            let form = System::of(&address)
+                .and_then(|system| system.form_address(&address))
+                .ok_or_else(|| format!("{address} is not a posting Maverick can fill"))?;
             let connection = *bridge
                 .connections()
                 .first()
@@ -402,18 +456,17 @@ async fn fill_form(
             (Tab { connection, tab }, Some(form))
         }
     };
-    let address = match &form {
-        Some(form) => ashby::posting_address(form),
-        None => ashby::posting_address(&tab.tab.url),
-    }
-    .ok_or("This tab is not on a posting Maverick can fill.")?;
+    let on = form.as_deref().unwrap_or(&tab.tab.url);
+    let not_fillable = "This tab is not on a posting Maverick can fill.";
+    let system = System::of(on).ok_or(not_fillable)?;
+    let address = system.posting_address(on).ok_or(not_fillable)?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
     let report = match form {
         Some(form) => match page.navigate(&form).await {
-            Ok(()) => ashby::fill(&page, &answers).await,
+            Ok(()) => system.fill(&page, &answers).await,
             Err(error) => Err(error.into()),
         },
-        None => ashby::fill(&page, &answers).await,
+        None => system.fill(&page, &answers).await,
     };
     // Chrome's debugging bar goes away with the detach, whether or not the fill worked.
     let detached = page.detach().await;
@@ -421,6 +474,7 @@ async fn fill_form(
     detached.map_err(|error| error.to_string())?;
     Ok(Filled {
         report,
+        system,
         tab,
         title,
         address,
@@ -472,7 +526,7 @@ mod tests {
         }
         let connection = bridge.connections()[0];
         let gap = Duration::from_millis(5);
-        let seen = submitted(&bridge, connection, 31, gap, Duration::from_secs(5)).await;
+        let seen = submitted(&bridge, connection, 31, ".sent", gap, Duration::from_secs(5)).await;
         (seen, chrome.join().unwrap())
     }
 
@@ -489,7 +543,7 @@ mod tests {
                 "id": asked[0]["id"],
                 "method": "tabs.has",
                 "tabId": 31,
-                "selector": ".ashby-application-form-success-container",
+                "selector": ".sent",
             })
         );
     }
