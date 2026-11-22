@@ -5,7 +5,7 @@ use gpui_kit::component::{ActiveTheme as _, IndexPath, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{App, Context, ElementId, ParentElement as _, SharedString, Styled as _, Task, Window, div};
 use maverick_core::ashby;
-use maverick_core::jobs::{Posting, Stage, posting_address};
+use maverick_core::jobs::{Application, Posting, Stage, posting_address};
 
 /// A posting whose form Maverick knows how to fill.
 #[derive(Clone, Debug, PartialEq)]
@@ -18,17 +18,24 @@ pub struct Job {
 }
 
 /// The postings still waiting for an application, best score first.
-pub fn open_jobs(postings: &[Posting]) -> Vec<Job> {
+/// A posting with a recorded application is left out, whatever its stage says.
+pub fn open_jobs(postings: &[Posting], applications: &[Application]) -> Vec<Job> {
+    let applied: Vec<String> = applications
+        .iter()
+        .filter_map(|sent| ashby::posting_address(sent.link.as_deref()?))
+        .collect();
     let mut jobs: Vec<Job> = postings
         .iter()
         .filter(|posting| matches!(posting.stage, Stage::Found | Stage::Review))
-        .map(|posting| Job {
-            company: posting.company.clone(),
-            title: posting.title.clone(),
-            score: posting.score,
-            address: posting_address(&posting.link),
+        .filter_map(|posting| {
+            Some(Job {
+                company: posting.company.clone(),
+                title: posting.title.clone(),
+                score: posting.score,
+                address: ashby::posting_address(&posting_address(&posting.link))?,
+            })
         })
-        .filter(|job| ashby::is_posting(&job.address))
+        .filter(|job| !applied.contains(&job.address))
         .collect();
     jobs.sort_by_key(|job| std::cmp::Reverse(job.score));
     jobs.dedup_by(|later, earlier| later.address == earlier.address);
@@ -64,6 +71,12 @@ impl JobList {
 
     pub fn mark_opened(&mut self, address: &str) {
         self.opened.push(address.to_owned());
+    }
+
+    /// Takes a job off the list once its application went through.
+    pub fn remove(&mut self, address: &str) {
+        self.jobs.retain(|job| job.address != address);
+        self.matches = matching(&self.jobs, &self.query);
     }
 }
 
@@ -201,9 +214,16 @@ mod tests {
             ),
             posting(&ashby(6), "Not scored", Stage::Found, None),
             posting(&ashby(1), "Reviewed again", Stage::Review, Some(66)),
+            posting(
+                &format!("{}?utm_source=x", ashby(7)),
+                "Sent since the import",
+                Stage::Review,
+                Some(99),
+            ),
         ];
+        let sent = Application::submitted_today("Sent since the import", &format!("{}/application", ashby(7)));
 
-        let jobs = open_jobs(&postings);
+        let jobs = open_jobs(&postings, &[sent]);
         let listed: Vec<(&str, &str)> = jobs
             .iter()
             .map(|job| (job.title.as_str(), job.address.as_str()))

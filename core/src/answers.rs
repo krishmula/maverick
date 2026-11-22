@@ -26,6 +26,10 @@ pub struct Answers {
     /// With no facts, no model is asked.
     #[serde(default)]
     pub facts: Vec<String>,
+    /// The user's resume as text, one line per entry. A model drafts answers to essay questions
+    /// from it. With no background, essay questions are left for the user.
+    #[serde(default)]
+    pub background: Vec<String>,
 }
 
 /// Answers every question whose text holds one of `any` and none of `not`.

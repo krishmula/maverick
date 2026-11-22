@@ -77,6 +77,15 @@ async function run(request) {
       if (request.active) await chrome.windows.update(tab.windowId, { focused: true });
       return { id: tab.id, windowId: tab.windowId };
     }
+    case "tabs.has": {
+      // Looks at a page without the debugger, so no debugging bar shows while the app only watches.
+      const [frame] = await chrome.scripting.executeScript({
+        target: { tabId: request.tabId },
+        func: (selector) => document.querySelector(selector) !== null,
+        args: [request.selector],
+      });
+      return frame.result === true;
+    }
     case "reload":
       // Loads the extension again from the folder the app wrote. The answer goes out first.
       setTimeout(() => chrome.runtime.reload(), 100);

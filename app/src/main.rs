@@ -85,7 +85,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             .detach();
 
             let answers_file = maverick_core::answers_path();
-            let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, cx));
+            let database = maverick_core::database_path();
+            let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, database, cx));
             let jobs = stored_jobs();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(880.), px(620.)), cx)),
@@ -108,10 +109,14 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 /// The open postings from the local database. A missing or unreadable database gives an empty list.
 fn stored_jobs() -> Vec<jobs::Job> {
-    let postings = maverick_core::database_path()
+    let store = maverick_core::database_path()
         .filter(|path| path.is_file())
-        .and_then(|path| maverick_core::store::Store::open(&path).ok())
-        .and_then(|store| store.postings().ok())
-        .unwrap_or_default();
-    jobs::open_jobs(&postings)
+        .and_then(|path| maverick_core::store::Store::open(&path).ok());
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    jobs::open_jobs(
+        &store.postings().unwrap_or_default(),
+        &store.applications().unwrap_or_default(),
+    )
 }
