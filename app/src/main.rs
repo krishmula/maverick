@@ -6,6 +6,7 @@ mod icon;
 mod jobs;
 mod main_view;
 mod mav;
+mod models;
 mod report;
 mod schedule;
 mod tabs;
@@ -53,6 +54,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("tracker") => return cli::tracker(&arguments.collect::<Vec<_>>()),
         Some("google") => return cli::google(&arguments.collect::<Vec<_>>()),
         Some("ticktick") => return cli::ticktick(&arguments.collect::<Vec<_>>()),
+        Some("models") => return cli::models(&arguments.collect::<Vec<_>>()),
         Some("mav") => return cli::mav(&arguments.collect::<Vec<_>>().join(" ")),
         Some("score") => {
             let mut limit = maverick_core::score::RUN_CAP;

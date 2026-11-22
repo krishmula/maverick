@@ -10,7 +10,8 @@ use tokio::process::Command;
 
 use crate::credentials::Password;
 
-const TIME_LIMIT: Duration = Duration::from_secs(60);
+/// Long enough for a model to answer.
+const TIME_LIMIT: Duration = Duration::from_secs(120);
 
 /// One authorized call to `service`. `body` is sent as JSON. The reply is JSON; an empty reply is `null`.
 pub async fn call(
@@ -20,12 +21,30 @@ pub async fn call(
     url: &str,
     body: Option<&Value>,
 ) -> Result<Value, String> {
-    let mut config = format!(
-        "url = {}\nrequest = {}\nheader = {}\n",
-        quoted(url),
-        quoted(method),
-        quoted(&format!("Authorization: Bearer {}", token.reveal()))
-    );
+    let authorization = format!("Bearer {}", token.reveal());
+    request(service, method, url, &[("Authorization", &authorization)], body).await
+}
+
+pub async fn get(service: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
+    request(service, "GET", url, headers, None).await
+}
+
+pub async fn post(service: &str, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, String> {
+    request(service, "POST", url, headers, Some(body)).await
+}
+
+/// One call to `service` with `headers`, which may hold secrets: they go to curl on its input.
+pub async fn request(
+    service: &str,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Result<Value, String> {
+    let mut config = format!("url = {}\nrequest = {}\n", quoted(url), quoted(method));
+    for (name, value) in headers {
+        config.push_str(&format!("header = {}\n", quoted(&format!("{name}: {value}"))));
+    }
     if let Some(body) = body {
         config.push_str(&format!(
             "header = \"Content-Type: application/json\"\ndata-binary = {}\n",
@@ -41,6 +60,7 @@ pub async fn call(
     if !(200..300).contains(&status) {
         let message = json["error"]["message"]
             .as_str()
+            .or(json["error"].as_str())
             .or(json["error_description"].as_str())
             .or(json["errorMessage"].as_str())
             .unwrap_or("no reason given");

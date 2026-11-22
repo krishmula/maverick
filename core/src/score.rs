@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use crate::answers::Answers;
 use crate::description::{self, Fetched, Source};
 use crate::jobs::{Application, Posting, Sponsorship, Stage, posting_address};
-use crate::model;
+use crate::providers::{self, Job};
 use crate::rules::{SeenJobs, prefilter};
 
 /// A score at or above this, with no blocking flag, makes a posting ready to apply to.
@@ -327,9 +327,14 @@ fn request(posting: &Posting, description: &description::Description, profile: &
 }
 
 async fn read(posting: &Posting, description: &description::Description, profile: &Profile) -> Result<Reading, String> {
-    let reply = model::run(INSTRUCTIONS, request(posting, description, profile), &reading_schema()).await?;
-    serde_json::from_value(reply["structured_output"].clone())
-        .map_err(|error| format!("the model's reply was not in the agreed form: {error}"))
+    let reply = providers::run(
+        Job::Scoring,
+        INSTRUCTIONS,
+        request(posting, description, profile),
+        &reading_schema(),
+    )
+    .await?;
+    serde_json::from_value(reply).map_err(|error| format!("the model's reply was not in the agreed form: {error}"))
 }
 
 #[cfg(test)]

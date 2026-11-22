@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod mav;
 pub mod model;
 pub mod page;
+pub mod providers;
 pub mod relay;
 pub mod rules;
 pub mod score;

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::calendar::{self, Event, Slot};
 use crate::google;
-use crate::model;
+use crate::providers::{self, Job};
 use crate::ticktick::{self, Agenda, Due, NewTask, Project};
 
 const INSTRUCTIONS: &str = "You are Mav, the user's planning assistant. The user tells you what to remember, \
@@ -295,8 +295,7 @@ pub async fn ask(message: &str, said: &[(Speaker, String)], context: &Context) -
         }
     }
     let _ = write!(request, "\nThe user says: {message}\n");
-    let reply = model::run(INSTRUCTIONS, request, &schema()).await?;
-    let answer = &reply["structured_output"];
+    let answer = &providers::run(Job::Mav, INSTRUCTIONS, request, &schema()).await?;
     let text = answer["reply"].as_str().unwrap_or_default().to_owned();
     let drafts: Vec<Draft> = serde_json::from_value(answer["proposals"].clone()).unwrap_or_default();
     Ok(Reply {

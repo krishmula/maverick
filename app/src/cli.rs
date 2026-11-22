@@ -309,6 +309,89 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `maverick models <list|check|key|forget|use>`: sets up the models Maverick runs.
+pub fn models(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use maverick_core::credentials::Password;
+    use maverick_core::providers::{self, Choice, Choices, Job, Provider, Status};
+
+    const USAGE: &str = "usage: maverick models list | check [provider] | key <provider> < key-file | forget <provider> | use <mav|forms|scoring> <provider> [model]";
+    let provider_named = |name: &str| -> Result<Provider, Box<dyn Error>> {
+        let wanted = name.to_lowercase().replace([' ', '-'], "");
+        Provider::ALL
+            .into_iter()
+            .find(|provider| provider.name().to_lowercase().replace(' ', "") == wanted)
+            .ok_or_else(|| format!("no provider is called {name}; use one of claude-code, codex, opencode, anthropic, openai, openrouter").into())
+    };
+    let runtime = runtime()?;
+    let show = |provider: Provider, status: Status| {
+        let (mark, detail) = match status {
+            Status::Ready(detail) => ("ready", detail),
+            Status::Present(detail) => ("found", detail),
+            Status::Missing(detail) => ("missing", format!("{detail}. {}", provider.help())),
+            Status::Failed(detail) => ("failed", detail),
+        };
+        println!("  {:<12} {mark:<8} {detail}", provider.name());
+    };
+    match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["list"] | [] => {
+            for provider in Provider::ALL {
+                show(provider, runtime.block_on(providers::look(provider)));
+            }
+            let choices = Choices::current();
+            for job in Job::ALL {
+                println!("  {:<12} uses {}", job.name(), choices.for_job(job).label());
+            }
+        }
+        ["check"] => {
+            for provider in Provider::ALL {
+                show(provider, runtime.block_on(providers::check(provider, "")));
+            }
+        }
+        ["check", name] => {
+            let provider = provider_named(name)?;
+            show(provider, runtime.block_on(providers::check(provider, "")));
+        }
+        ["key", name] => {
+            let provider = provider_named(name)?;
+            if provider.command().is_some() {
+                return Err(format!("{} signs in through its own command, not a key", provider.name()).into());
+            }
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let key = Password::new(key.trim());
+            if key.reveal().is_empty() {
+                return Err("give the key on standard input".into());
+            }
+            runtime.block_on(providers::save_key(provider, &key))?;
+            show(provider, runtime.block_on(providers::check(provider, "")));
+        }
+        ["forget", name] => {
+            let provider = provider_named(name)?;
+            runtime.block_on(providers::forget_key(provider))?;
+            println!("Removed the {} key.", provider.name());
+        }
+        ["use", job, name, ref model @ ..] => {
+            let job = match job {
+                "mav" => Job::Mav,
+                "forms" => Job::Forms,
+                "scoring" => Job::Scoring,
+                _ => return Err(USAGE.into()),
+            };
+            let choice = Choice {
+                provider: provider_named(name)?,
+                model: model.join(" "),
+            };
+            let file = providers::choices_path().ok_or("this system has no application data directory")?;
+            let mut choices = Choices::load(&file)?;
+            choices.set(job, choice.clone());
+            choices.save(&file)?;
+            println!("{} now uses {}.", job.name(), choice.label());
+        }
+        _ => return Err(USAGE.into()),
+    }
+    Ok(())
+}
+
 /// `maverick mav <message>`: shows what Mav would propose. It never writes anything.
 pub fn mav(message: &str) -> Result<(), Box<dyn Error>> {
     use maverick_core::mav::{self, Context};
