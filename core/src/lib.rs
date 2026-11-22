@@ -2,7 +2,12 @@
 
 pub mod bridge;
 pub mod extension;
+pub mod jobs;
 pub mod relay;
+pub mod rules;
+pub mod store;
+pub mod tracker;
+pub mod xlsx;
 
 use std::path::PathBuf;
 
@@ -12,6 +17,10 @@ const SOCKET_ENV: &str = "MAVERICK_BRIDGE_SOCKET";
 
 pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join(APP_ID))
+}
+
+pub fn database_path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("maverick.db"))
 }
 
 /// The socket the app listens on and the relay connects to.

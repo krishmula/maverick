@@ -1,9 +1,12 @@
 mod browser;
+mod cli;
 mod main_view;
 mod tabs;
 
 use std::error::Error;
 use std::io;
+use std::path::Path;
+use std::process::ExitCode;
 
 use gpui_kit::component::Theme;
 use gpui_kit::{AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size};
@@ -15,14 +18,31 @@ use crate::main_view::MainView;
 
 actions!(maverick, [Quit]);
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Chrome starts a native messaging host with the calling extension's origin
-    // as its first argument. In that case this process is the relay, not the app.
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| arg.starts_with("chrome-extension://"))
-    {
-        return Ok(maverick_core::relay::run()?);
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("maverick: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let mut arguments = std::env::args().skip(1);
+    match arguments.next().as_deref() {
+        // Chrome starts a native messaging host with the calling extension's origin
+        // as its first argument. In that case this process is the relay, not the app.
+        Some(origin) if origin.starts_with("chrome-extension://") => return Ok(maverick_core::relay::run()?),
+        Some("import-tracker") => {
+            let file = arguments
+                .next()
+                .ok_or("usage: maverick import-tracker <tracker.xlsx>")?;
+            return cli::import_tracker(Path::new(&file));
+        }
+        Some("check-rules") => return cli::check_rules(),
+        Some(other) => return Err(format!("{other:?} is not a maverick command").into()),
+        None => {}
     }
 
     let socket = maverick_core::socket_path().ok_or("this system has no application data directory")?;
