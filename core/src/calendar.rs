@@ -1,7 +1,7 @@
 //! Google Calendar: the user's events, the free time between them, and new events.
 //!
-//! It reads the primary calendar of every connected Google account, and writes to the first
-//! account that has granted Maverick permission to change events.
+//! It reads the calendars the user chose in each Google profile (the primary one unless they
+//! chose others), and writes to the profile the user names, or to the one marked for new blocks.
 
 use jiff::civil::{Date, Time};
 use jiff::tz::TimeZone;
@@ -9,8 +9,10 @@ use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use serde_json::{Value, json};
 
 use crate::google::{self, Account, CALENDAR_EVENTS, Client};
+use crate::http::form_encoded;
 
-const EVENTS: &str = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+const CALENDARS: &str = "https://www.googleapis.com/calendar/v3/calendars";
+const CALENDAR_LIST: &str = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
 /// The hours the user plans in, when looking for free time.
 pub const DAY_STARTS: i8 = 8;
 pub const DAY_ENDS: i8 = 22;
@@ -26,6 +28,8 @@ pub enum Span {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     pub title: String,
+    /// The name of the Google profile it came from.
+    pub profile: String,
     pub span: Span,
     /// False for an event marked free, which does not block time.
     pub busy: bool,
@@ -121,7 +125,7 @@ pub fn clashes<'a>(events: &'a [Event], start: &ZonedDateTime, end: &ZonedDateTi
         .collect()
 }
 
-/// The events between `from` and `to` on every connected account's primary calendar, by start.
+/// The events between `from` and `to` on the calendars each profile reads, by start.
 pub async fn events(from: Timestamp, to: Timestamp, zone: &TimeZone) -> Result<Vec<Event>, String> {
     let Some(client) = Client::stored().await? else {
         return Ok(Vec::new());
@@ -130,13 +134,22 @@ pub async fn events(from: Timestamp, to: Timestamp, zone: &TimeZone) -> Result<V
     let mut all = Vec::new();
     for account in google::accounts(&file)?.iter().filter(|account| can_read(account)) {
         let token = google::access_token(&client, &account.email).await?;
-        let url = format!(
-            "{EVENTS}?singleEvents=true&orderBy=startTime&maxResults=250&timeMin={}&timeMax={}",
-            from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            to.strftime("%Y-%m-%dT%H:%M:%SZ")
-        );
-        let reply = google::call(&token, "GET", &url, None).await?;
-        all.extend(parse_events(&reply, zone));
+        let primary = ["primary".to_owned()];
+        let calendars = if account.calendars.is_empty() {
+            &primary[..]
+        } else {
+            &account.calendars[..]
+        };
+        for calendar in calendars {
+            let url = format!(
+                "{CALENDARS}/{}/events?singleEvents=true&orderBy=startTime&maxResults=250&timeMin={}&timeMax={}",
+                form_encoded(calendar),
+                from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                to.strftime("%Y-%m-%dT%H:%M:%SZ")
+            );
+            let reply = google::call(&token, "GET", &url, None).await?;
+            all.extend(parse_events(&reply, zone, account.name()));
+        }
     }
     all.sort_by_key(|event| match &event.span {
         Span::Days(first, _) => (*first, None),
@@ -145,8 +158,45 @@ pub async fn events(from: Timestamp, to: Timestamp, zone: &TimeZone) -> Result<V
     Ok(all)
 }
 
+/// One calendar in a Google account.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calendar {
+    pub id: String,
+    pub name: String,
+    pub primary: bool,
+}
+
+/// The calendars the account with `email` can see.
+pub async fn calendars(email: &str) -> Result<Vec<Calendar>, String> {
+    let client = Client::stored().await?.ok_or("no Google OAuth client is stored")?;
+    let token = google::access_token(&client, email).await?;
+    let reply = google::call(&token, "GET", CALENDAR_LIST, None).await?;
+    Ok(parse_calendars(&reply))
+}
+
+pub fn parse_calendars(reply: &Value) -> Vec<Calendar> {
+    let mut calendars: Vec<Calendar> = reply["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some(Calendar {
+                id: item["id"].as_str()?.to_owned(),
+                name: item["summaryOverride"]
+                    .as_str()
+                    .or(item["summary"].as_str())
+                    .unwrap_or("(no name)")
+                    .to_owned(),
+                primary: item["primary"] == true,
+            })
+        })
+        .collect();
+    calendars.sort_by_key(|calendar| !calendar.primary);
+    calendars
+}
+
 /// The events in one reply from Google. A cancelled event or one Maverick cannot read is left out.
-pub fn parse_events(reply: &Value, zone: &TimeZone) -> Vec<Event> {
+pub fn parse_events(reply: &Value, zone: &TimeZone, profile: &str) -> Vec<Event> {
     let Some(items) = reply["items"].as_array() else {
         return Vec::new();
     };
@@ -169,6 +219,7 @@ pub fn parse_events(reply: &Value, zone: &TimeZone) -> Vec<Event> {
             };
             Some(Event {
                 title: item["summary"].as_str().unwrap_or("(no title)").to_owned(),
+                profile: profile.to_owned(),
                 span,
                 busy: item["transparency"] != "transparent",
             })
@@ -183,17 +234,43 @@ fn can_read(account: &Account) -> bool {
         .any(|scope| scope == google::CALENDAR_READ || scope == CALENDAR_EVENTS)
 }
 
-/// Adds an event from `start` to `end` to the primary calendar of the first account that allows it.
-/// Returns the account it went to.
-pub async fn add(title: &str, start: &ZonedDateTime, end: &ZonedDateTime) -> Result<String, String> {
+/// The account new blocks go to: the profile named `profile`, ignoring case, or else the one
+/// marked for new blocks, or else the first that may add events.
+pub fn block_account<'a>(accounts: &'a [Account], profile: Option<&str>) -> Result<&'a Account, String> {
+    let chosen = match profile {
+        Some(name) => accounts
+            .iter()
+            .find(|account| account.name().eq_ignore_ascii_case(name.trim()))
+            .ok_or_else(|| format!("no Google profile is called {name}"))?,
+        None => accounts
+            .iter()
+            .find(|account| account.adds_blocks)
+            .or_else(|| accounts.iter().find(|account| account.can(CALENDAR_EVENTS)))
+            .ok_or("no Google profile lets Maverick add events yet; sign in to one again under Connections")?,
+    };
+    if !chosen.can(CALENDAR_EVENTS) {
+        return Err(format!(
+            "the {} profile does not let Maverick add events yet; sign in to it again under Connections",
+            chosen.name()
+        ));
+    }
+    Ok(chosen)
+}
+
+/// Adds an event from `start` to `end` to the primary calendar of the profile `block_account` picks.
+/// Returns the profile's name.
+pub async fn add(
+    title: &str,
+    start: &ZonedDateTime,
+    end: &ZonedDateTime,
+    profile: Option<&str>,
+) -> Result<String, String> {
     let client = Client::stored()
         .await?
         .ok_or("no Google OAuth client is stored; run `maverick google client` first")?;
     let file = google::accounts_path().ok_or("this system has no application data directory")?;
-    let account = google::accounts(&file)?
-        .into_iter()
-        .find(|account| account.scopes.iter().any(|scope| scope == CALENDAR_EVENTS))
-        .ok_or("no Google account lets Maverick add events yet; run `maverick google add` to grant it")?;
+    let accounts = google::accounts(&file)?;
+    let account = block_account(&accounts, profile)?;
     let token = google::access_token(&client, &account.email).await?;
     let moment = |at: &ZonedDateTime| {
         json!({
@@ -202,8 +279,8 @@ pub async fn add(title: &str, start: &ZonedDateTime, end: &ZonedDateTime) -> Res
         })
     };
     let body = json!({ "summary": title, "start": moment(start), "end": moment(end) });
-    google::call(&token, "POST", EVENTS, Some(&body)).await?;
-    Ok(account.email)
+    google::call(&token, "POST", &format!("{CALENDARS}/primary/events"), Some(&body)).await?;
+    Ok(account.name().to_owned())
 }
 
 /// How long a stretch is, as `2 h` or `1 h 30 min`.
@@ -235,6 +312,7 @@ mod tests {
     fn timed(title: &str, start: ZonedDateTime, end: ZonedDateTime) -> Event {
         Event {
             title: title.into(),
+            profile: "Work".into(),
             span: Span::At(start, end),
             busy: true,
         }
@@ -249,6 +327,7 @@ mod tests {
             timed("Prep", at(23, 11, 0), at(23, 12, 0)),
             Event {
                 title: "Lunch (free)".into(),
+                profile: "Work".into(),
                 span: Span::At(at(23, 12, 0), at(23, 13, 0)),
                 busy: false,
             },
@@ -286,11 +365,50 @@ mod tests {
             { "summary": "Hold", "transparency": "transparent",
               "start": { "dateTime": "2026-11-23T18:00:00Z" }, "end": { "dateTime": "2026-11-23T19:00:00Z" } }
         ]});
-        let events = parse_events(&reply, &zone());
+        let events = parse_events(&reply, &zone(), "Work");
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].hours(), "10:00 to 11:30");
         assert!(events[1].touches(date(2026, 11, 24)) && !events[1].touches(date(2026, 11, 25)));
         assert!(!events[2].busy);
+    }
+
+    #[test]
+    fn calendars_parse_with_the_primary_first() {
+        let reply = json!({ "items": [
+            { "id": "team@group.calendar.google.com", "summary": "Team", "summaryOverride": "On-call" },
+            { "id": "kris@example.com", "summary": "kris@example.com", "primary": true }
+        ]});
+        let calendars = parse_calendars(&reply);
+        assert!(calendars[0].primary);
+        assert_eq!(calendars[1].name, "On-call");
+    }
+
+    #[test]
+    fn blocks_go_to_the_named_profile_or_the_marked_one() {
+        let profile = |email: &str, label: &str, write: bool, marked: bool| Account {
+            email: email.into(),
+            label: Some(label.into()),
+            scopes: if write {
+                vec![CALENDAR_EVENTS.into()]
+            } else {
+                vec![google::CALENDAR_READ.into()]
+            },
+            adds_blocks: marked,
+            ..Account::default()
+        };
+        let accounts = [
+            profile("w@example.com", "Work", true, false),
+            profile("s@example.com", "School", true, true),
+            profile("o@example.com", "Old", false, false),
+        ];
+        assert_eq!(block_account(&accounts, None).unwrap().email, "s@example.com");
+        assert_eq!(block_account(&accounts, Some(" work ")).unwrap().email, "w@example.com");
+        assert!(
+            block_account(&accounts, Some("Old"))
+                .unwrap_err()
+                .contains("sign in to it again")
+        );
+        assert!(block_account(&accounts, Some("Gym")).is_err());
     }
 
     #[test]

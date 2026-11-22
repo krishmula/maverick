@@ -596,6 +596,8 @@ mod tests {
                     upcoming: vec![entry("Send references", Due::Day(date(2026, 11, 23)))],
                 },
                 events: Vec::new(),
+                profiles: Vec::new(),
+                ticktick: Default::default(),
             };
             mav.update(cx, |mav, cx| mav.set(ready(seen), cx));
             window.render_frame(cx);

@@ -1,6 +1,7 @@
 mod band;
 mod browser;
 mod cli;
+mod connections;
 mod icon;
 mod jobs;
 mod main_view;
