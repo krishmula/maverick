@@ -58,10 +58,26 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE postings ADD COLUMN sponsorship TEXT
         CHECK (sponsorship IN ('sponsors', 'no_sponsorship', 'unknown'));
 ",
+    "
+    CREATE TABLE chats (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE chat_lines (
+        id INTEGER PRIMARY KEY,
+        chat_id INTEGER NOT NULL REFERENCES chats (id) ON DELETE CASCADE,
+        said_at TEXT NOT NULL,
+        line TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX chat_lines_by_chat ON chat_lines (chat_id, id);
+",
 ];
 
 pub struct Store {
-    db: Connection,
+    pub(crate) db: Connection,
 }
 
 /// How many records the store holds, by state.

@@ -229,6 +229,8 @@ The **mav** view is a conversation with Mav, your planning assistant. Type what 
 
 Mav proposes each TickTick task or calendar block as a card. Nothing is written until you click **Confirm** on the card. **Skip** drops it. A block that overlaps a busy event lists the clash in pink before you confirm. Questions such as "what is left today?" get an answer and no cards.
 
+The left side lists your chats with Mav, newest first. Maverick saves every chat in its local database as you go; click one to read it again, **+ new** to start another, and **delete** on the open one to remove it. Mav reads only the open chat. A proposal in a saved chat shows how it ended (added, skipped or failed) and cannot be confirmed again, since your tasks and calendar have moved on since.
+
 The right side shows the calendar, then every open TickTick task in the lists Mav shows, grouped by priority (high, medium, low, none) or, with the **date** switch, into overdue, today, the coming week and no date. On the right side, without Mav:
 
 - Tick a task's box to finish it. It shows as done until the next read drops it.
