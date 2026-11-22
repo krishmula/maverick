@@ -34,6 +34,26 @@ The app shows your tabs when Chrome connects. If the app starts after Chrome, Ch
 - Press the Up and Down arrow keys to move the selection.
 - Press Enter, or click a row, to switch Chrome to that tab.
 
+## Import the job tracker
+
+The job funnel keeps its records in a local SQLite database at `~/Library/Application Support/dev.maverick.app/maverick.db`. To copy the tracker spreadsheet into it, export the Google Sheet as `.xlsx` and run:
+
+```sh
+cargo run --release -p maverick -- import-tracker "/path/to/tracker.xlsx"
+```
+
+The import reads three tabs: `Sheet1` (applications), `Found` (postings), and `Hiring Posts`. It updates records the database already holds, so you can repeat it after the sheet changes. It lists each row it cannot read and leaves that row out.
+
+## Check the rules against stored decisions
+
+Code rules skip a posting from its title and location alone, and spot a posting that repeats an earlier one. To compare them with the decisions the database already holds, run:
+
+```sh
+cargo run --release -p maverick -- check-rules
+```
+
+The report counts what the rules would skip and lists each posting where the rules and the stored decision disagree.
+
 ## Run the tests
 
 ```sh
