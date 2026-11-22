@@ -291,7 +291,13 @@ pub fn check_scores(count: usize) -> Result<(), Box<dyn Error>> {
 pub fn run() -> Result<(), Box<dyn Error>> {
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
     let profile = profile()?;
-    let pass = runtime()?.block_on(maverick_core::funnel::run_once(&database, profile))?;
+    let pass = runtime()?.block_on(async {
+        let sheet = maverick_core::sheet::linked_session().await?;
+        if let Some(session) = &sheet {
+            println!("Reading and writing the tracker sheet {:?}.", session.sheet.name);
+        }
+        maverick_core::funnel::run_once(&database, profile, sheet).await
+    })?;
     for posting in &pass.scored {
         println!("{}", scored_line(posting));
     }
@@ -300,5 +306,127 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pass.duplicates, pass.skipped_by_rules, pass.unreadable
     );
     println!("{}", pass.summary());
+    Ok(())
+}
+
+/// `maverick google <client|add|list|check|remove>`: manages the connected Google accounts.
+pub fn google(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use maverick_core::google::{self, Client};
+
+    const USAGE: &str = "usage: maverick google client <client id> < secret-file | add | list | check | get <email> <url> | remove <email>";
+    let file = google::accounts_path().ok_or("this system has no application data directory")?;
+    let runtime = runtime()?;
+    let client = || -> Result<Client, Box<dyn Error>> {
+        runtime
+            .block_on(Client::stored())?
+            .ok_or_else(|| "no Google OAuth client is stored yet; run `maverick google client <id>` first".into())
+    };
+    match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["client", id] => {
+            let mut secret = String::new();
+            std::io::stdin().read_line(&mut secret)?;
+            let secret = secret.trim();
+            if secret.is_empty() {
+                return Err("give the client secret on standard input".into());
+            }
+            runtime.block_on(Client::new(id, maverick_core::credentials::Password::new(secret)).save())?;
+            println!("Stored the OAuth client {id} in the Keychain.");
+        }
+        ["add"] => {
+            let client = client()?;
+            let account = runtime.block_on(google::connect(&client, &file, |url| {
+                println!("Opening the Google sign-in in your browser. If it does not open, visit:\n{url}");
+                let _ = std::process::Command::new("/usr/bin/open").arg(url).status();
+            }))?;
+            println!("Connected {} with {} scopes.", account.email, account.scopes.len());
+        }
+        ["list"] => {
+            let accounts = google::accounts(&file)?;
+            if accounts.is_empty() {
+                println!("No Google accounts are connected.");
+            }
+            for account in accounts {
+                println!(
+                    "{}  connected {}  {}",
+                    account.email,
+                    account.connected_at,
+                    account.scopes.join(" ")
+                );
+            }
+        }
+        ["check"] => {
+            let client = client()?;
+            for account in google::accounts(&file)? {
+                let checked = runtime.block_on(async {
+                    let token = google::access_token(&client, &account.email).await?;
+                    google::call(
+                        &token,
+                        "GET",
+                        "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)",
+                        None,
+                    )
+                    .await
+                });
+                match checked {
+                    Ok(about) => println!(
+                        "{}: works (Drive sees {})",
+                        account.email, about["user"]["emailAddress"]
+                    ),
+                    Err(error) => println!("{}: {error}", account.email),
+                }
+            }
+        }
+        ["get", email, url] => {
+            let client = client()?;
+            let reply = runtime.block_on(async {
+                let token = google::access_token(&client, email).await?;
+                google::call(&token, "GET", url, None).await
+            })?;
+            println!("{}", serde_json::to_string_pretty(&reply)?);
+        }
+        ["remove", email] => {
+            runtime.block_on(google::disconnect(&file, email))?;
+            println!("Removed {email}.");
+        }
+        _ => return Err(USAGE.into()),
+    }
+    Ok(())
+}
+
+/// `maverick tracker link [name]` links the live tracker sheet; `maverick tracker` shows the link.
+pub fn tracker(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use maverick_core::google::{self, Client};
+    use maverick_core::sheet::{self, TrackerSheet};
+
+    let file = sheet::config_path().ok_or("this system has no application data directory")?;
+    match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => match TrackerSheet::linked(&file)? {
+            Some(linked) => println!(
+                "Linked: {:?} ({}) through {}",
+                linked.name, linked.spreadsheet_id, linked.account
+            ),
+            None => println!("No tracker sheet is linked. Run `maverick tracker link <part of its name>`."),
+        },
+        ["link", name] => {
+            let runtime = runtime()?;
+            let client = runtime
+                .block_on(Client::stored())?
+                .ok_or("no Google OAuth client is stored yet; run `maverick google client <id>` first")?;
+            let accounts = google::accounts(&google::accounts_path().ok_or("no data directory")?)?;
+            let found = runtime.block_on(sheet::find(&client, &accounts, name))?;
+            let Some(chosen) = found.first() else {
+                return Err(format!("no connected account has a spreadsheet named like {name:?}").into());
+            };
+            chosen.save(&file)?;
+            println!("Linked {:?} through {}.", chosen.name, chosen.account);
+            for other in &found[1..] {
+                println!(
+                    "  Also found {:?} through {}; pass a longer name to pick it.",
+                    other.name, other.account
+                );
+            }
+        }
+        _ => return Err("usage: maverick tracker [link <part of its name>]".into()),
+    }
     Ok(())
 }

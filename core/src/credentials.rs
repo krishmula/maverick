@@ -96,6 +96,102 @@ async fn read(service: &str) -> Result<Option<SignIn>, String> {
     parse(&String::from_utf8_lossy(&output.stdout), &said).map(Some)
 }
 
+/// The password stored for `account` under `service`, or `None` when there is none.
+/// Use this when one service holds several accounts.
+pub async fn secret(service: &str, account: &str) -> Result<Option<Password>, String> {
+    let run = Command::new(SECURITY)
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(TIME_LIMIT, run)
+        .await
+        .map_err(|_| "the Keychain did not answer in time".to_owned())?
+        .map_err(|error| format!("could not run {SECURITY}: {error}"))?;
+    if output.status.code() == Some(NOT_FOUND) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "{SECURITY} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let password = printed.strip_suffix('\n').unwrap_or(&printed);
+    if password.is_empty() {
+        return Err("the Keychain item's password is empty".to_owned());
+    }
+    Ok(Some(Password::new(password)))
+}
+
+/// Stores `password` for `account` under `service`, replacing any password stored there.
+///
+/// The command reads the password from its input, so it never shows in the list of processes.
+/// A value with a quote, a backslash or a line break is refused rather than escaped.
+pub async fn store(service: &str, account: &str, password: &Password) -> Result<(), String> {
+    let plain = |text: &str| !text.is_empty() && !text.contains(['"', '\\', '\n', '\r']);
+    if !(plain(service) && plain(account) && plain(password.reveal())) {
+        return Err("a Keychain value may not be empty or hold a quote, a backslash or a line break".to_owned());
+    }
+    let command = format!(
+        "add-generic-password -U -s \"{service}\" -a \"{account}\" -w \"{}\"\n",
+        password.reveal()
+    );
+    run_interactive(&command).await
+}
+
+/// Deletes the item for `account` under `service`. A missing item is not an error.
+pub async fn forget(service: &str, account: &str) -> Result<(), String> {
+    let run = Command::new(SECURITY)
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(TIME_LIMIT, run)
+        .await
+        .map_err(|_| "the Keychain did not answer in time".to_owned())?
+        .map_err(|error| format!("could not run {SECURITY}: {error}"))?;
+    match output.status.code() {
+        Some(0) | Some(NOT_FOUND) => Ok(()),
+        _ => Err(format!(
+            "{SECURITY} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Runs one `security` command read from standard input.
+async fn run_interactive(command: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut child = Command::new(SECURITY)
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not run {SECURITY}: {error}"))?;
+    let mut input = child.stdin.take().expect("the input is piped");
+    input
+        .write_all(command.as_bytes())
+        .await
+        .map_err(|error| format!("could not talk to {SECURITY}: {error}"))?;
+    drop(input);
+    let output = tokio::time::timeout(TIME_LIMIT, child.wait_with_output())
+        .await
+        .map_err(|_| "the Keychain did not answer in time".to_owned())?
+        .map_err(|error| format!("{SECURITY} failed: {error}"))?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    // `security -i` exits 0 even when its command fails, and reports the failure on its error output.
+    if !output.status.success() || !said.trim().is_empty() {
+        return Err(format!("{SECURITY} failed: {}", said.trim()));
+    }
+    Ok(())
+}
+
 const PASSWORD_LINE: &str = "password: ";
 const ACCOUNT_LINE: &str = "\"acct\"<blob>=";
 
@@ -253,6 +349,39 @@ mod tests {
                 .stderr(Stdio::null())
                 .status();
         }
+    }
+
+    /// Stores, reads, replaces and deletes made-up items in the real login Keychain.
+    #[tokio::test]
+    async fn a_service_holds_one_secret_per_account() {
+        let nanos = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
+        let service = format!("dev.maverick.test-{}-{nanos}", std::process::id());
+        let made_up = |text: &str| Password::new(text);
+        store(&service, "ada@example.com", &made_up("1//first-token_A"))
+            .await
+            .unwrap();
+        store(&service, "bo@example.com", &made_up("1//second-token_B"))
+            .await
+            .unwrap();
+        store(&service, "ada@example.com", &made_up("1//replaced-token"))
+            .await
+            .unwrap();
+
+        let read = |account: &'static str| {
+            let service = service.clone();
+            async move { secret(&service, account).await.unwrap().map(|p| p.reveal().to_owned()) }
+        };
+        assert_eq!(read("ada@example.com").await.as_deref(), Some("1//replaced-token"));
+        assert_eq!(read("bo@example.com").await.as_deref(), Some("1//second-token_B"));
+        assert_eq!(read("cy@example.com").await, None);
+
+        forget(&service, "ada@example.com").await.unwrap();
+        forget(&service, "ada@example.com").await.unwrap();
+        assert_eq!(read("ada@example.com").await, None);
+        forget(&service, "bo@example.com").await.unwrap();
+
+        let refused = store(&service, "ada@example.com", &made_up("has \"quote\"")).await;
+        assert!(refused.is_err());
     }
 
     /// Reads the real login Keychain, but only items this test stores itself, with made-up values.

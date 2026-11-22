@@ -60,7 +60,8 @@ impl Funnel {
             .background
             .spawn(async move {
                 let profile = Profile::from(&Answers::load(&answers)?);
-                let pass = funnel::run_once(&database, profile).await?;
+                let sheet = maverick_core::sheet::linked_session().await?;
+                let pass = funnel::run_once(&database, profile, sheet).await?;
                 let (jobs, cells) = tokio::task::spawn_blocking(move || stored_jobs(Some(&database)))
                     .await
                     .map_err(|stopped| stopped.to_string())?;
