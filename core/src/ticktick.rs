@@ -84,6 +84,73 @@ pub async fn undone(token: &Password, from: Timestamp, to: Timestamp) -> Result<
     serde_json::from_value(reply).map_err(|error| format!("TickTick's tasks did not parse: {error}"))
 }
 
+/// A task Maverick is about to add.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewTask {
+    pub title: String,
+    /// The list's id. The Inbox is `inbox`.
+    pub list_id: String,
+    pub due: Option<Due>,
+    /// Minutes before the due time to remind, or for an all-day task, a reminder at 9:00 that day.
+    pub remind_before: Option<i64>,
+}
+
+/// The body TickTick takes to create `task`.
+pub fn new_task_body(task: &NewTask, zone: &TimeZone) -> Value {
+    let mut body = json!({ "title": task.title, "projectId": task.list_id });
+    let format = |moment: Timestamp| moment.strftime(DATE_FORMAT).to_string();
+    let zone_name = zone.iana_name().unwrap_or("UTC");
+    match &task.due {
+        None => {}
+        Some(Due::Day(date)) => {
+            let midnight = date
+                .to_zoned_datetime(zone.clone())
+                .map(|at| at.timestamp())
+                .unwrap_or_default();
+            body["startDate"] = json!(format(midnight));
+            body["dueDate"] = json!(format(midnight));
+            body["isAllDay"] = json!(true);
+            body["timeZone"] = json!(zone_name);
+            if task.remind_before.is_some() {
+                body["reminders"] = json!(["TRIGGER:P0DT9H0M0S"]);
+            }
+        }
+        Some(Due::At(moment)) => {
+            body["startDate"] = json!(format(moment.timestamp()));
+            body["dueDate"] = json!(format(moment.timestamp()));
+            body["isAllDay"] = json!(false);
+            body["timeZone"] = json!(moment.time_zone().iana_name().unwrap_or(zone_name));
+            if let Some(minutes) = task.remind_before {
+                let trigger = if minutes <= 0 {
+                    "TRIGGER:PT0S".to_owned()
+                } else {
+                    format!("TRIGGER:-PT{minutes}M")
+                };
+                body["reminders"] = json!([trigger]);
+            }
+        }
+    }
+    body
+}
+
+/// Adds `task` to TickTick and returns it as TickTick stored it.
+pub async fn create(token: &Password, task: &NewTask, zone: &TimeZone) -> Result<Task, String> {
+    let reply = http::call(
+        "TickTick",
+        token,
+        "POST",
+        &format!("{API}/task"),
+        Some(&new_task_body(task, zone)),
+    )
+    .await?;
+    serde_json::from_value(reply).map_err(|error| format!("TickTick's reply to the new task did not parse: {error}"))
+}
+
+pub async fn delete(token: &Password, list_id: &str, task_id: &str) -> Result<(), String> {
+    let url = format!("{API}/project/{list_id}/task/{task_id}");
+    http::call("TickTick", token, "DELETE", &url, None).await.map(drop)
+}
+
 /// When a task is due, as the user reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Due {
@@ -297,6 +364,36 @@ mod tests {
         inbox.project_id = "inbox118293".to_owned();
         let agenda = Agenda::of(&[inbox], &[], &sunday_afternoon());
         assert_eq!(agenda.upcoming[0].list, "Inbox");
+    }
+
+    #[test]
+    fn a_new_task_carries_its_time_zone_and_reminder() {
+        let at = date(2026, 11, 24).at(10, 0, 0, 0).in_tz("America/Los_Angeles").unwrap();
+        let timed = NewTask {
+            title: "Follow up".into(),
+            list_id: "inbox".into(),
+            due: Some(Due::At(at.clone())),
+            remind_before: Some(30),
+        };
+        let zone = at.time_zone().clone();
+        let body = new_task_body(&timed, &zone);
+        assert_eq!(body["dueDate"], "2026-11-24T18:00:00+0000");
+        assert_eq!(body["timeZone"], "America/Los_Angeles");
+        assert_eq!(body["isAllDay"], false);
+        assert_eq!(body["reminders"], json!(["TRIGGER:-PT30M"]));
+
+        let all_day = NewTask {
+            due: Some(Due::Day(date(2026, 11, 24))),
+            remind_before: None,
+            ..timed
+        };
+        let body = new_task_body(&all_day, &zone);
+        assert_eq!(body["dueDate"], "2026-11-24T08:00:00+0000");
+        assert_eq!(body["isAllDay"], true);
+        assert!(body.get("reminders").is_none());
+
+        let undated = NewTask { due: None, ..all_day };
+        assert!(new_task_body(&undated, &zone).get("dueDate").is_none());
     }
 
     #[test]

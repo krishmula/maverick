@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("tracker") => return cli::tracker(&arguments.collect::<Vec<_>>()),
         Some("google") => return cli::google(&arguments.collect::<Vec<_>>()),
         Some("ticktick") => return cli::ticktick(&arguments.collect::<Vec<_>>()),
+        Some("mav") => return cli::mav(&arguments.collect::<Vec<_>>().join(" ")),
         Some("score") => {
             let mut limit = maverick_core::score::RUN_CAP;
             let mut dry_run = false;

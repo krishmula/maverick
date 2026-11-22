@@ -37,9 +37,19 @@ pub const SHEETS: &str = "https://www.googleapis.com/auth/spreadsheets";
 pub const DRIVE_READ: &str = "https://www.googleapis.com/auth/drive.readonly";
 pub const GMAIL_READ: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const CALENDAR_READ: &str = "https://www.googleapis.com/auth/calendar.readonly";
+/// Read and change events, which adding a planned block needs.
+pub const CALENDAR_EVENTS: &str = "https://www.googleapis.com/auth/calendar.events";
 
 /// What a new account is asked for. Sign-in identity, then each service Maverick uses.
-pub const SCOPES: &[&str] = &["openid", "email", SHEETS, DRIVE_READ, GMAIL_READ, CALENDAR_READ];
+pub const SCOPES: &[&str] = &[
+    "openid",
+    "email",
+    SHEETS,
+    DRIVE_READ,
+    GMAIL_READ,
+    CALENDAR_READ,
+    CALENDAR_EVENTS,
+];
 
 /// How long the browser sign-in may take before Maverick stops waiting.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(5 * 60);
