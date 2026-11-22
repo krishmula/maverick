@@ -20,6 +20,7 @@ use crate::band::{Band, Cell, Mark};
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
+use crate::mav::Mav;
 use crate::report;
 use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Refreshed};
 use crate::tabs::{TabList, host_of};
@@ -39,6 +40,8 @@ const TRACKED: usize = 6;
 enum Showing {
     Tabs,
     Jobs,
+    /// What is due in TickTick.
+    Mav,
 }
 
 pub struct MainView {
@@ -48,6 +51,7 @@ pub struct MainView {
     icon_file: Option<PathBuf>,
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
+    mav: Entity<Mav>,
     band: Band,
     /// What the last funnel pass did, for the bar.
     funnel_status: Option<String>,
@@ -68,7 +72,10 @@ impl MainView {
         let showing = if jobs.is_empty() { Showing::Tabs } else { Showing::Jobs };
         let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
+        let mav = cx.new(|cx| Mav::new(browser.read(cx).background()));
         let _subscriptions = vec![
+            // The bar counts what is due.
+            cx.observe(&mav, |_, _, cx| cx.notify()),
             cx.observe_in(&browser, window, |this, browser, window, cx| {
                 this.show_current_tabs(window, cx);
                 // A job leaves the list once its application went through.
@@ -141,6 +148,7 @@ impl MainView {
             icon_file,
             jobs,
             tabs,
+            mav,
             band: Band::new(cells),
             funnel_status: None,
             _funnel: None,
@@ -175,6 +183,7 @@ impl MainView {
         match showing {
             Showing::Tabs => self.tabs.update(cx, |tabs, cx| tabs.focus(window, cx)),
             Showing::Jobs => self.jobs.update(cx, |jobs, cx| jobs.focus(window, cx)),
+            Showing::Mav => self.mav.update(cx, |mav, cx| mav.load(cx)),
         }
         cx.notify();
     }
@@ -257,7 +266,12 @@ impl MainView {
                                 Showing::Jobs,
                                 cx,
                             ))
-                            .child(tab("show-tabs", "Tabs".to_owned(), "tabs", tabs, Showing::Tabs, cx)),
+                            .child(tab("show-tabs", "Tabs".to_owned(), "tabs", tabs, Showing::Tabs, cx))
+                            .child({
+                                let pressing = self.mav.read(cx).pressing();
+                                let name = pressing.map_or("Mav".to_owned(), |due| format!("Mav · {due}"));
+                                tab("show-mav", name, "mav", pressing, Showing::Mav, cx)
+                            }),
                     ),
             )
             .child(
@@ -481,6 +495,7 @@ impl MainView {
                 Some(tab) => self.tab_pane(&tab, palette, cx),
                 None => v_flex(),
             },
+            Showing::Mav => v_flex(),
         }
     }
 
@@ -825,8 +840,11 @@ impl Render for MainView {
             .child(grid(palette.grid))
             .child(self.bar(&palette, cx))
             .children(self.notices(&palette, cx))
-            .child(self.band(&palette, cx))
-            .child(if connected {
+            // The band tracks jobs, so the Mav view leaves it out.
+            .children((self.showing != Showing::Mav).then(|| self.band(&palette, cx)))
+            .child(if self.showing == Showing::Mav {
+                div().flex_1().min_h_0().child(self.mav.clone()).into_any_element()
+            } else if connected {
                 h_flex()
                     .flex_1()
                     .min_h_0()
@@ -842,7 +860,7 @@ impl Render for MainView {
                                 Showing::Tabs => List::new(&self.tabs)
                                     .search_placeholder("search tabs")
                                     .into_any_element(),
-                                Showing::Jobs => List::new(&self.jobs)
+                                Showing::Jobs | Showing::Mav => List::new(&self.jobs)
                                     .search_placeholder("search jobs")
                                     .into_any_element(),
                             }),

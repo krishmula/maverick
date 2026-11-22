@@ -309,6 +309,53 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `maverick ticktick <token|today|forget>`: connects TickTick and shows the agenda.
+pub fn ticktick(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use maverick_core::credentials::Password;
+    use maverick_core::ticktick::{self, Entry};
+
+    const USAGE: &str = "usage: maverick ticktick token < token-file | today | forget";
+    let runtime = runtime()?;
+    match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["token"] => {
+            let mut token = String::new();
+            std::io::stdin().read_line(&mut token)?;
+            let token = Password::new(token.trim());
+            if token.reveal().is_empty() {
+                return Err("give the API token on standard input".into());
+            }
+            // A token TickTick refuses is not worth keeping.
+            let lists = runtime.block_on(ticktick::projects(&token))?;
+            runtime.block_on(ticktick::save_token(&token))?;
+            println!(
+                "Stored the TickTick token in the Keychain. It sees {} lists.",
+                lists.len()
+            );
+        }
+        ["today"] => {
+            let token = runtime
+                .block_on(ticktick::stored_token())?
+                .ok_or("no TickTick token is stored yet; run `maverick ticktick token` first")?;
+            let agenda = runtime.block_on(ticktick::agenda(&token, &jiff::ZonedDateTime::now()))?;
+            let print = |heading: &str, entries: &[Entry]| {
+                println!("{heading} ({})", entries.len());
+                for entry in entries {
+                    println!("  {:<16} {}  [{}]", entry.due.label(), entry.title, entry.list);
+                }
+            };
+            print("Overdue", &agenda.overdue);
+            print("Today", &agenda.today);
+            print("Coming week", &agenda.upcoming);
+        }
+        ["forget"] => {
+            runtime.block_on(ticktick::forget_token())?;
+            println!("Removed the TickTick token from the Keychain.");
+        }
+        _ => return Err(USAGE.into()),
+    }
+    Ok(())
+}
+
 /// `maverick google <client|add|list|check|remove>`: manages the connected Google accounts.
 pub fn google(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::google::{self, Client};
