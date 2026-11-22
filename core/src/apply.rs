@@ -89,10 +89,15 @@ pub enum FillError {
     /// The posting is no longer listed.
     Closed,
     UnexpectedForm(String),
-    /// The application is behind an account, and only the user signs in to it.
+    /// The application is behind an account, and Maverick has no sign-in stored for the system.
+    /// `service` is the name of the Keychain item it looks for.
     SignInNeeded {
         system: &'static str,
+        service: &'static str,
     },
+    /// Maverick tried to get past a system's sign-in and stopped. The text says what happened
+    /// and what the user does next.
+    SignIn(String),
     Page(PageError),
     /// The link to the tab broke. `during` says what the filler was doing.
     Interrupted {
@@ -109,11 +114,14 @@ impl fmt::Display for FillError {
             Self::UnexpectedForm(problem) => {
                 write!(f, "the form is described in a way Maverick cannot read: {problem}")
             }
-            Self::SignInNeeded { system } => write!(
+            Self::SignInNeeded { system, service } => write!(
                 f,
-                "{system} shows the application only to a signed-in account. \
-                 Sign in to {system} in that tab, then click Fill form again."
+                "{system} shows the application only to a signed-in account, and Maverick has no {system} \
+                 sign-in stored. To store one, run `security add-generic-password -s {service} -a <email> -w` \
+                 in Terminal and type the password at the prompt. Then click Fill form again. \
+                 Or sign in to {system} in that tab yourself."
             ),
+            Self::SignIn(what_happened) => f.write_str(what_happened),
             Self::Page(error) => write!(f, "{error}"),
             Self::Interrupted { during, error } => write!(f, "{error} This happened while {during}."),
         }

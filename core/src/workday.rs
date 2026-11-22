@@ -1,11 +1,23 @@
-//! Fills the page of a Workday application that is on screen and stops. It never signs in,
-//! never moves to the next page and never submits.
+//! Fills the page of a Workday application that is on screen and stops. It never moves to the
+//! next page and never submits.
 //!
-//! Most employers show a Workday application only to an account on their own Workday site, and
-//! this code was written without one. So its parts stand on different ground:
+//! Most employers show a Workday application only to an account on their own Workday site. When
+//! the user has stored one Workday sign-in in the Keychain, this code signs in with it, and
+//! creates the account at an employer where the sign-in is refused. See `pass_wall`.
+//!
+//! This code was written without a Workday account. So its parts stand on different ground:
 //!
 //! - Checked against live sites: the address shapes, the job's public data, the choice between
 //!   "Autofill with Resume", "Apply Manually" and "Use My Last Application", and the sign-in wall.
+//! - Checked against the sign-in walls of 19 employers, with made-up values and WITHOUT pressing
+//!   Sign In or Create Account: the markup of the sign-in form, the create-account form and the
+//!   chooser, moving between them, typing into them and reading the text back, ticking the
+//!   consent box, and which element a click on a submit button lands on.
+//! - NOT checked against a live site: everything after a press of Sign In or Create Account. No
+//!   sign-in was tried and no account was created while writing this. What the wall shows after a
+//!   press (`errorMessage`, `alertMessage`, `inputAlert`, `informationalBlurbText`, and the move
+//!   to the site's `/login` page when the email address must be verified) is read from Workday's
+//!   public page script named below. The tests run it against a reconstruction of the wall.
 //! - Checked against the two live sites found that ask for no account, on their first page only
 //!   ("My Information"), with made-up answers and without saving the page: reading the fields,
 //!   typing text, an email and a phone number, a radio group, a single check box, and reading and
@@ -33,9 +45,20 @@ use crate::answers::{Answer, Answers, Kind, Question, Role};
 use crate::apply::{
     self, Enter, Field, FillError, Form, Problem, Report, during, expect_value, plain_text, quoted, settles, text_of,
 };
+use crate::bridge::BridgeError;
+use crate::credentials::{Keychain, SignIn, SignIns};
 use crate::page::{Key, Locator, Page, PageError};
 
+/// The Keychain item that holds the user's one sign-in for every employer's Workday site.
+pub const SIGN_IN_SERVICE: &str = "dev.maverick.workday";
+
 const PAGE_WAIT: Duration = Duration::from_secs(30);
+/// How long Workday gets to answer a press of Sign In or Create Account.
+const SIGN_IN_WAIT: Duration = Duration::from_secs(30);
+/// How long the wall gets to change from one of its forms to another.
+const FORM_WAIT: Duration = Duration::from_secs(10);
+/// How many looks in a row a notice must stay before it counts as Workday's answer.
+const NOTICE_LOOKS: u32 = 10;
 const PAGE_GAP: Duration = Duration::from_millis(300);
 const STEADY_LOOKS: u32 = 5;
 const UPLOAD_WAIT: Duration = Duration::from_secs(30);
@@ -245,18 +268,22 @@ async fn address_of(page: &Page) -> Result<String, FillError> {
 /// The tab must be on a Workday posting, on the choice of how to apply, or inside the application.
 ///
 /// From a posting it opens the application and chooses "Apply Manually". When Workday then asks
-/// for an account, it stops with `FillError::SignInNeeded`: the user signs in and fills again.
+/// for an account, it signs in with the sign-in in the user's Keychain, or stops with
+/// `FillError::SignInNeeded` when there is none. See `pass_wall`.
 /// It never clicks "Save and Continue".
 pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
     let captures = crate::data_dir().map(|dir| dir.join("captures"));
-    fill_saving_captures(page, answers, captures.as_deref()).await
+    fill_with(page, answers, captures.as_deref(), &Keychain).await
 }
 
-/// `fill`, with the folder for captures chosen by the caller. With none, no capture is saved.
-pub async fn fill_saving_captures(
+/// `fill`, with the folder for captures and the source of the sign-in chosen by the caller.
+/// With no folder, no capture is saved. With `&None::<SignIn>`, the Keychain is never read and
+/// the fill stops at the sign-in wall.
+pub async fn fill_with(
     page: &Page,
     answers: &Answers,
     captures: Option<&Path>,
+    sign_ins: &impl SignIns,
 ) -> Result<Report, FillError> {
     let address = address_of(page).await?;
     let at = Address::parse(&address).ok_or_else(|| FillError::NotAPosting(address.clone()))?;
@@ -273,10 +300,45 @@ pub async fn fill_saving_captures(
             .map_err(during("choosing Apply Manually"))?;
         screen = shown(page, &[Screen::Choice]).await?;
     }
-    if screen == Screen::Wall {
-        return Err(FillError::SignInNeeded { system: "Workday" });
+    fill_from(page, answers, job, captures, sign_ins, screen).await
+}
+
+/// Fills the application in a tab that is past the choice of how to apply: it gets past the
+/// sign-in wall when the wall is up, then fills the page on screen.
+pub async fn fill_application(
+    page: &Page,
+    answers: &Answers,
+    job: Job,
+    captures: Option<&Path>,
+    sign_ins: &impl SignIns,
+) -> Result<Report, FillError> {
+    let screen = shown(page, &[Screen::Choice]).await?;
+    fill_from(page, answers, job, captures, sign_ins, screen).await
+}
+
+async fn fill_from(
+    page: &Page,
+    answers: &Answers,
+    job: Job,
+    captures: Option<&Path>,
+    sign_ins: &impl SignIns,
+    screen: Screen,
+) -> Result<Report, FillError> {
+    if screen != Screen::Wall {
+        return fill_page(page, answers, job, captures).await;
     }
-    fill_page(page, answers, job, captures).await
+    let entry = pass_wall(page, sign_ins).await?;
+    // The user must learn what was done under their name, also when the fill then fails.
+    let after_entry = |error: FillError| FillError::SignIn(format!("{} Then the fill failed: {error}", entry.note()));
+    shown(page, &[Screen::Wall, Screen::Choice])
+        .await
+        .map_err(after_entry)?;
+    let mut report = fill_page(page, answers, job, captures).await.map_err(after_entry)?;
+    report.note = Some(match report.note {
+        Some(note) => format!("{} {note}", entry.note()),
+        None => entry.note().to_owned(),
+    });
+    Ok(report)
 }
 
 /// What a tab inside Workday's apply flow shows.
@@ -306,6 +368,16 @@ const SCREEN: &str = r#"(() => {
     return { screen: loading ? "loading" : "page", fields };
 })()"#;
 
+/// Reads the screen out of what `SCREEN` returned.
+fn screen_in(seen: &Value) -> Screen {
+    match seen["screen"].as_str() {
+        Some("wall") => Screen::Wall,
+        Some("choice") => Screen::Choice,
+        Some("page") => Screen::Page,
+        _ => Screen::Loading,
+    }
+}
+
 /// Waits until the tab shows something other than a loading page and the screens in `passing`.
 /// Workday draws a page piece by piece: a live page showed one field for a moment before the
 /// rest. So the same screen must show with the same fields `STEADY_LOOKS` times in a row.
@@ -317,12 +389,7 @@ async fn shown(page: &Page, passing: &[Screen]) -> Result<Screen, FillError> {
             .evaluate(SCREEN)
             .await
             .map_err(during("waiting for the application to appear"))?;
-        let screen = match seen["screen"].as_str() {
-            Some("wall") => Screen::Wall,
-            Some("choice") => Screen::Choice,
-            Some("page") => Screen::Page,
-            _ => Screen::Loading,
-        };
+        let screen = screen_in(&seen);
         let now = Some((screen, seen["fields"].as_u64()));
         steady = if now == last { steady + 1 } else { 1 };
         last = now;
@@ -335,6 +402,462 @@ async fn shown(page: &Page, passing: &[Screen]) -> Result<Screen, FillError> {
             }));
         }
         tokio::time::sleep(PAGE_GAP).await;
+    }
+}
+
+/// How a fill got past the sign-in wall.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Entry {
+    SignedIn,
+    CreatedAccount {
+        /// The create-account form had a consent box, and it was ticked.
+        consented: bool,
+    },
+}
+
+impl Entry {
+    /// What the report tells the user was done under their name.
+    fn note(self) -> &'static str {
+        match self {
+            Self::SignedIn => "Signed in to Workday with the sign-in in your Keychain.",
+            Self::CreatedAccount { consented: false } => {
+                "Created your Workday account at this employer with the sign-in in your Keychain."
+            }
+            Self::CreatedAccount { consented: true } => {
+                "Created your Workday account at this employer with the sign-in in your Keychain, \
+                 and ticked the consent box on its form."
+            }
+        }
+    }
+}
+
+/// The form the sign-in wall shows.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum WallForm {
+    /// Buttons for Google and the like, and "Sign in with email". 4 of 19 live walls opened so.
+    Chooser,
+    SignIn,
+    /// 15 of 19 live walls opened on this form.
+    Create,
+    /// Another form, such as "Forgot Password", or no wall at all.
+    Other,
+}
+
+/// What the sign-in wall shows: its form and what it says. UNVERIFIED on a live site, except the
+/// form: no live wall was made to say anything.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct Wall {
+    form: WallForm,
+    /// The ids of the form's fields. Workday gives a field a new id each time it draws the form.
+    fields: Vec<String>,
+    /// False while the form's button is not ready for a press. See `settled_wall`.
+    ready: bool,
+    /// Workday's answer to a refused sign-in or a refused new account.
+    refusals: Vec<String>,
+    /// What the form says about single fields before it sends anything, such as a password that
+    /// breaks the employer's rules.
+    field_errors: Vec<String>,
+    /// A message that is no error, such as the request to verify the email address.
+    notices: Vec<String>,
+    /// Shown under a refused sign-in when the account exists and its email address is unverified.
+    unverified: Vec<String>,
+}
+
+impl Wall {
+    fn has_errors(&self) -> bool {
+        !(self.refusals.is_empty() && self.field_errors.is_empty() && self.unverified.is_empty())
+    }
+
+    fn says_something(&self) -> bool {
+        self.has_errors() || !self.notices.is_empty()
+    }
+
+    /// Everything the wall says, in quotes, for a message to the user. The text stays as Workday
+    /// wrote it, so that `pass_wall` can find a password in it.
+    fn said(&self) -> String {
+        let all = [&self.refusals, &self.field_errors, &self.unverified, &self.notices];
+        let said: Vec<&str> = all.into_iter().flatten().map(String::as_str).collect();
+        format!("\"{}\"", said.join(" "))
+    }
+}
+
+/// Reads the wall. The form and its fields are as 19 live walls had them. The four kinds of
+/// message are named as Workday's public page script draws them: no live wall showed one.
+const WALL: &str = r#"(() => {
+    const wall = document.querySelector('[data-automation-id="signInContent"]');
+    const has = (id) => wall?.querySelector(`[data-automation-id="${id}"]`) != null;
+    const said = (id) => [...(wall?.querySelectorAll(`[data-automation-id="${id}"]`) ?? [])]
+        .map((element) => element.textContent.replace(/\s+/g, " ").trim())
+        .filter((text) => text !== "");
+    const button = wall?.querySelector('button[type="submit"]');
+    return {
+        form: has("createAccountSubmitButton") ? "create"
+            : has("signInSubmitButton") ? "sign-in"
+            : has("SignInWithEmailButton") ? "chooser"
+            : "other",
+        fields: [...(wall?.querySelectorAll("input") ?? [])].map((input) => input.id),
+        ready: !button || button.getAttribute("aria-hidden") !== "true" || has("click_filter"),
+        refusals: said("errorMessage"),
+        fieldErrors: said("inputAlert"),
+        notices: said("alertMessage"),
+        unverified: said("informationalBlurbText"),
+    };
+})()"#;
+
+/// Looks at the tab once: which screen it shows, and what the wall says.
+async fn look(page: &Page) -> Result<(Screen, Wall), PageError> {
+    let seen = page.evaluate(&format!("({{ at: {SCREEN}, wall: {WALL} }})")).await?;
+    let wall = Wall::deserialize(&seen["wall"]).map_err(|error| PageError::Script(error.to_string()))?;
+    Ok((screen_in(&seen["at"]), wall))
+}
+
+/// Gets past the sign-in wall with the user's stored Workday sign-in.
+///
+/// The user keeps ONE email and password for every employer's Workday site, in the Keychain item
+/// `SIGN_IN_SERVICE`. With no such item this stops with `FillError::SignInNeeded` and types nothing.
+///
+/// With one, it signs in. Workday gives the same answer for a wrong password and for an email
+/// address it does not know, so a refused sign-in is followed by ONE try to create the account
+/// with the same email and password. It never tries either a second time in one fill. When
+/// Workday wants the email address verified, it stops and says so: it never reads email.
+///
+/// Typing into the wall is verified on live sites. Everything after a press is NOT: see the top
+/// of this module.
+async fn pass_wall(page: &Page, sign_ins: &impl SignIns) -> Result<Entry, FillError> {
+    let sign_in = sign_ins
+        .sign_in(SIGN_IN_SERVICE)
+        .await
+        .map_err(|problem| {
+            FillError::SignIn(format!(
+                "Maverick could not read your Workday sign-in from the Keychain: {problem}. \
+                 Sign in to Workday in that tab yourself, then click Fill form again."
+            ))
+        })?
+        .ok_or(FillError::SignInNeeded {
+            system: "Workday",
+            service: SIGN_IN_SERVICE,
+        })?;
+    let password = sign_in.password.reveal();
+    // No step below puts the password in an error. Should Workday or Chrome ever repeat it in
+    // their own text, that text is dropped here.
+    enter_account(page, &sign_in).await.map_err(|error| {
+        if !password.is_empty() && error.to_string().contains(password) {
+            FillError::SignIn(
+                "Maverick stopped at Workday's sign-in. What Workday showed held the password, \
+                 so it is left out here. Look at the tab."
+                    .into(),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+async fn enter_account(page: &Page, sign_in: &SignIn) -> Result<Entry, FillError> {
+    let (email, password) = (sign_in.account.as_str(), sign_in.password.reveal());
+    let yourself = "Sign in to Workday in that tab yourself, then click Fill form again.";
+
+    let typed = sign_in_form(page, email, password).await?;
+    let refused = match press(page, "signInSubmitButton", &typed, "signing in to Workday").await? {
+        Pressed::Application => return Ok(Entry::SignedIn),
+        Pressed::Nothing => return Err(no_answer("Sign In")),
+        Pressed::Said(wall) if !wall.unverified.is_empty() => {
+            return Err(FillError::SignIn(format!(
+                "Workday did not sign you in and says the account may need its email address verified: {}. \
+                 Open the email from Workday and verify, then click Fill form again. \
+                 Maverick tried the sign-in once and created no account.",
+                wall.said()
+            )));
+        }
+        // Only a refusal from Workday itself can mean that there is no account yet.
+        Pressed::Said(wall) if wall.refusals.is_empty() => {
+            return Err(FillError::SignIn(format!(
+                "Workday did not sign you in and shows: {}. Maverick tried once and created no account. {yourself}",
+                wall.said()
+            )));
+        }
+        Pressed::Said(wall) => wall.said(),
+    };
+
+    let (typed, consented) = create_form(page, email, password).await?;
+    match press(
+        page,
+        "createAccountSubmitButton",
+        &typed,
+        "creating your Workday account",
+    )
+    .await?
+    {
+        Pressed::Application => Ok(Entry::CreatedAccount { consented }),
+        Pressed::Nothing => Err(no_answer("Create Account")),
+        Pressed::Said(wall) if !wall.has_errors() => Err(FillError::SignIn(format!(
+            "Workday refused the sign-in, so Maverick asked it to create your account at this employer. \
+             Workday now shows: {}. If it asks you to verify your email address, open the email from Workday \
+             and verify. Then click Fill form again.",
+            wall.said()
+        ))),
+        Pressed::Said(wall) => Err(FillError::SignIn(format!(
+            "Workday refused the sign-in with {refused}, and then refused to create an account with {}. \
+             Maverick tried each once and stopped. Check the email and the password in the Keychain item \
+             {SIGN_IN_SERVICE}, or sign in to Workday in that tab yourself. Then click Fill form again.",
+            wall.said()
+        ))),
+    }
+}
+
+fn no_answer(button: &str) -> FillError {
+    FillError::SignIn(format!(
+        "Maverick pressed {button} on Workday once, and Workday showed neither the application nor a message \
+         in {} seconds. Look at the tab before you click Fill form again.",
+        SIGN_IN_WAIT.as_secs()
+    ))
+}
+
+/// An element of the sign-in wall.
+fn in_wall(id: &str) -> Locator {
+    Locator::css(&format!(
+        "[data-automation-id=\"signInContent\"] [data-automation-id=\"{id}\"]"
+    ))
+}
+
+/// Waits until the wall has finished drawing a form, and returns what it shows.
+///
+/// A live wall draws a form twice after a switch. About a tenth of a second after the first
+/// drawing it puts new fields in place of the first ones, and only then lays the click filter
+/// over the button. Text typed into the first drawing is lost, and a click there lands on the
+/// bare button. So the same fields must show `STEADY_LOOKS` times in a row, with the button ready.
+async fn settled_wall(page: &Page, doing: &'static str) -> Result<Wall, FillError> {
+    let deadline = Instant::now() + FORM_WAIT;
+    let (mut last, mut steady) = (None, 0);
+    loop {
+        let (_, wall) = look(page).await.map_err(during(doing))?;
+        steady = if last.as_ref() == Some(&wall) { steady + 1 } else { 1 };
+        let settled = steady >= STEADY_LOOKS && wall.ready && wall.form != WallForm::Other;
+        if settled || Instant::now() >= deadline {
+            return Ok(wall);
+        }
+        last = Some(wall);
+        tokio::time::sleep(PAGE_GAP).await;
+    }
+}
+
+/// Brings up the sign-in form or the create-account form. The wall opens on either one or on the
+/// chooser, and has a link from each to the next. Verified on live walls.
+async fn bring_up(page: &Page, wanted: WallForm) -> Result<(), FillError> {
+    let doing = "looking for Workday's sign-in form";
+    // The chooser leads to the sign-in form and that leads to the create-account form.
+    for _ in 0..3 {
+        let wall = settled_wall(page, doing).await?;
+        let link = match wall.form {
+            form if form == wanted && wall.ready => return Ok(()),
+            form if form == wanted => break,
+            WallForm::Chooser => "SignInWithEmailButton",
+            WallForm::Create => "signInLink",
+            WallForm::SignIn => "createAccountLink",
+            WallForm::Other => break,
+        };
+        page.click(&in_wall(link)).await.map_err(during(doing))?;
+        let deadline = Instant::now() + FORM_WAIT;
+        while look(page).await.map_err(during(doing))?.1.form == wall.form && Instant::now() < deadline {
+            tokio::time::sleep(PAGE_GAP).await;
+        }
+    }
+    Err(FillError::SignIn(
+        "Workday shows a sign-in page that Maverick does not know, so it pressed nothing. \
+         Sign in to Workday in that tab yourself, then click Fill form again."
+            .into(),
+    ))
+}
+
+/// The fields of a form and the text typed into each, for a last check before a press.
+type Typed<'a> = Vec<(&'static str, &'a str)>;
+
+/// Brings up the sign-in form and types the sign-in into it. Verified on live walls.
+async fn sign_in_form<'a>(page: &Page, email: &'a str, password: &'a str) -> Result<Typed<'a>, FillError> {
+    bring_up(page, WallForm::SignIn).await?;
+    type_in(page, "email", "the email address", email).await?;
+    type_in(page, "password", "the password", password).await?;
+    Ok(vec![("email", email), ("password", password)])
+}
+
+/// Brings up the create-account form, types the sign-in into it and ticks its consent box.
+/// Returns whether there was a box. Verified on live walls.
+async fn create_form<'a>(page: &Page, email: &'a str, password: &'a str) -> Result<(Typed<'a>, bool), FillError> {
+    bring_up(page, WallForm::Create).await?;
+    type_in(page, "email", "the email address", email).await?;
+    type_in(page, "password", "the password", password).await?;
+    type_in(page, "verifyPassword", "the password a second time", password).await?;
+    let typed = vec![("email", email), ("password", password), ("verifyPassword", password)];
+    Ok((typed, consent(page).await?))
+}
+
+/// Types into a field of the wall and checks that the field took the text. The check happens in
+/// the page and brings back yes or no, so the text never reaches an error. Verified on live walls.
+///
+/// Fields are found by their own names. The wall also holds a field named `website` that a person
+/// cannot see ("beecatcher"): Workday refuses a press when it holds text, and nothing here types
+/// into it.
+async fn type_in(page: &Page, id: &str, what: &str, text: &str) -> Result<(), FillError> {
+    let field = in_wall(id);
+    page.fill(&field, text)
+        .await
+        .map_err(during(format!("typing {what} into Workday's sign-in form")))?;
+    if settles(page, &holds(&field, text))
+        .await
+        .map_err(during(format!("checking {what} in Workday's sign-in form")))?
+    {
+        return Ok(());
+    }
+    Err(FillError::SignIn(format!(
+        "Workday's sign-in form did not take {what} as typed, so Maverick pressed nothing. \
+         Sign in to Workday in that tab yourself, then click Fill form again."
+    )))
+}
+
+/// A JavaScript condition: the field holds exactly `text`.
+fn holds(field: &Locator, text: &str) -> String {
+    format!("({})?.value === {}", field.as_script(), quoted(text))
+}
+
+/// Ticks the consent box of the create-account form, when the employer put one there, and says
+/// whether it did. 10 of 19 live forms had one, and Workday's script creates no account without
+/// it. Verified on live walls.
+async fn consent(page: &Page) -> Result<bool, FillError> {
+    let doing = "ticking the consent box of Workday's create-account form";
+    let consent_box = in_wall("createAccountCheckbox");
+    let present = format!("!!({})", consent_box.as_script());
+    if page.evaluate(&present).await.map_err(during(doing))? != true {
+        return Ok(false);
+    }
+    match tick(page, &consent_box, true).await {
+        Ok(()) => Ok(true),
+        Err(Problem::Page(error)) => Err(during(doing)(error)),
+        Err(problem) => Err(FillError::SignIn(format!(
+            "Maverick could not tick the consent box of Workday's create-account form: {problem}. \
+             It created no account. Sign in to Workday in that tab yourself, then click Fill form again."
+        ))),
+    }
+}
+
+/// What a rehearsal of the wall found.
+#[derive(Debug, PartialEq)]
+pub struct Rehearsal {
+    /// The create-account form had a consent box, and it was ticked.
+    pub consented: bool,
+    /// The `data-automation-id` of the element a press of Create Account would land on.
+    pub create_press: String,
+    /// The same for Sign In.
+    pub sign_in_press: String,
+}
+
+/// Does on the wall everything `pass_wall` does before a press, and presses NEITHER Sign In nor
+/// Create Account: it brings up each form, types `sign_in` into it, ticks the consent box and
+/// finds the element a press would land on. A live test runs this with a made-up sign-in, which
+/// is how the steps before a press are verified without an account.
+pub async fn rehearse_wall(page: &Page, sign_in: &SignIn) -> Result<Rehearsal, FillError> {
+    let (email, password) = (sign_in.account.as_str(), sign_in.password.reveal());
+    let (typed, consented) = create_form(page, email, password).await?;
+    let create_press = press_lands_on(page, "createAccountSubmitButton", &typed).await?;
+    let typed = sign_in_form(page, email, password).await?;
+    Ok(Rehearsal {
+        consented,
+        create_press,
+        sign_in_press: press_lands_on(page, "signInSubmitButton", &typed).await?,
+    })
+}
+
+/// The `data-automation-id` of the element a press of `button` would land on.
+async fn press_lands_on(page: &Page, button: &str, typed: &Typed<'_>) -> Result<String, FillError> {
+    let doing = "rehearsing the press";
+    ready_for_press(page, typed, doing).await?;
+    let target = format!(
+        "({})?.getAttribute('data-automation-id') ?? ''",
+        press_target(button).as_script()
+    );
+    let id = page.evaluate(&target).await.map_err(during(doing))?;
+    Ok(id.as_str().unwrap_or_default().to_owned())
+}
+
+/// What Workday did with a press of Sign In or Create Account.
+enum Pressed {
+    /// A page of the application is on screen.
+    Application,
+    /// The wall stayed and says something.
+    Said(Wall),
+    /// Neither happened in `SIGN_IN_WAIT`.
+    Nothing,
+}
+
+/// The element a mouse click on a submit button of the wall lands on.
+///
+/// On all 19 live walls the real button (`signInSubmitButton` or `createAccountSubmitButton`) is
+/// hidden from input, with `aria-hidden` and a `tabindex` of -2, and a `click_filter` element with
+/// the role of a button lies over it. A person's click lands on the filter, and Workday's script
+/// then clicks the real button itself. `Page::click` refuses the covered button, rightly, so the
+/// click goes to the filter. A wall without a filter gets the click on its button.
+fn press_target(button: &str) -> Locator {
+    Locator::script(
+        format!("Workday's {button}"),
+        format!(
+            "((button) => button?.closest('[data-automation-id=\"noCaptchaWrapper\"]')\
+             ?.querySelector('[data-automation-id=\"click_filter\"]') ?? button)({})",
+            in_wall(button).as_script()
+        ),
+    )
+}
+
+/// Looks at the wall right before a press and returns what it shows. Should Workday have drawn
+/// the form anew since the typing, the fields are empty or the button is bare, and nothing is
+/// pressed.
+async fn ready_for_press(page: &Page, typed: &Typed<'_>, doing: &'static str) -> Result<Wall, FillError> {
+    let (_, wall) = look(page).await.map_err(during(doing))?;
+    let mut held = wall.ready;
+    for (id, text) in typed {
+        held = held && page.evaluate(&holds(&in_wall(id), text)).await.map_err(during(doing))? == true;
+    }
+    if held {
+        return Ok(wall);
+    }
+    Err(FillError::SignIn(
+        "Workday drew its sign-in form anew while Maverick typed into it, so Maverick pressed nothing. \
+         Click Fill form again."
+            .into(),
+    ))
+}
+
+/// Presses a submit button of the wall ONCE and waits for Workday's answer.
+///
+/// UNVERIFIED on a live site: no button was pressed there. Per Workday's script, a good sign-in
+/// takes the wall away, a refusal draws a message on the wall, and a new account that must verify
+/// its email address loads the site's `/login` page with a notice.
+async fn press(page: &Page, button: &str, typed: &Typed<'_>, doing: &'static str) -> Result<Pressed, FillError> {
+    let before = ready_for_press(page, typed, doing).await?;
+    page.click(&press_target(button)).await.map_err(during(doing))?;
+    let deadline = Instant::now() + SIGN_IN_WAIT;
+    let (mut last, mut noticed) = (before.clone(), 0);
+    loop {
+        tokio::time::sleep(PAGE_GAP).await;
+        match look(page).await {
+            Ok((Screen::Page, _)) => return Ok(Pressed::Application),
+            Ok((_, wall)) => {
+                // A notice can show for a moment before the application does, so it must stay.
+                let news = wall != before && wall.says_something();
+                noticed = if news && wall == last { noticed + 1 } else { 0 };
+                if news && (wall.has_errors() || noticed >= NOTICE_LOOKS) {
+                    return Ok(Pressed::Said(wall));
+                }
+                last = wall;
+            }
+            // Workday can load another page after a press, and a look between two pages fails.
+            Err(PageError::Script(_) | PageError::Bridge(BridgeError::Browser(_))) => {}
+            Err(error) => return Err(during(doing)(error)),
+        }
+        if Instant::now() >= deadline {
+            let news = last != before && last.says_something();
+            return Ok(if news { Pressed::Said(last) } else { Pressed::Nothing });
+        }
     }
 }
 

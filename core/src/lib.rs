@@ -4,6 +4,7 @@ pub mod answers;
 pub mod apply;
 pub mod ashby;
 pub mod bridge;
+pub mod credentials;
 pub mod extension;
 pub mod greenhouse;
 pub mod jobs;

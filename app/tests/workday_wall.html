@@ -1,0 +1,208 @@
+<!doctype html>
+<!--
+  A RECONSTRUCTION of the sign-in wall of a Workday application, not a copy of one.
+
+  The three forms follow the markup of 19 live walls, which were read without pressing Sign In
+  or Create Account. Nobody signed in to Workday or created an account to make this page, so
+  everything that happens after a press here was never seen live. It follows Workday's public
+  page script (candidate-experience-apply-flow.min.js, read in November 2026): the click filter
+  over the real button, the hidden "website" field, the names of the four kinds of message, and
+  the move to the site's /login page when a new account must verify its email address.
+  Every name, value and message text here is made up, except the text under "unverified".
+
+  The address chooses what the page does:
+    start=create|chooser|other              the form the wall opens on. Most live walls open on create.
+    consent=1                               the create form has a consent box
+    signin=ok|wrong|unverified|invalid|echo what a press of Sign In does
+    create=ok|greets|verify|exists|weak     what a press of Create Account does
+-->
+<title>Reconstructed Workday sign-in wall</title>
+<style>
+  .press { position: relative; display: inline-block; }
+  [data-automation-id="click_filter"] { position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 3; cursor: pointer; }
+  .box { position: relative; display: inline-block; width: 24px; height: 24px; border: 1px solid; }
+  .box input { position: absolute; inset: 0; margin: 0; width: 24px; height: 24px; opacity: 0; }
+  [data-automation-id="beecatcher"] { border: 0; transform: scaleY(0.01); margin-top: -22px; display: block; position: relative; z-index: -1; }
+</style>
+<div id="root"></div>
+<!-- The space keeps this field from lying over the wall's last button, which it does not do on a live wall. -->
+<div style="position: relative; padding-top: 40px">
+  <label for="bee" style="position: absolute; left: -9999px">Enter website. This input is for robots only, do not enter if you're human.</label>
+  <input data-automation-id="beecatcher" id="bee" name="website" type="text">
+</div>
+<script>
+  const options = new URLSearchParams(location.search);
+  const option = (name, fallback) => options.get(name) ?? fallback;
+  const root = document.getElementById("root");
+  // A visit that is not Workday's own move to /login starts with nothing remembered.
+  if (location.pathname !== "/login") sessionStorage.clear();
+
+  // Every press of a submit button, in order. `sent` is false when the form stopped it before
+  // asking the server. The test reads this to count the tries.
+  const presses = () => JSON.parse(sessionStorage.presses ?? "[]");
+  const record = (press) => (sessionStorage.presses = JSON.stringify([...presses(), press]));
+
+  let inputs = 3;
+  const field = (id, label, type, complete) => {
+    const input = `input-${++inputs}`;
+    return `<div data-automation-id="formField-${id}">
+      <label for="${input}"><span>${label}<abbr aria-hidden="true">*</abbr></span></label>
+      <div><div><input type="${type}" data-automation-id="${id}" id="${input}" aria-required="true" autocomplete="${complete}" value=""></div><div data-errors="${id}"></div></div>
+    </div>`;
+  };
+  // As on the live walls: the real button takes no input, and a filter with the role of a button lies over it.
+  const submit = (id, label) => `<div><div><div data-automation-id="noCaptchaWrapper" style="position: relative"><div><div class="press">
+      <div aria-label="${label}" role="button" tabindex="0" data-automation-id="click_filter"></div>
+      <button type="submit" data-automation-id="${id}" tabindex="-2" aria-hidden="true">${label}</button>
+    </div></div></div></div></div>`;
+  const consentBox = () => {
+    const input = `input-${++inputs}`;
+    return `<div><div data-automation-id="formField-"><div><div><div>
+      <div class="box"><input id="${input}" type="checkbox" aria-checked="false" data-automation-id="createAccountCheckbox"><span></span></div>
+      <label cursor="pointer" for="${input}">Yes, I have read and consent to the terms and conditions</label>
+    </div></div><div data-errors="createAccountCheckbox"></div></div></div></div>`;
+  };
+  const forgot = `<div><button type="button" data-automation-id="forgotPasswordLink">Forgot your password?</button></div>`;
+
+  const views = {
+    chooser: () => `<div><h2 id="authViewTitle">Sign In</h2>
+      <button type="button" aria-label="Sign in with Google" data-automation-id="GoogleSignInButton">Sign in with Google</button>
+      <div><span>OR</span></div>
+      <button type="button" data-automation-id="SignInWithEmailButton">Sign in with email</button></div>`,
+    signIn: () => `<h3 id="authViewTitle" tabindex="-1">Sign In</h3>
+      <div data-message></div>
+      <form data-automation-id="signInFormo" data-form="sign-in">
+        ${field("email", "Email Address", "text", "email")}
+        ${field("password", "Password", "password", "current-password")}
+        ${submit("signInSubmitButton", "Sign In")}
+      </form>
+      <div>Don't have an account yet?<button type="button" data-automation-id="createAccountLink">Create Account</button></div>
+      ${forgot}`,
+    create: () => `<h3 id="authViewTitle" tabindex="-1">Create Account</h3>
+      <div data-message></div>
+      <div data-automation-id="passwordRulesList"><div data-automation-id="richText"><p>Password Requirements:</p><ul><li>A minimum of 8 characters</li></ul></div></div>
+      <form data-automation-id="signInFormo" data-form="create">
+        ${field("email", "Email Address", "text", "email")}
+        ${field("password", "Password", "password", "new-password")}
+        ${field("verifyPassword", "Verify New Password", "password", "new-password")}
+        ${option("consent") ? consentBox() : ""}
+        ${submit("createAccountSubmitButton", "Create Account")}
+      </form>
+      <div>Already have an account?<button type="button" data-automation-id="signInLink">Sign In</button></div>
+      ${forgot}`,
+    other: () => `<h3 id="authViewTitle" tabindex="-1">Forgot Password</h3>
+      <form data-form="forgot">${field("email", "Email Address", "text", "email")}<button type="submit" data-automation-id="resetPasswordSubmitButton">Reset Password</button></form>`,
+  };
+  // As on the live walls, a form is drawn twice: first with a bare button, and a moment later
+  // anew, with new input ids, empty fields and the filter over the button.
+  const show = (view) => {
+    const draw = () => (root.innerHTML = `<div data-automation-id="signInContent"><div dir="ltr"><div>${views[view]()}</div></div></div>`);
+    draw();
+    root.querySelector('[data-automation-id="click_filter"]')?.remove();
+    setTimeout(draw, 100);
+  };
+
+  const error = (text) => `<div data-automation-id="errorMessage" role="alert"><span role="img" aria-label="Error"></span><div>${text}</div></div>`;
+  const notice = (text) => `<div data-automation-id="alertMessage" role="alert">${text}</div>`;
+  const say = (html) => (root.querySelector("[data-message]").innerHTML = html);
+  const fieldError = (id, text) => {
+    root.querySelector(`[data-errors="${id}"]`).innerHTML = `<div data-automation-id="inputAlert">Error: ${text}</div>`;
+  };
+
+  const application = `<div data-automation-id="applyFlowPage">
+    <div data-automation-id="applyFlowMyInfoPage">
+      <div data-automation-id="formField-firstName" data-fkit-id="name--legalName--firstName">
+        <label for="name--legalName--firstName"><span>First Name<abbr aria-hidden="true">*</abbr></span></label>
+        <div><input type="text" id="name--legalName--firstName" aria-required="true" value=""></div>
+      </div>
+    </div>
+    <button type="button" data-automation-id="pageFooterNextButton" onclick="window.advanced = true">Save and Continue</button>
+  </div>`;
+  // The wall goes, a loading page shows, then the first page of the application.
+  const enter = () => {
+    root.innerHTML = `<div data-automation-id="applyFlowPage"><div data-automation-id="applyFlowLoadingPage"></div></div>`;
+    setTimeout(() => (root.innerHTML = application), 500);
+  };
+
+  const value = (id) => root.querySelector(`[data-automation-id="${id}"]`)?.value ?? null;
+
+  const signIn = () => {
+    const [email, password] = [value("email"), value("password")];
+    const outcome = option("signin", "wrong");
+    if (outcome === "invalid") {
+      record({ form: "sign-in", email, password, sent: false });
+      return fieldError("email", "Enter a valid email address.");
+    }
+    record({ form: "sign-in", email, password, sent: true });
+    if (outcome === "ok") return enter();
+    // Not from Workday: a message that repeats the password, to try that Maverick drops it.
+    if (outcome === "echo") return say(error(`No account for ${email} with ${password}.`));
+    say(error("Wrong email address or password. Made-up text."));
+    if (outcome === "unverified") {
+      // The text and both names are in Workday's script. A press of this button is never wanted.
+      root.querySelector("[data-message]").insertAdjacentHTML(
+        "beforeend",
+        `<div><div data-automation-id="informationalBlurbText">Still can't sign in? Be sure to check your spam folder, your account may need verification</div>
+         <button type="button" data-automation-id="informationalBlurbButton">Resend Account Verification</button></div>`,
+      );
+    }
+  };
+
+  const create = () => {
+    const [email, password, verify] = [value("email"), value("password"), value("verifyPassword")];
+    const consent = root.querySelector('[data-automation-id="createAccountCheckbox"]')?.checked ?? null;
+    const outcome = option("create", "ok");
+    const stopped = (id, text) => {
+      record({ form: "create", email, password, verify, consent, sent: false });
+      fieldError(id, text);
+    };
+    if (outcome === "weak") return stopped("password", "The password must hold a made-up thing.");
+    if (verify !== password) return stopped("verifyPassword", "The passwords do not match.");
+    if (consent === false) return stopped("createAccountCheckbox", "Tick the box to go on.");
+    record({ form: "create", email, password, verify, consent, sent: true });
+    if (outcome === "exists") return say(error("An account with this email address exists already. Made-up text."));
+    if (outcome === "verify") {
+      // As Workday's script does when the site wants the email address verified.
+      sessionStorage.signInResponseMessage = "We sent an email to verify your account. Made-up text.";
+      sessionStorage.signInResponseType = "ALERT";
+      return location.assign(`/login${location.search}&redirect=%2Fapply%2FapplyManually`);
+    }
+    // Not from Workday: a notice that shows for a moment before the application does, to try
+    // that Maverick does not take it for a stop.
+    if (outcome === "greets") {
+      say(notice("Your account is ready. Made-up text."));
+      return setTimeout(enter, 900);
+    }
+    enter();
+  };
+
+  // Workday's filter: a click on it counts as a person's, and it then clicks the real button.
+  let passing = false;
+  root.addEventListener("click", (event) => {
+    const id = event.target.closest("[data-automation-id]")?.getAttribute("data-automation-id");
+    if (id === "click_filter") {
+      passing = true;
+      event.target.parentElement.querySelector("button").dispatchEvent(new MouseEvent("click", { view: window, bubbles: true, cancelable: true }));
+    } else if (id === "SignInWithEmailButton" || id === "signInLink") show("signIn");
+    else if (id === "createAccountLink") show("create");
+    else if (["GoogleSignInButton", "forgotPasswordLink", "informationalBlurbButton", "resetPasswordSubmitButton"].includes(id)) record({ form: id, sent: true });
+  });
+  root.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.target.getAttribute("data-form");
+    // A press that did not come through the filter, or came with text in the hidden field, is a robot's.
+    if (!passing || document.getElementById("bee").value !== "") return record({ form, blocked: true, sent: false });
+    if (form === "sign-in") signIn();
+    else if (form === "create") create();
+  });
+
+  if (sessionStorage.signInResponseMessage) {
+    const message = sessionStorage.signInResponseMessage;
+    show("signIn");
+    setTimeout(() => say(notice(message)), 150);
+    delete sessionStorage.signInResponseMessage;
+    delete sessionStorage.signInResponseType;
+  } else {
+    show(option("start", "create"));
+  }
+</script>
