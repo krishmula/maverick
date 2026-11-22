@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/sunset.png" width="128" alt="Maverick icon"></p>
+
 # Maverick
 
 Maverick is a personal desktop app for macOS, written in Rust with [GPUI](https://www.gpui.rs). It works with the Chrome you already use, through a small extension.
@@ -10,7 +12,17 @@ Today it lists every open Chrome tab, updates the list as tabs change, and switc
 - Rust 1.89 or later. The code is tested on Rust 1.100.
 - Google Chrome 116 or later.
 
-## Run the app
+## Install
+
+1. Download the `.dmg` for the latest version from [Releases](https://github.com/krishmula/maverick/releases). Builds are for Apple silicon.
+2. Open it and drag **Maverick** into **Applications**. Start it from there, not from the disk image: Chrome stores the app's path when it first runs.
+3. The app is not notarized by Apple, so macOS blocks the first launch. Open **System Settings > Privacy & Security** and click **Open Anyway**, or run:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Maverick.app
+   ```
+
+## Run from source
 
 ```sh
 cargo run --release -p maverick
@@ -29,6 +41,10 @@ On each start, the app writes the extension to `~/Library/Application Support/de
 The app shows your tabs when Chrome connects. If the app starts after Chrome, Chrome reconnects within 30 seconds.
 
 After an app update, Maverick asks the extension to reload itself. Extension 0.2.0 and older cannot do that: open `chrome://extensions` and click the reload arrow on **Maverick Bridge** once.
+
+## Change the app icon
+
+Click the icon at the left of the header and pick Stealth, Sunset, Arctic, Neon or Crimson. Maverick shows the new icon in the Dock right away and remembers it. Finder and Launchpad keep showing Sunset, the icon inside the app bundle.
 
 ## Use the tab list
 
@@ -124,6 +140,19 @@ MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
 	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
 	cargo test -p maverick --test chrome a_live -- --ignored --nocapture
 ```
+
+## Make a release
+
+1. Raise `version` in `app/Cargo.toml` and merge it into `main`.
+2. Tag that commit and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The `Release` workflow builds `Maverick.app` and attaches a `.dmg` and a `.zip` to a new GitHub release. The tag must match the version. To build the same files locally, run `scripts/bundle.sh`; they land in `target/dist`.
+
+Each icon is an SVG in `assets/icon`. After editing one, run `assets/icon/build.sh` (needs `brew install librsvg`) and commit the PNGs and `Maverick.icns` it writes. Sunset is the bundle icon.
 
 ## Layout
 

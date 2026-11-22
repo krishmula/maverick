@@ -2,15 +2,19 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::list::{List, ListEvent, ListState};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img,
 };
 use maverick_core::ashby::{FieldResult, Outcome, Source};
+use std::path::PathBuf;
+
 use maverick_core::bridge::BrowserState;
 
 use crate::browser::{Browser, Fill, Latency};
+use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList};
 use crate::tabs::TabList;
 
@@ -24,13 +28,21 @@ enum Showing {
 pub struct MainView {
     browser: Entity<Browser>,
     showing: Showing,
+    icon: AppIcon,
+    icon_file: Option<PathBuf>,
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl MainView {
-    pub fn new(browser: Entity<Browser>, jobs: Vec<Job>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        browser: Entity<Browser>,
+        jobs: Vec<Job>,
+        icon_file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let jobs = cx.new(|cx| ListState::new(JobList::new(jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let _subscriptions = vec![
@@ -78,9 +90,13 @@ impl MainView {
                 Theme::sync_system_appearance(Some(window), cx);
             }),
         ];
+        let icon = AppIcon::saved(icon_file.as_deref());
+        icon.show_in_dock();
         let mut view = Self {
             browser,
             showing: Showing::Tabs,
+            icon,
+            icon_file,
             jobs,
             tabs,
             _subscriptions,
@@ -160,6 +176,50 @@ impl MainView {
             .gap_1()
             .child(button("show-tabs", "Tabs".to_owned(), Showing::Tabs, cx))
             .child(button("show-jobs", format!("Jobs · {jobs}"), Showing::Jobs, cx))
+            .into_any_element()
+    }
+
+    fn set_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
+        self.icon = icon;
+        icon.show_in_dock();
+        if let Some(file) = &self.icon_file
+            && let Err(error) = icon.save(file)
+        {
+            eprintln!("maverick: could not save the icon choice: {error}");
+        }
+        cx.notify();
+    }
+
+    /// The current app icon. Clicking it shows every icon to choose from.
+    fn icon_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity().downgrade();
+        let current = self.icon;
+        Popover::new("icon-picker")
+            .trigger(
+                Button::new("pick-icon")
+                    .ghost()
+                    .compact()
+                    .tooltip("Change the app icon")
+                    .child(img(current.image()).size_5()),
+            )
+            .content(move |_, _, cx| {
+                h_flex().gap_1().children(AppIcon::ALL.into_iter().map(|icon| {
+                    let view = view.clone();
+                    let button = Button::new(icon.name()).compact().child(
+                        v_flex()
+                            .items_center()
+                            .gap_1()
+                            .p_1()
+                            .child(img(icon.image()).size_16())
+                            .child(div().text_xs().child(icon.name())),
+                    );
+                    let button = if icon == current { button } else { button.ghost() };
+                    button.on_click(cx.listener(move |popover, _, window, cx| {
+                        view.update(cx, |this, cx| this.set_icon(icon, cx)).ok();
+                        popover.dismiss(window, cx);
+                    }))
+                }))
+            })
             .into_any_element()
     }
 
@@ -343,7 +403,8 @@ impl Render for MainView {
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
-                            .gap_3()
+                            .gap_2()
+                            .child(self.icon_picker(cx))
                             .child(div().font_weight(FontWeight::SEMIBOLD).child("Maverick"))
                             .child(self.switcher(cx)),
                     )
@@ -407,6 +468,7 @@ mod tests {
 
     use super::MainView;
     use crate::browser::{Browser, Fill};
+    use crate::icon::AppIcon;
     use crate::jobs::{Job, job_row_id};
     use crate::tabs::{fill_button_id, row_id};
 
@@ -459,11 +521,31 @@ mod tests {
         open_window_with_answers(bridge, runtime, None, Vec::new(), cx).0
     }
 
+    fn open_window_with_icon_file(icon_file: PathBuf, cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        open_window(&Bridge::new(), &runtime, None, Vec::new(), Some(icon_file), cx).0
+    }
+
     fn open_window_with_answers(
         bridge: &Arc<Bridge>,
         runtime: &tokio::runtime::Runtime,
         answers_file: Option<PathBuf>,
         jobs: Vec<Job>,
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
+        open_window(bridge, runtime, answers_file, jobs, None, cx)
+    }
+
+    fn open_window(
+        bridge: &Arc<Bridge>,
+        runtime: &tokio::runtime::Runtime,
+        answers_file: Option<PathBuf>,
+        jobs: Vec<Job>,
+        icon_file: Option<PathBuf>,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
         cx.update(gpui_kit::init);
@@ -482,7 +564,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, icon_file, window, cx))
             })
             .expect("the test window opens")
         });
@@ -602,6 +684,28 @@ mod tests {
             assert!(window.try_find("measure-latency").is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_picked_icon_is_saved_for_the_next_start(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let icon_file = dir.path().join("icon");
+        let window = open_window_with_icon_file(icon_file.clone(), cx);
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("Neon").is_none());
+            window.click("pick-icon", cx);
+            window.render_frame(cx);
+            for name in ["Stealth", "Sunset", "Arctic", "Neon", "Crimson"] {
+                assert!(window.try_find(name).is_some(), "the picker offers {name}");
+            }
+            window.click("Neon", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("Neon").is_none(), "choosing an icon closes the picker");
+        })
+        .unwrap();
+        assert_eq!(AppIcon::saved(Some(&icon_file)), AppIcon::Neon);
     }
 
     #[gpui_kit::test]
