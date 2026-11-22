@@ -108,6 +108,12 @@ impl JobList {
         self.opened.push(address.to_owned());
     }
 
+    /// Shows `jobs` in place of the current list, keeping the search.
+    pub fn replace(&mut self, jobs: Vec<Job>) {
+        self.jobs = jobs;
+        self.matches = matching(&self.jobs, &self.query);
+    }
+
     /// Takes a job off the list once its application went through.
     pub fn remove(&mut self, address: &str) {
         self.jobs.retain(|job| job.address != address);

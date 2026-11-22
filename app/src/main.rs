@@ -5,6 +5,7 @@ mod icon;
 mod jobs;
 mod main_view;
 mod report;
+mod schedule;
 mod tabs;
 mod ui;
 
@@ -46,6 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             return cli::import_tracker(Path::new(&file));
         }
         Some("check-rules") => return cli::check_rules(),
+        Some("run") => return cli::run(),
         Some("score") => {
             let mut limit = maverick_core::score::RUN_CAP;
             let mut dry_run = false;
@@ -114,8 +116,25 @@ fn run() -> Result<(), Box<dyn Error>> {
 
             let answers_file = maverick_core::answers_path();
             let database = maverick_core::database_path();
-            let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, database, cx));
-            let (jobs, cells) = stored_jobs();
+            let browser = cx.new(|cx| {
+                Browser::new(
+                    bridge,
+                    background.clone(),
+                    extension_dir,
+                    answers_file.clone(),
+                    database.clone(),
+                    cx,
+                )
+            });
+            let (jobs, cells) = schedule::stored_jobs(database.as_deref());
+            let funnel = database
+                .clone()
+                .zip(answers_file.clone())
+                .map(|(database, answers)| schedule::Funnel {
+                    database,
+                    answers,
+                    background: background.clone(),
+                });
             let icon_file = maverick_core::data_dir().map(|dir| dir.join("icon"));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1080.), px(720.)), cx)),
@@ -129,26 +148,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, cells, icon_file, window, cx))
+                cx.new(|cx| {
+                    let mut view = MainView::new(browser, jobs, cells, icon_file, window, cx);
+                    if let Some(funnel) = funnel {
+                        view.run_funnel(funnel, window, cx);
+                    }
+                    view
+                })
             })
             .expect("the main window opens");
             cx.activate(true);
         });
     drop(runtime);
     Ok(())
-}
-
-/// The open postings from the local database, and one band cell for every posting in it.
-/// A missing or unreadable database gives none of either.
-fn stored_jobs() -> (Vec<jobs::Job>, Vec<band::Cell>) {
-    let store = maverick_core::database_path()
-        .filter(|path| path.is_file())
-        .and_then(|path| maverick_core::store::Store::open(&path).ok());
-    let Some(store) = store else {
-        return (Vec::new(), Vec::new());
-    };
-    let postings = store.postings().unwrap_or_default();
-    let jobs = jobs::open_jobs(&postings, &store.applications().unwrap_or_default());
-    let cells = band::cells(&postings, &jobs);
-    (jobs, cells)
 }

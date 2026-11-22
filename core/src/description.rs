@@ -377,7 +377,7 @@ fn amazon_reply(status: u16, body: &str, id: &str) -> Result<Fetched, String> {
 // HTTP through curl.
 
 /// The status and body of `address`, following redirects.
-async fn get(address: &str) -> Result<(u16, String), String> {
+pub(crate) async fn get(address: &str) -> Result<(u16, String), String> {
     let run = Command::new("/usr/bin/curl")
         .args(["--silent", "--show-error", "--location", "--compressed"])
         .args(["--max-time", &TIME_LIMIT.as_secs().to_string()])

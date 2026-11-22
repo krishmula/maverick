@@ -86,6 +86,11 @@ impl Band {
         }
     }
 
+    /// Shows `cells` in place of the current ones, without restarting the drift.
+    pub fn replace(&mut self, cells: Vec<Cell>) {
+        self.cells = Rc::new(cells);
+    }
+
     /// Turns a job's cell into an applied one, once its application went through.
     pub fn mark_applied(&mut self, address: &str) {
         let Some(ix) = self

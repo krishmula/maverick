@@ -190,6 +190,42 @@ impl Store {
         write.commit()
     }
 
+    /// Adds postings intake found and returns how many were new.
+    /// A posting whose link the store already holds is left as it is.
+    pub fn add_found(&mut self, postings: &[Posting]) -> Result<usize, StoreError> {
+        let write = self.db.transaction()?;
+        let mut added = 0;
+        {
+            let mut insert = write.prepare(
+                "INSERT INTO postings
+                     (link, found_at, source, company, title, location, email_subject, stage, score, variant, flags,
+                      notes, address, sponsorship)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT (link) DO NOTHING",
+            )?;
+            for found in postings {
+                added += insert.execute(params![
+                    found.link,
+                    found.found_at.to_string(),
+                    found.source,
+                    found.company,
+                    found.title,
+                    found.location,
+                    found.email_subject,
+                    found.stage.as_str(),
+                    found.score,
+                    found.variant,
+                    found.flags,
+                    found.notes,
+                    found.address,
+                    found.sponsorship.map(Sponsorship::as_str),
+                ])?;
+            }
+        }
+        write.commit()?;
+        Ok(added)
+    }
+
     /// Records an application the user submitted: the postings at `posting_links` become applied,
     /// and the application is added unless one with the same link is already recorded.
     pub fn record_application(&mut self, posting_links: &[String], sent: &Application) -> Result<(), StoreError> {

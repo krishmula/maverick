@@ -14,11 +14,14 @@ use gpui_kit::{
 };
 use maverick_core::bridge::{BrowserState, Tab};
 
+use gpui_kit::TestSupportExt as _;
+
 use crate::band::{Band, Cell, Mark};
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::report;
+use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Refreshed};
 use crate::tabs::{TabList, host_of};
 use crate::ui::{self, Palette, Signal};
 
@@ -46,6 +49,9 @@ pub struct MainView {
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     band: Band,
+    /// What the last funnel pass did, for the bar.
+    funnel_status: Option<String>,
+    _funnel: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _drift: Task<()>,
 }
@@ -136,6 +142,8 @@ impl MainView {
             jobs,
             tabs,
             band: Band::new(cells),
+            funnel_status: None,
+            _funnel: None,
             _subscriptions,
             _drift,
         };
@@ -252,7 +260,59 @@ impl MainView {
                             .child(tab("show-tabs", "Tabs".to_owned(), "tabs", tabs, Showing::Tabs, cx)),
                     ),
             )
-            .child(self.link(palette, cx))
+            .child(
+                h_flex()
+                    .gap_4()
+                    .min_w_0()
+                    .children(self.funnel_status.clone().map(|status| {
+                        let tip = SharedString::from(status.clone());
+                        div()
+                            .id("funnel-status")
+                            .test_support()
+                            .role(gpui_kit::Role::Label)
+                            .aria_label(status.clone())
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                            })
+                            .text_xs()
+                            .text_color(palette.faint)
+                            .max_w(px(380.))
+                            .truncate()
+                            .child(status)
+                    }))
+                    .child(self.link(palette, cx)),
+            )
+    }
+
+    /// Runs the funnel a minute from now and then every hour, and shows what each pass found.
+    pub fn run_funnel(&mut self, funnel: Funnel, window: &mut Window, cx: &mut Context<Self>) {
+        self._funnel = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(FIRST_PASS).await;
+            loop {
+                if let Some(refreshed) = funnel.pass().await {
+                    let shown = this.update_in(cx, |this, window, cx| this.refresh(refreshed, window, cx));
+                    if shown.is_err() {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(BETWEEN_PASSES).await;
+            }
+        }));
+    }
+
+    /// Shows the lists and the status a funnel pass left.
+    fn refresh(&mut self, refreshed: Refreshed, window: &mut Window, cx: &mut Context<Self>) {
+        self.funnel_status = Some(refreshed.status);
+        if let Some((jobs, cells)) = refreshed.lists {
+            self.band.replace(cells);
+            self.jobs.update(cx, |list, cx| {
+                list.delegate_mut().replace(jobs);
+                let shown = list.delegate().shown();
+                keep_a_row_selected(list, shown, window, cx);
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     fn set_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
@@ -897,6 +957,22 @@ mod tests {
         icon_file: Option<PathBuf>,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
+        let (window, browser, _) = open_window_and_view(bridge, runtime, answers_file, jobs, icon_file, cx);
+        (window, browser)
+    }
+
+    fn open_window_and_view(
+        bridge: &Arc<Bridge>,
+        runtime: &tokio::runtime::Runtime,
+        answers_file: Option<PathBuf>,
+        jobs: Vec<Job>,
+        icon_file: Option<PathBuf>,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui_kit::AnyWindowHandle,
+        gpui_kit::Entity<Browser>,
+        gpui_kit::Entity<MainView>,
+    ) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::ui::install(cx);
@@ -907,7 +983,7 @@ mod tests {
             cx.new(|cx| Browser::new(bridge.clone(), background, Ok(extension_dir), answers_file, None, cx))
         });
         let shown = browser.clone();
-        let (window, _view) = cx.update(|cx| {
+        let (window, view) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     Default::default(),
@@ -920,7 +996,7 @@ mod tests {
             })
             .expect("the test window opens")
         });
-        (window, shown)
+        (window, shown, view)
     }
 
     #[gpui_kit::test]
@@ -1039,6 +1115,57 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("close-fill-report").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_funnel_pass_replaces_the_jobs_and_a_failed_pass_keeps_them(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let job = |id: u8, title: &str| Job {
+            company: "Example Co".into(),
+            title: title.into(),
+            score: Some(80),
+            address: format!("https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb94{id:02}"),
+            ..Job::default()
+        };
+        let (window, _, view) = open_window_and_view(&Bridge::new(), &runtime, None, vec![job(1, "First")], None, cx);
+
+        let pass = |status: &str, lists: Option<Vec<Job>>| crate::schedule::Refreshed {
+            status: status.into(),
+            lists: lists.map(|jobs| (jobs, Vec::new())),
+        };
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh(
+                    pass(
+                        "Checked at 9:00 AM: 2 new postings",
+                        Some(vec![job(1, "First"), job(2, "Second")]),
+                    ),
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("show-jobs").label(), Some("Jobs · 2"));
+            assert_eq!(
+                window.find("funnel-status").label(),
+                Some("Checked at 9:00 AM: 2 new postings")
+            );
+
+            view.update(cx, |view, cx| {
+                view.refresh(pass("The 10:00 AM check failed: offline", None), window, cx)
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("show-jobs").label(), Some("Jobs · 2"));
+            assert_eq!(
+                window.find("funnel-status").label(),
+                Some("The 10:00 AM check failed: offline")
+            );
         })
         .unwrap();
     }

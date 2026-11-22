@@ -585,3 +585,37 @@ fn scoring_decisions_survive_a_reopen_and_a_repeated_import_keeps_the_address() 
     assert_eq!(after_import.address, scored.address);
     assert_eq!(after_import.sponsorship, scored.sponsorship);
 }
+
+#[test]
+fn intake_adds_only_postings_the_store_does_not_hold() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+    let found = |link: &str| Posting {
+        link: link.into(),
+        found_at: "2026-11-22T17:00:00Z".parse().unwrap(),
+        source: "Simplify".into(),
+        company: "Example Co".into(),
+        title: "Backend Engineer".into(),
+        location: Some("Austin, TX".into()),
+        email_subject: None,
+        stage: Stage::Found,
+        score: None,
+        variant: None,
+        flags: None,
+        notes: None,
+        address: Some(format!("{link}/original")),
+        sponsorship: None,
+    };
+    assert_eq!(store.add_found(&[found("https://simplify.jobs/p/1")]).unwrap(), 1);
+    let scored = Posting {
+        stage: Stage::Review,
+        score: Some(70),
+        ..found("https://simplify.jobs/p/1")
+    };
+    store.save_decisions(std::slice::from_ref(&scored)).unwrap();
+
+    let again = [found("https://simplify.jobs/p/1"), found("https://simplify.jobs/p/2")];
+    assert_eq!(store.add_found(&again).unwrap(), 1);
+    let postings = store.postings().unwrap();
+    assert_eq!(postings, [scored, found("https://simplify.jobs/p/2")]);
+}
