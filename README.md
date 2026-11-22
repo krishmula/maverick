@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/icon/icon.png" width="128" alt="Maverick icon"></p>
+<p align="center"><img src="assets/icon/sunset.png" width="128" alt="Maverick icon"></p>
 
 # Maverick
 
@@ -41,6 +41,10 @@ On each start, the app writes the extension to `~/Library/Application Support/de
 The app shows your tabs when Chrome connects. If the app starts after Chrome, Chrome reconnects within 30 seconds.
 
 After an app update, Maverick asks the extension to reload itself. Extension 0.2.0 and older cannot do that: open `chrome://extensions` and click the reload arrow on **Maverick Bridge** once.
+
+## Change the app icon
+
+Click the icon at the left of the header and pick Stealth, Sunset, Arctic, Neon or Crimson. Maverick shows the new icon in the Dock right away and remembers it. Finder and Launchpad keep showing Sunset, the icon inside the app bundle.
 
 ## Use the tab list
 
@@ -148,7 +152,7 @@ MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
 
 The `Release` workflow builds `Maverick.app` and attaches a `.dmg` and a `.zip` to a new GitHub release. The tag must match the version. To build the same files locally, run `scripts/bundle.sh`; they land in `target/dist`.
 
-The icon source is `assets/icon/icon.svg`. After editing it, run `assets/icon/build.sh` (needs `brew install librsvg`) and commit the new `Maverick.icns`.
+Each icon is an SVG in `assets/icon`. After editing one, run `assets/icon/build.sh` (needs `brew install librsvg`) and commit the PNGs and `Maverick.icns` it writes. Sunset is the bundle icon.
 
 ## Layout
 
