@@ -1,18 +1,22 @@
 //! The main window: a bar, the band, and either a list beside a detail pane or the steps to connect Chrome.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::list::{List, ListEvent, ListState};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{IndexPath, Theme, TitleBar, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    canvas, div, fill, point, px, relative, size,
+    canvas, div, fill, img, point, px, relative, size,
 };
 use maverick_core::bridge::{BrowserState, Tab};
 
 use crate::band::{Band, Cell, Mark};
 use crate::browser::{Browser, Fill, Latency, Subject};
+use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::report;
 use crate::tabs::{TabList, host_of};
@@ -37,6 +41,8 @@ enum Showing {
 pub struct MainView {
     browser: Entity<Browser>,
     showing: Showing,
+    icon: AppIcon,
+    icon_file: Option<PathBuf>,
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     band: Band,
@@ -49,6 +55,7 @@ impl MainView {
         browser: Entity<Browser>,
         jobs: Vec<Job>,
         cells: Vec<Cell>,
+        icon_file: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -119,9 +126,13 @@ impl MainView {
                 }
             }
         });
+        let icon = AppIcon::saved(icon_file.as_deref());
+        icon.show_in_dock();
         let mut view = Self {
             browser,
             showing,
+            icon,
+            icon_file,
             jobs,
             tabs,
             band: Band::new(cells),
@@ -218,13 +229,14 @@ impl MainView {
                 h_flex()
                     .gap_5()
                     .child(
-                        div()
-                            .ml_2()
-                            .font_family(ui::DOTS)
-                            .font_weight(FontWeight::BLACK)
-                            .text_size(px(17.))
-                            .text_color(palette.ink)
-                            .child("MAVERICK"),
+                        h_flex().ml_1().gap(px(6.)).child(self.icon_picker(palette, cx)).child(
+                            div()
+                                .font_family(ui::DOTS)
+                                .font_weight(FontWeight::BLACK)
+                                .text_size(px(17.))
+                                .text_color(palette.ink)
+                                .child("MAVERICK"),
+                        ),
                     )
                     .child(
                         h_flex()
@@ -241,6 +253,53 @@ impl MainView {
                     ),
             )
             .child(self.link(palette, cx))
+    }
+
+    fn set_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
+        self.icon = icon;
+        icon.show_in_dock();
+        if let Some(file) = &self.icon_file
+            && let Err(error) = icon.save(file)
+        {
+            eprintln!("maverick: could not save the icon choice: {error}");
+        }
+        cx.notify();
+    }
+
+    /// The current app icon. Clicking it shows every icon to choose from.
+    fn icon_picker(&self, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity().downgrade();
+        let current = self.icon;
+        let palette = *palette;
+        Popover::new("icon-picker")
+            .trigger(
+                Button::new("pick-icon")
+                    .ghost()
+                    .compact()
+                    .tooltip("Change the app icon")
+                    .child(img(current.image()).size(px(18.))),
+            )
+            .content(move |_, _, cx| {
+                h_flex().gap_1().children(AppIcon::ALL.into_iter().map(|icon| {
+                    let view = view.clone();
+                    let chosen = icon == current;
+                    let ink = palette.ink;
+                    let face = v_flex()
+                        .relative()
+                        .items_center()
+                        .gap(px(6.))
+                        .p_2()
+                        .hover(move |face| face.bg(ink.opacity(0.05)))
+                        .child(img(icon.image()).size(px(56.)))
+                        .child(ui::caps(icon.name()).text_color(if chosen { palette.ink } else { palette.muted }))
+                        .children(chosen.then(|| ui::brackets(palette.ink)).into_iter().flatten());
+                    ui::button(icon.name(), icon.name(), face).on_click(cx.listener(move |popover, _, window, cx| {
+                        view.update(cx, |this, cx| this.set_icon(icon, cx)).ok();
+                        popover.dismiss(window, cx);
+                    }))
+                }))
+            })
+            .into_any_element()
     }
 
     /// The state of the link to Chrome. A click measures the round trip again.
@@ -758,6 +817,7 @@ mod tests {
 
     use super::MainView;
     use crate::browser::{Browser, Fill};
+    use crate::icon::AppIcon;
     use crate::jobs::{Job, job_row_id};
     use crate::tabs::{fill_button_id, row_id};
 
@@ -810,11 +870,31 @@ mod tests {
         open_window_with_answers(bridge, runtime, None, Vec::new(), cx).0
     }
 
+    fn open_window_with_icon_file(icon_file: PathBuf, cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        open_window(&Bridge::new(), &runtime, None, Vec::new(), Some(icon_file), cx).0
+    }
+
     fn open_window_with_answers(
         bridge: &Arc<Bridge>,
         runtime: &tokio::runtime::Runtime,
         answers_file: Option<PathBuf>,
         jobs: Vec<Job>,
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
+        open_window(bridge, runtime, answers_file, jobs, None, cx)
+    }
+
+    fn open_window(
+        bridge: &Arc<Bridge>,
+        runtime: &tokio::runtime::Runtime,
+        answers_file: Option<PathBuf>,
+        jobs: Vec<Job>,
+        icon_file: Option<PathBuf>,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
         cx.update(|cx| {
@@ -836,11 +916,33 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), icon_file, window, cx))
             })
             .expect("the test window opens")
         });
         (window, shown)
+    }
+
+    #[gpui_kit::test]
+    fn a_picked_icon_is_saved_for_the_next_start(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let icon_file = dir.path().join("icon");
+        let window = open_window_with_icon_file(icon_file.clone(), cx);
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("Neon").is_none());
+            window.click("pick-icon", cx);
+            window.render_frame(cx);
+            for name in ["Stealth", "Sunset", "Arctic", "Neon", "Crimson"] {
+                assert!(window.try_find(name).is_some(), "the picker offers {name}");
+            }
+            window.click("Neon", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("Neon").is_none(), "choosing an icon closes the picker");
+        })
+        .unwrap();
+        assert_eq!(AppIcon::saved(Some(&icon_file)), AppIcon::Neon);
     }
 
     /// Runs the app until the form filler stops, and returns how it ended.

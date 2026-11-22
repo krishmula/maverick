@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/sunset.png" width="128" alt="Maverick icon"></p>
+
 # Maverick
 
 Maverick is a personal desktop app for macOS, written in Rust with [GPUI](https://www.gpui.rs). It works with the Chrome you already use, through a small extension.
@@ -10,7 +12,17 @@ Today it lists every open Chrome tab, updates the list as tabs change, and switc
 - Rust 1.89 or later. The code is tested on Rust 1.100.
 - Google Chrome 116 or later.
 
-## Run the app
+## Install
+
+1. Download the `.dmg` for the latest version from [Releases](https://github.com/krishmula/maverick/releases). Builds are for Apple silicon.
+2. Open it and drag **Maverick** into **Applications**. Start it from there, not from the disk image: Chrome stores the app's path when it first runs.
+3. The app is not notarized by Apple, so macOS blocks the first launch. Open **System Settings > Privacy & Security** and click **Open Anyway**, or run:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Maverick.app
+   ```
+
+## Run from source
 
 ```sh
 cargo run --release -p maverick
@@ -51,6 +63,10 @@ Four colors carry meaning, and nothing else in the window has a color:
 | Violet | Model | The model answered or drafted it. Check it. |
 | Teal | Done | It worked. |
 | Pink | Failed | Maverick tried and could not. The reason is next to it. |
+
+## Change the app icon
+
+Click the icon at the left of the bar and pick Stealth, Sunset, Arctic, Neon or Crimson. Maverick shows the new icon in the Dock right away and remembers it. Finder and Launchpad keep showing Sunset, the icon inside the app bundle.
 
 ## Use the tab list
 
@@ -198,6 +214,19 @@ MAVERICK_E2E_WORKDAY="https://<company>.wd1.myworkdayjobs.com/<site>/job/<place>
 ```
 
 That test reads the job, opens the application and expects the sign-in stop. It types nothing. For a posting whose application asks for no account, set `MAVERICK_E2E_WORKDAY_OPEN` and run `a_live_workday_page`. It fills the first page with made-up answers, uploads nothing and never leaves the page.
+
+## Make a release
+
+1. Raise `version` in `app/Cargo.toml` and merge it into `main`.
+2. Tag that commit and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The `Release` workflow builds `Maverick.app` and attaches a `.dmg` and a `.zip` to a new GitHub release. The tag must match the version. To build the same files locally, run `scripts/bundle.sh`; they land in `target/dist`.
+
+Each icon is an SVG in `assets/icon`. After editing one, run `assets/icon/build.sh` (needs `brew install librsvg`) and commit the PNGs and `Maverick.icns` it writes. Sunset is the bundle icon.
 
 ## Layout
 

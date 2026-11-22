@@ -1,6 +1,7 @@
 mod band;
 mod browser;
 mod cli;
+mod icon;
 mod jobs;
 mod main_view;
 mod report;
@@ -91,6 +92,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let database = maverick_core::database_path();
             let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, database, cx));
             let (jobs, cells) = stored_jobs();
+            let icon_file = maverick_core::data_dir().map(|dir| dir.join("icon"));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1080.), px(720.)), cx)),
                 window_min_size: Some(size(px(760.), px(520.))),
@@ -103,7 +105,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, cells, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, cells, icon_file, window, cx))
             })
             .expect("the main window opens");
             cx.activate(true);
