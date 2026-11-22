@@ -229,16 +229,19 @@ The **mav** view is a conversation with Mav, your planning assistant. Type what 
 
 Mav proposes each TickTick task or calendar block as a card. Nothing is written until you click **Confirm** on the card. **Skip** drops it. A block that overlaps a busy event lists the clash in pink before you confirm. Questions such as "what is left today?" get an answer and no cards.
 
-The right side shows today's and tomorrow's events, then every open TickTick task in the lists Mav shows, grouped by priority (high, medium, low, none) or, with the **date** switch, into overdue, today, the coming week and no date. On the right side, without Mav:
+The right side shows the calendar, then every open TickTick task in the lists Mav shows, grouped by priority (high, medium, low, none) or, with the **date** switch, into overdue, today, the coming week and no date. On the right side, without Mav:
 
 - Tick a task's box to finish it. It shows as done until the next read drops it.
 - Click a task's priority tag to move it to the next priority: high, medium, low, none, then high again.
 - Type in **Add a task** and press Enter to add it to your default list. Click the tag next to the box to choose its priority first.
+- The calendar shows one day with its events and the free time between them, from 8:00 to 22:00. **‹** and **›** move a day at a time through the coming week, **today** comes back, and **week** lists the coming seven days. Each event shows its profile.
+- **+ block** on a free stretch asks for a name; press Enter and Maverick adds the block to the profile marked for new blocks.
+- **delete** on an event asks **sure?** first; a second click deletes it from Google Calendar.
 - **collapse ›** folds the side panel into a strip with the count of overdue and due-today tasks; **‹** opens it again. Maverick remembers both choices in `mav-view.json`.
 
 The number next to **mav** in the bar counts the tasks that are overdue or due today.
 
-Mav can also finish, change, move and delete tasks you already have: "mark the lease done", "make the quiz prep high priority and move it to Thursday at 6", "move the dentist task to Personal". Each one comes as a card that shows what changes, such as `low → high`, and runs only when you confirm it.
+Mav can also finish, change, move and delete tasks you already have: "mark the lease done", "make the quiz prep high priority and move it to Thursday at 6", "move the dentist task to Personal". Mav also moves and deletes calendar events: "push my next event back an hour" keeps the event's length unless you name an end. Each one comes as a card that shows what changes, such as `low → high`, and runs only when you confirm it.
 
 When an application goes through, Mav offers a task to follow up a week later at 10:00, in a list whose name contains "job", or else the Inbox.
 

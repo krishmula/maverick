@@ -30,6 +30,8 @@ calendar is the exact name of one of the user's Google profiles when they say wh
 To finish, change or delete one of the user's existing tasks, use kind complete, change or delete, set task to its ref such as t3, and title to its current title. \
 For change, set only what changes: date and time for a new due date, priority, rename for a new title, and list to move it to another list; leave the rest null. \
 priority is high, medium, low or none. For a new task, set it only when the user names one. \
+To move or delete one of the user's calendar events, use kind move_event or delete_event, set event to its ref such as e2, and title to its title. \
+For move_event, set date and time for the new start, and end_time only when the user gives one; otherwise it keeps its length. \
 For a question about their schedule or tasks, answer from what you see, with no proposals. \
 In reply, say in one or two short plain sentences what you propose or what you found. No em dashes. \
 Never invent tasks or events.";
@@ -124,8 +126,8 @@ impl Context {
                 if overdue { ", overdue" } else { "" }
             );
         }
-        text.push_str("\nCalendar:\n");
-        for event in &self.events {
+        text.push_str("\nCalendar (ref: when, title, profile):\n");
+        for (index, event) in self.events.iter().enumerate() {
             let day = match &event.span {
                 calendar::Span::Days(first, _) => first.strftime("%a %Y-%m-%d").to_string(),
                 calendar::Span::At(start, _) => start.strftime("%a %Y-%m-%d").to_string(),
@@ -133,7 +135,8 @@ impl Context {
             let free = if event.busy { "" } else { ", marked free" };
             let _ = writeln!(
                 text,
-                "- {day} {}: {} [{}]{free}",
+                "- e{}: {day} {}: {} [{}]{free}",
+                index + 1,
                 event.hours(),
                 event.title,
                 event.profile
@@ -178,6 +181,8 @@ pub struct Draft {
     pub priority: Option<String>,
     /// A new title for a task being changed.
     pub rename: Option<String>,
+    /// The ref of a calendar event, such as `e2`, for move_event and delete_event.
+    pub event: Option<String>,
 }
 
 /// What Mav says back.
@@ -217,6 +222,15 @@ pub enum Action {
     Delete {
         entry: Entry,
     },
+    MoveEvent {
+        event: Event,
+        start: ZonedDateTime,
+        end: ZonedDateTime,
+        clashes: Vec<String>,
+    },
+    DeleteEvent {
+        event: Event,
+    },
 }
 
 impl Action {
@@ -225,6 +239,7 @@ impl Action {
             Action::Task { task, .. } => &task.title,
             Action::Block { title, .. } => title,
             Action::Complete { entry } | Action::Change { entry, .. } | Action::Delete { entry } => &entry.title,
+            Action::MoveEvent { event, .. } | Action::DeleteEvent { event } => &event.title,
         }
     }
 
@@ -236,6 +251,8 @@ impl Action {
             Action::Complete { .. } => "TickTick · Finish",
             Action::Change { .. } => "TickTick · Change",
             Action::Delete { .. } => "TickTick · Delete",
+            Action::MoveEvent { .. } => "Calendar · Move",
+            Action::DeleteEvent { .. } => "Calendar · Delete",
         }
     }
 
@@ -264,6 +281,30 @@ impl Action {
                 }
                 facts
             }
+            Action::MoveEvent {
+                event,
+                start,
+                end,
+                clashes,
+            } => {
+                let mut facts = vec![
+                    (
+                        "When",
+                        format!(
+                            "{} → {} to {}",
+                            event_when(event),
+                            start.strftime("%a %-d %b · %H:%M"),
+                            end.strftime("%H:%M")
+                        ),
+                    ),
+                    ("Calendar", event.profile.clone()),
+                ];
+                if !clashes.is_empty() {
+                    facts.push(("Clashes", clashes.join(", ")));
+                }
+                facts
+            }
+            Action::DeleteEvent { event } => vec![("When", event_when(event)), ("Calendar", event.profile.clone())],
             Action::Complete { entry } | Action::Delete { entry } => {
                 vec![("List", entry.list.clone()), ("Due", entry.when())]
             }
@@ -311,6 +352,14 @@ impl Action {
                 .ok_or_else(|| "TickTick is not connected; connect it under Connections".to_owned())
         };
         match self {
+            Action::MoveEvent { event, start, end, .. } => {
+                calendar::reschedule(event, start, end).await?;
+                Ok(format!("Moved in the {} calendar", event.profile))
+            }
+            Action::DeleteEvent { event } => {
+                calendar::delete(event).await?;
+                Ok(format!("Deleted from the {} calendar", event.profile))
+            }
             Action::Complete { entry } => {
                 ticktick::complete(&token().await?, &entry.list_id, &entry.id).await?;
                 Ok("Finished in TickTick".to_owned())
@@ -383,7 +432,7 @@ fn schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["task", "block", "complete", "change", "delete"] },
+                        "kind": { "type": "string", "enum": ["task", "block", "complete", "change", "delete", "move_event", "delete_event"] },
                         "title": { "type": "string" },
                         "list": maybe("string"),
                         "date": { "type": ["string", "null"], "description": "YYYY-MM-DD" },
@@ -394,8 +443,9 @@ fn schema() -> Value {
                         "task": { "type": ["string", "null"], "description": "an existing task's ref, such as t3" },
                         "priority": { "type": ["string", "null"], "enum": ["high", "medium", "low", "none", null] },
                         "rename": maybe("string"),
+                        "event": { "type": ["string", "null"], "description": "a calendar event's ref, such as e2" },
                     },
-                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before", "calendar", "task", "priority", "rename"],
+                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before", "calendar", "task", "priority", "rename", "event"],
                     "additionalProperties": false,
                 },
             },
@@ -431,6 +481,53 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
     };
     match draft.kind.as_str() {
         "complete" | "change" | "delete" => existing(draft.kind.as_str(), draft, context, date, start, &at),
+        "move_event" | "delete_event" => {
+            let named = draft.event.as_deref().unwrap_or("none");
+            let event = named
+                .trim()
+                .trim_start_matches('e')
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| context.events.get(number.checked_sub(1)?))
+                .cloned()
+                .ok_or_else(|| format!("Mav pointed at an event Maverick cannot find: {named}"))?;
+            if draft.kind == "delete_event" {
+                return Ok(Action::DeleteEvent { event });
+            }
+            let calendar::Span::At(was_start, was_end) = &event.span else {
+                return Err(format!(
+                    "{} is an all-day event, which Maverick does not move",
+                    event.title
+                ));
+            };
+            let (Some(date), Some(time)) = (date, start) else {
+                return Err(format!(
+                    "Mav proposed moving {} without a new date and time",
+                    event.title
+                ));
+            };
+            let start = at(date, time)?;
+            let end = match end {
+                Some(end) => at(date, end)?,
+                None => start
+                    .checked_add(was_end.duration_since(was_start))
+                    .map_err(|error| error.to_string())?,
+            };
+            if end <= start {
+                return Err(format!("Mav proposed moving {} to end before it starts", event.title));
+            }
+            let clashes = calendar::clashes(&context.events, &start, &end)
+                .into_iter()
+                .filter(|other| other.source != event.source)
+                .map(|other| other.title.clone())
+                .collect();
+            Ok(Action::MoveEvent {
+                event,
+                start,
+                end,
+                clashes,
+            })
+        }
         "task" if title.is_empty() => Err("Mav proposed a task with no title".to_owned()),
         "block" if title.is_empty() => Err("Mav proposed a block with no title".to_owned()),
         "task" => {
@@ -490,6 +587,14 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
             })
         }
         other => Err(format!("Mav proposed a kind of thing Maverick cannot do: {other}")),
+    }
+}
+
+/// When an event is, as `Mon 23 Nov · 10:00`, or the first day of an all-day one.
+fn event_when(event: &Event) -> String {
+    match &event.span {
+        calendar::Span::Days(first, _) => first.strftime("%a %-d %b").to_string(),
+        calendar::Span::At(start, _) => start.strftime("%a %-d %b · %H:%M").to_string(),
     }
 }
 
@@ -665,6 +770,11 @@ mod tests {
             events: vec![Event {
                 title: "Screen".into(),
                 profile: "Work".into(),
+                source: calendar::Source {
+                    account: "w@example.com".into(),
+                    calendar: "primary".into(),
+                    id: "s1".into(),
+                },
                 span: Span::At(at(10), at(11)),
                 busy: true,
             }],
@@ -833,6 +943,58 @@ mod tests {
     }
 
     #[test]
+    fn events_are_moved_keeping_their_length_or_deleted_by_ref() {
+        let context = context();
+        let later = Draft {
+            event: Some("e1".into()),
+            date: Some("2026-11-23".into()),
+            time: Some("15:00".into()),
+            ..draft("move_event")
+        };
+        let Ok(action) = check(&later, &context) else {
+            panic!("not a move")
+        };
+        assert_eq!(
+            action.facts(),
+            [
+                ("When", "Mon 23 Nov · 10:00 → Mon 23 Nov · 15:00 to 16:00".to_owned()),
+                ("Calendar", "Work".to_owned())
+            ]
+        );
+        assert!(matches!(
+            check(
+                &Draft {
+                    event: Some("e1".into()),
+                    ..draft("delete_event")
+                },
+                &context
+            ),
+            Ok(Action::DeleteEvent { .. })
+        ));
+        assert!(
+            check(
+                &Draft {
+                    event: Some("e7".into()),
+                    ..draft("delete_event")
+                },
+                &context
+            )
+            .unwrap_err()
+            .contains("e7")
+        );
+        assert!(
+            check(
+                &Draft {
+                    event: Some("e1".into()),
+                    ..draft("move_event")
+                },
+                &context
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn a_task_with_no_list_goes_to_the_default_list() {
         let Ok(Action::Task { task, list }) = check(&draft("task"), &context()) else {
             panic!("not a task")
@@ -870,8 +1032,19 @@ mod tests {
     #[test]
     fn the_answer_format_allows_every_kind_check_understands() {
         let kinds = schema()["properties"]["proposals"]["items"]["properties"]["kind"]["enum"].clone();
-        for kind in ["task", "block", "complete", "change", "delete"] {
-            assert!(kinds.as_array().unwrap().iter().any(|allowed| allowed == kind), "{kind} is not allowed");
+        for kind in [
+            "task",
+            "block",
+            "complete",
+            "change",
+            "delete",
+            "move_event",
+            "delete_event",
+        ] {
+            assert!(
+                kinds.as_array().unwrap().iter().any(|allowed| allowed == kind),
+                "{kind} is not allowed"
+            );
         }
     }
 
@@ -880,7 +1053,7 @@ mod tests {
         let described = context().describe();
         assert!(described.contains("Now: Sunday 2026-11-22 16:00 (America/Los_Angeles)"));
         assert!(described.contains("TickTick lists: Inbox, Job search\n"));
-        assert!(described.contains("- Mon 2026-11-23 10:00 to 11:00: Screen [Work]"));
+        assert!(described.contains("- e1: Mon 2026-11-23 10:00 to 11:00: Screen [Work]"));
         assert!(described.contains("Google profiles: Work, School"));
         assert!(described.contains("- t1: Study for the quiz (Mon 23, Inbox, priority low)"));
         assert!(described.contains("- t2: Renew lease (no date, Job search, priority none)"));

@@ -33,6 +33,16 @@ pub struct Event {
     pub span: Span,
     /// False for an event marked free, which does not block time.
     pub busy: bool,
+    /// Where it lives in Google, so it can be moved or deleted.
+    pub source: Source,
+}
+
+/// Where an event lives: the account, the calendar in it, and the event's id.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Source {
+    pub account: String,
+    pub calendar: String,
+    pub id: String,
 }
 
 impl Event {
@@ -148,7 +158,12 @@ pub async fn events(from: Timestamp, to: Timestamp, zone: &TimeZone) -> Result<V
                 to.strftime("%Y-%m-%dT%H:%M:%SZ")
             );
             let reply = google::call(&token, "GET", &url, None).await?;
-            all.extend(parse_events(&reply, zone, account.name()));
+            let source = Source {
+                account: account.email.clone(),
+                calendar: calendar.clone(),
+                id: String::new(),
+            };
+            all.extend(parse_events(&reply, zone, account.name(), &source));
         }
     }
     all.sort_by_key(|event| match &event.span {
@@ -196,7 +211,7 @@ pub fn parse_calendars(reply: &Value) -> Vec<Calendar> {
 }
 
 /// The events in one reply from Google. A cancelled event or one Maverick cannot read is left out.
-pub fn parse_events(reply: &Value, zone: &TimeZone, profile: &str) -> Vec<Event> {
+pub fn parse_events(reply: &Value, zone: &TimeZone, profile: &str, from: &Source) -> Vec<Event> {
     let Some(items) = reply["items"].as_array() else {
         return Vec::new();
     };
@@ -222,6 +237,10 @@ pub fn parse_events(reply: &Value, zone: &TimeZone, profile: &str) -> Vec<Event>
                 profile: profile.to_owned(),
                 span,
                 busy: item["transparency"] != "transparent",
+                source: Source {
+                    id: item["id"].as_str().unwrap_or_default().to_owned(),
+                    ..from.clone()
+                },
             })
         })
         .collect()
@@ -283,6 +302,79 @@ pub async fn add(
     Ok(account.name().to_owned())
 }
 
+/// A token for the account `source` belongs to, after checking it may change events.
+async fn writer(source: &Source) -> Result<crate::credentials::Password, String> {
+    let client = Client::stored().await?.ok_or("no Google OAuth client is stored")?;
+    let file = google::accounts_path().ok_or("this system has no application data directory")?;
+    let account = google::accounts(&file)?
+        .into_iter()
+        .find(|account| account.email == source.account)
+        .ok_or_else(|| format!("{} is no longer connected", source.account))?;
+    if !account.can(CALENDAR_EVENTS) {
+        return Err(format!(
+            "the {} profile does not let Maverick change events yet; sign in to it again under Connections",
+            account.name()
+        ));
+    }
+    google::access_token(&client, &account.email).await
+}
+
+fn event_url(source: &Source) -> String {
+    format!(
+        "{CALENDARS}/{}/events/{}",
+        form_encoded(&source.calendar),
+        form_encoded(&source.id)
+    )
+}
+
+/// Moves `event` to start at `start` and end at `end`.
+pub async fn reschedule(event: &Event, start: &ZonedDateTime, end: &ZonedDateTime) -> Result<(), String> {
+    let token = writer(&event.source).await?;
+    let moment = |at: &ZonedDateTime| {
+        json!({
+            "dateTime": at.timestamp().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "timeZone": at.time_zone().iana_name().unwrap_or("UTC"),
+        })
+    };
+    let body = json!({ "start": moment(start), "end": moment(end) });
+    google::call(&token, "PATCH", &event_url(&event.source), Some(&body))
+        .await
+        .map(drop)
+}
+
+pub async fn delete(event: &Event) -> Result<(), String> {
+    let token = writer(&event.source).await?;
+    google::call(&token, "DELETE", &event_url(&event.source), None)
+        .await
+        .map(drop)
+}
+
+/// The free stretches and events of `day` in time order, for showing them together.
+pub fn day_plan<'a>(events: &'a [Event], day: Date, now: &ZonedDateTime) -> Vec<Stretch<'a>> {
+    let mut plan: Vec<Stretch<'a>> = events
+        .iter()
+        .filter(|event| event.touches(day))
+        .map(Stretch::Event)
+        .collect();
+    plan.extend(free_slots(events, day, now).into_iter().map(Stretch::Free));
+    let key = |stretch: &Stretch| match stretch {
+        Stretch::Event(event) => match &event.span {
+            Span::Days(..) => (0, None),
+            Span::At(start, _) => (1, Some(start.timestamp())),
+        },
+        Stretch::Free(slot) => (1, Some(slot.start.timestamp())),
+    };
+    plan.sort_by_key(key);
+    plan
+}
+
+/// One line of a day: an event, or free time between events.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stretch<'a> {
+    Event(&'a Event),
+    Free(Slot),
+}
+
 /// How long a stretch is, as `2 h` or `1 h 30 min`.
 pub fn length(minutes: i64) -> String {
     let duration = SignedDuration::from_mins(minutes);
@@ -313,6 +405,7 @@ mod tests {
         Event {
             title: title.into(),
             profile: "Work".into(),
+            source: Source::default(),
             span: Span::At(start, end),
             busy: true,
         }
@@ -328,6 +421,7 @@ mod tests {
             Event {
                 title: "Lunch (free)".into(),
                 profile: "Work".into(),
+                source: Source::default(),
                 span: Span::At(at(23, 12, 0), at(23, 13, 0)),
                 busy: false,
             },
@@ -358,14 +452,26 @@ mod tests {
     #[test]
     fn events_parse_from_googles_reply() {
         let reply = json!({ "items": [
-            { "summary": "Screen", "start": { "dateTime": "2026-11-23T10:00:00-08:00" },
+            { "id": "e1", "summary": "Screen", "start": { "dateTime": "2026-11-23T10:00:00-08:00" },
               "end": { "dateTime": "2026-11-23T11:30:00-08:00" } },
             { "summary": "Trip", "start": { "date": "2026-11-23" }, "end": { "date": "2026-11-25" } },
             { "summary": "Gone", "status": "cancelled", "start": { "date": "2026-11-23" }, "end": { "date": "2026-11-24" } },
             { "summary": "Hold", "transparency": "transparent",
               "start": { "dateTime": "2026-11-23T18:00:00Z" }, "end": { "dateTime": "2026-11-23T19:00:00Z" } }
         ]});
-        let events = parse_events(&reply, &zone(), "Work");
+        let from = Source {
+            account: "w@example.com".into(),
+            calendar: "primary".into(),
+            id: String::new(),
+        };
+        let events = parse_events(&reply, &zone(), "Work", &from);
+        assert_eq!(
+            events[0].source,
+            Source {
+                id: "e1".into(),
+                ..from.clone()
+            }
+        );
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].hours(), "10:00 to 11:30");
         assert!(events[1].touches(date(2026, 11, 24)) && !events[1].touches(date(2026, 11, 25)));
@@ -409,6 +515,23 @@ mod tests {
                 .contains("sign in to it again")
         );
         assert!(block_account(&accounts, Some("Gym")).is_err());
+    }
+
+    #[test]
+    fn a_day_lists_events_and_free_time_in_order() {
+        let events = [
+            timed("Standup", at(23, 9, 0), at(23, 9, 30)),
+            timed("Gym", at(23, 17, 0), at(23, 18, 0)),
+        ];
+        let plan = day_plan(&events, date(2026, 11, 23), &at(22, 16, 0));
+        let read: Vec<String> = plan
+            .iter()
+            .map(|stretch| match stretch {
+                Stretch::Event(event) => event.title.clone(),
+                Stretch::Free(slot) => format!("free {}", slot.start.strftime("%H:%M")),
+            })
+            .collect();
+        assert_eq!(read, ["free 08:00", "Standup", "free 09:30", "Gym", "free 18:00"]);
     }
 
     #[test]
