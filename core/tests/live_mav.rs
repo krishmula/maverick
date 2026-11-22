@@ -2,7 +2,7 @@
 //! and deletes it again. It runs only when asked:
 //! `MAVERICK_E2E_MAV=1 cargo test -p maverick-core --test live_mav -- --ignored`.
 
-use jiff::{ToSpan as _, ZonedDateTime};
+use jiff::ZonedDateTime;
 use maverick_core::mav::{self, Action, Context};
 use maverick_core::ticktick::{self, Due};
 
@@ -39,16 +39,10 @@ async fn a_request_becomes_a_task_that_lands_in_ticktick() {
 
     println!("{}", action.carry_out().await.unwrap());
     let token = ticktick::stored_token().await.unwrap().unwrap();
-    let start = now.start_of_day().unwrap();
-    let found = ticktick::undone(
-        &token,
-        start.timestamp(),
-        start.checked_add(3.days()).unwrap().timestamp(),
-    )
-    .await
-    .unwrap()
-    .into_iter()
-    .find(|made| made.title == task.title)
-    .expect("the confirmed task is in TickTick");
+    let (_, open) = ticktick::open_tasks(&token).await.unwrap();
+    let found = open
+        .into_iter()
+        .find(|made| made.title == task.title)
+        .expect("the confirmed task is in TickTick");
     ticktick::delete(&token, &found.project_id, &found.id).await.unwrap();
 }

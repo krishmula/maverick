@@ -452,11 +452,20 @@ pub fn ticktick(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let token = runtime
                 .block_on(ticktick::stored_token())?
                 .ok_or("no TickTick token is stored yet; run `maverick ticktick token` first")?;
-            let agenda = runtime.block_on(ticktick::agenda(&token, &jiff::ZonedDateTime::now()))?;
+            let now = jiff::ZonedDateTime::now();
+            let (lists, tasks) = runtime.block_on(ticktick::open_tasks(&token))?;
+            let entries = ticktick::entries(&tasks, &lists, now.time_zone());
+            let agenda = ticktick::Agenda::from_entries(&entries, &now);
             let print = |heading: &str, entries: &[Entry]| {
                 println!("{heading} ({})", entries.len());
                 for entry in entries {
-                    println!("  {:<16} {}  [{}]", entry.due.label(), entry.title, entry.list);
+                    println!(
+                        "  {:<16} {:<6} {}  [{}]",
+                        entry.when(),
+                        entry.priority.name(),
+                        entry.title,
+                        entry.list
+                    );
                 }
             };
             print("Overdue", &agenda.overdue);

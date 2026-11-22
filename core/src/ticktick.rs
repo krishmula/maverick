@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, ToSpan as _, ZonedDateTime};
+use jiff::{Timestamp, ZonedDateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,10 +23,6 @@ const API: &str = "https://api.ticktick.com/open/v1";
 /// TickTick's date format, such as `2019-11-13T03:00:00+0000`. Replies add milliseconds.
 const DATE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%z";
 const REPLY_DATE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.f%z";
-/// The widest range TickTick lists undone tasks for.
-const MOST_DAYS: i64 = 14;
-/// How far back the agenda looks for overdue tasks.
-const OVERDUE_DAYS: i64 = 7;
 
 pub async fn stored_token() -> Result<Option<Password>, String> {
     credentials::secret(TOKEN_SERVICE, TOKEN_ACCOUNT).await
@@ -99,6 +95,64 @@ impl Settings {
     }
 }
 
+/// How much a task matters, as TickTick ranks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl Priority {
+    pub const ALL: [Priority; 4] = [Priority::High, Priority::Medium, Priority::Low, Priority::None];
+
+    /// TickTick's number: None 0, Low 1, Medium 3, High 5.
+    pub fn value(self) -> u8 {
+        match self {
+            Priority::None => 0,
+            Priority::Low => 1,
+            Priority::Medium => 3,
+            Priority::High => 5,
+        }
+    }
+
+    pub fn from_value(value: u8) -> Self {
+        match value {
+            5.. => Priority::High,
+            3 | 4 => Priority::Medium,
+            1 | 2 => Priority::Low,
+            0 => Priority::None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::None => "none",
+            Priority::Low => "low",
+            Priority::Medium => "medium",
+            Priority::High => "high",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<Self> {
+        Priority::ALL
+            .into_iter()
+            .find(|priority| priority.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The next priority when the user clicks the tag: high, medium, low, none, then high again.
+    pub fn next(self) -> Self {
+        match self {
+            Priority::High => Priority::Medium,
+            Priority::Medium => Priority::Low,
+            Priority::Low => Priority::None,
+            Priority::None => Priority::High,
+        }
+    }
+}
+
 /// A task as TickTick sends it. Only the fields Maverick reads.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -130,18 +184,28 @@ pub async fn projects(token: &Password) -> Result<Vec<Project>, String> {
     serde_json::from_value(reply).map_err(|error| format!("TickTick's list of lists did not parse: {error}"))
 }
 
-/// The undone tasks dated between `from` and `to`, in every list including the Inbox.
-/// TickTick answers for at most 14 days at a time.
-pub async fn undone(token: &Password, from: Timestamp, to: Timestamp) -> Result<Vec<Task>, String> {
-    let body = json!({
-        "startDate": from.strftime(DATE_FORMAT).to_string(),
-        "endDate": to.strftime(DATE_FORMAT).to_string(),
-    });
-    let reply = http::call("TickTick", token, "POST", &format!("{API}/task/undone"), Some(&body)).await?;
-    if reply == Value::Null {
-        return Ok(Vec::new());
+/// Every undone task in the lists Mav shows, the Inbox included, with the lists.
+/// Unlike `undone`, this has tasks with no date and tasks of any age.
+pub async fn open_tasks(token: &Password) -> Result<(Vec<Project>, Vec<Task>), String> {
+    let lists = projects(token).await?;
+    let settings = Settings::current();
+    let mut ids: Vec<String> = vec!["inbox".to_owned()];
+    ids.extend(lists.iter().filter(|list| !list.closed).map(|list| list.id.clone()));
+    ids.retain(|id| settings.shows(id));
+    let mut reads = tokio::task::JoinSet::new();
+    for id in ids {
+        let token = token.clone();
+        reads.spawn(async move {
+            let reply = http::call("TickTick", &token, "GET", &format!("{API}/project/{id}/data"), None).await?;
+            serde_json::from_value::<Vec<Task>>(reply["tasks"].clone())
+                .map_err(|error| format!("TickTick's tasks did not parse: {error}"))
+        });
     }
-    serde_json::from_value(reply).map_err(|error| format!("TickTick's tasks did not parse: {error}"))
+    let mut tasks = Vec::new();
+    while let Some(read) = reads.join_next().await {
+        tasks.extend(read.map_err(|error| error.to_string())??);
+    }
+    Ok((lists, tasks))
 }
 
 /// A task Maverick is about to add.
@@ -153,11 +217,12 @@ pub struct NewTask {
     pub due: Option<Due>,
     /// Minutes before the due time to remind, or for an all-day task, a reminder at 9:00 that day.
     pub remind_before: Option<i64>,
+    pub priority: Priority,
 }
 
 /// The body TickTick takes to create `task`.
 pub fn new_task_body(task: &NewTask, zone: &TimeZone) -> Value {
-    let mut body = json!({ "title": task.title, "projectId": task.list_id });
+    let mut body = json!({ "title": task.title, "projectId": task.list_id, "priority": task.priority.value() });
     let format = |moment: Timestamp| moment.strftime(DATE_FORMAT).to_string();
     let zone_name = zone.iana_name().unwrap_or("UTC");
     match &task.due {
@@ -206,6 +271,67 @@ pub async fn create(token: &Password, task: &NewTask, zone: &TimeZone) -> Result
     serde_json::from_value(reply).map_err(|error| format!("TickTick's reply to the new task did not parse: {error}"))
 }
 
+/// What to change in a task. A field left `None` stays as it is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Change {
+    pub title: Option<String>,
+    pub priority: Option<Priority>,
+    pub due: Option<Due>,
+}
+
+impl Change {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.priority.is_none() && self.due.is_none()
+    }
+}
+
+/// The body TickTick takes to change task `id` in list `list_id`. TickTick keeps fields it is not sent.
+pub fn change_body(id: &str, list_id: &str, change: &Change, zone: &TimeZone) -> Value {
+    let mut body = json!({ "id": id, "projectId": list_id });
+    if let Some(title) = &change.title {
+        body["title"] = json!(title);
+    }
+    if let Some(priority) = change.priority {
+        body["priority"] = json!(priority.value());
+    }
+    if let Some(due) = &change.due {
+        let dated = new_task_body(
+            &NewTask {
+                title: String::new(),
+                list_id: String::new(),
+                due: Some(due.clone()),
+                remind_before: None,
+                priority: Priority::None,
+            },
+            zone,
+        );
+        for field in ["startDate", "dueDate", "isAllDay", "timeZone"] {
+            body[field] = dated[field].clone();
+        }
+    }
+    body
+}
+
+pub async fn change(token: &Password, id: &str, list_id: &str, change: &Change, zone: &TimeZone) -> Result<(), String> {
+    let body = change_body(id, list_id, change, zone);
+    http::call("TickTick", token, "POST", &format!("{API}/task/{id}"), Some(&body))
+        .await
+        .map(drop)
+}
+
+/// Moves task `id` from one list to another. A plain change cannot move a task.
+pub async fn move_to(token: &Password, id: &str, from: &str, to: &str) -> Result<(), String> {
+    let body = json!([{ "fromProjectId": from, "toProjectId": to, "taskId": id }]);
+    http::call("TickTick", token, "POST", &format!("{API}/task/move"), Some(&body))
+        .await
+        .map(drop)
+}
+
+pub async fn complete(token: &Password, list_id: &str, id: &str) -> Result<(), String> {
+    let url = format!("{API}/project/{list_id}/task/{id}/complete");
+    http::call("TickTick", token, "POST", &url, None).await.map(drop)
+}
+
 pub async fn delete(token: &Password, list_id: &str, task_id: &str) -> Result<(), String> {
     let url = format!("{API}/project/{list_id}/task/{task_id}");
     http::call("TickTick", token, "DELETE", &url, None).await.map(drop)
@@ -229,7 +355,7 @@ impl Due {
         }
     }
 
-    fn date(&self) -> Date {
+    pub fn date(&self) -> Date {
         match self {
             Due::Day(date) => *date,
             Due::At(moment) => moment.date(),
@@ -253,14 +379,80 @@ impl Due {
     }
 }
 
-/// One task on the agenda.
+/// One undone task, as the user reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
+    pub id: String,
+    pub list_id: String,
     pub title: String,
     /// The name of the task's list.
     pub list: String,
-    pub due: Due,
-    pub priority: u8,
+    pub due: Option<Due>,
+    pub priority: Priority,
+}
+
+impl Entry {
+    /// When it is due, or `no date`.
+    pub fn when(&self) -> String {
+        self.due.as_ref().map_or_else(|| "no date".to_owned(), Due::label)
+    }
+}
+
+/// The tasks as the user reads them: dated ones by date, then undated ones, higher priority first.
+pub fn entries(tasks: &[Task], projects: &[Project], zone: &TimeZone) -> Vec<Entry> {
+    let names: HashMap<&str, &str> = projects
+        .iter()
+        .map(|project| (project.id.as_str(), project.name.as_str()))
+        .collect();
+    let mut entries: Vec<Entry> = tasks
+        .iter()
+        .map(|task| Entry {
+            id: task.id.clone(),
+            list_id: task.project_id.clone(),
+            title: task.title.clone(),
+            list: list_name(&task.project_id, &names),
+            due: due(task, zone),
+            priority: Priority::from_value(task.priority),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        let order = |entry: &Entry| (entry.due.is_none(), entry.due.as_ref().map(Due::order));
+        order(a).cmp(&order(b)).then(b.priority.cmp(&a.priority))
+    });
+    entries
+}
+
+/// The tasks grouped by priority, each group by date.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Board {
+    pub high: Vec<Entry>,
+    pub medium: Vec<Entry>,
+    pub low: Vec<Entry>,
+    pub none: Vec<Entry>,
+}
+
+impl Board {
+    pub fn of(entries: &[Entry]) -> Self {
+        let mut board = Board::default();
+        for entry in entries {
+            match entry.priority {
+                Priority::High => board.high.push(entry.clone()),
+                Priority::Medium => board.medium.push(entry.clone()),
+                Priority::Low => board.low.push(entry.clone()),
+                Priority::None => board.none.push(entry.clone()),
+            }
+        }
+        board
+    }
+
+    pub fn groups(&self) -> [(Priority, &[Entry]); 4] {
+        [
+            (Priority::High, &self.high),
+            (Priority::Medium, &self.medium),
+            (Priority::Low, &self.low),
+            (Priority::None, &self.none),
+        ]
+    }
 }
 
 /// The undone tasks the user should see, sorted by when they are due.
@@ -276,32 +468,22 @@ pub struct Agenda {
 impl Agenda {
     /// Sorts `tasks` into the agenda as seen at `now`. A task with no date is left out.
     pub fn of(tasks: &[Task], projects: &[Project], now: &ZonedDateTime) -> Self {
-        let names: HashMap<&str, &str> = projects
-            .iter()
-            .map(|project| (project.id.as_str(), project.name.as_str()))
-            .collect();
-        let mut entries: Vec<Entry> = tasks
-            .iter()
-            .filter_map(|task| {
-                Some(Entry {
-                    title: task.title.clone(),
-                    list: list_name(&task.project_id, &names),
-                    due: due(task, now.time_zone())?,
-                    priority: task.priority,
-                })
-            })
-            .collect();
-        entries.sort_by(|a, b| a.due.order().cmp(&b.due.order()).then(b.priority.cmp(&a.priority)));
+        Self::from_entries(&entries(tasks, projects, now.time_zone()), now)
+    }
+
+    /// The dated ones of `entries`, already in order, sorted into the agenda.
+    pub fn from_entries(entries: &[Entry], now: &ZonedDateTime) -> Self {
         let today = now.date();
         let mut agenda = Agenda::default();
-        for entry in entries {
-            let passed = match &entry.due {
+        for entry in entries.iter().filter(|entry| entry.due.is_some()).cloned() {
+            let Some(due) = entry.due.clone() else { continue };
+            let passed = match &due {
                 Due::Day(date) => *date < today,
                 Due::At(moment) => moment < now,
             };
             if passed {
                 agenda.overdue.push(entry);
-            } else if entry.due.date() == today {
+            } else if due.date() == today {
                 agenda.today.push(entry);
             } else {
                 agenda.upcoming.push(entry);
@@ -309,19 +491,6 @@ impl Agenda {
         }
         agenda
     }
-}
-
-/// The agenda as of now: overdue tasks from the last week, today, and the coming week.
-pub async fn agenda(token: &Password, now: &ZonedDateTime) -> Result<Agenda, String> {
-    let start = now.start_of_day().map_err(|error| error.to_string())?;
-    let from = start
-        .checked_sub(OVERDUE_DAYS.days())
-        .map_err(|error| error.to_string())?;
-    let to = from.checked_add(MOST_DAYS.days()).map_err(|error| error.to_string())?;
-    let (projects, mut tasks) = tokio::try_join!(projects(token), undone(token, from.timestamp(), to.timestamp()))?;
-    let settings = Settings::current();
-    tasks.retain(|task| settings.shows(&task.project_id));
-    Ok(Agenda::of(&tasks, &projects, now))
 }
 
 fn list_name(project_id: &str, names: &HashMap<&str, &str>) -> String {
@@ -407,8 +576,8 @@ mod tests {
         assert_eq!(titles(&agenda.today), ["Water plants", "Send references"]);
         assert_eq!(titles(&agenda.upcoming), ["Follow up with recruiter"]);
         assert_eq!(agenda.upcoming[0].list, "Job search");
-        assert_eq!(agenda.upcoming[0].due.label(), "Tue 24 · 10:00");
-        assert_eq!(agenda.today[0].due.time(), None);
+        assert_eq!(agenda.upcoming[0].when(), "Tue 24 · 10:00");
+        assert_eq!(agenda.today[0].due.as_ref().and_then(Due::time), None);
     }
 
     #[test]
@@ -417,7 +586,7 @@ mod tests {
         let mut tokyo = task("Pack", "2026-11-22T15:00:00+0000", true);
         tokyo.time_zone = Some("Asia/Tokyo".to_owned());
         let agenda = Agenda::of(&[tokyo], &[], &sunday_afternoon());
-        assert_eq!(agenda.upcoming[0].due, Due::Day(date(2026, 11, 23)));
+        assert_eq!(agenda.upcoming[0].due, Some(Due::Day(date(2026, 11, 23))));
     }
 
     #[test]
@@ -436,6 +605,7 @@ mod tests {
             list_id: "inbox".into(),
             due: Some(Due::At(at.clone())),
             remind_before: Some(30),
+            priority: Priority::High,
         };
         let zone = at.time_zone().clone();
         let body = new_task_body(&timed, &zone);
@@ -443,6 +613,7 @@ mod tests {
         assert_eq!(body["timeZone"], "America/Los_Angeles");
         assert_eq!(body["isAllDay"], false);
         assert_eq!(body["reminders"], json!(["TRIGGER:-PT30M"]));
+        assert_eq!(body["priority"], 5);
 
         let all_day = NewTask {
             due: Some(Due::Day(date(2026, 11, 24))),
@@ -474,6 +645,67 @@ mod tests {
         assert_eq!(Settings::load(&file), Ok(Settings::default()));
         settings.save(&file).unwrap();
         assert_eq!(Settings::load(&file), Ok(settings));
+    }
+
+    #[test]
+    fn undated_tasks_go_last_and_the_board_groups_by_priority() {
+        let mut urgent = task("Pay rent", "2026-11-24T18:00:00+0000", false);
+        urgent.priority = 5;
+        let mut someday = Task {
+            id: "s".into(),
+            title: "Read a book".into(),
+            priority: 1,
+            ..Task::default()
+        };
+        someday.project_id = "inbox1".into();
+        let mut medium = task("Email Sam", "2026-11-23T18:00:00+0000", false);
+        medium.priority = 3;
+        let entries = entries(
+            &[someday, urgent, medium],
+            &[],
+            &TimeZone::get("America/Los_Angeles").unwrap(),
+        );
+        assert_eq!(titles(&entries), ["Email Sam", "Pay rent", "Read a book"]);
+        assert_eq!(entries[2].when(), "no date");
+        let board = Board::of(&entries);
+        assert_eq!(titles(&board.high), ["Pay rent"]);
+        assert_eq!(titles(&board.medium), ["Email Sam"]);
+        assert_eq!(titles(&board.low), ["Read a book"]);
+        // The agenda leaves an undated task out.
+        assert_eq!(Agenda::from_entries(&entries, &sunday_afternoon()).upcoming.len(), 2);
+    }
+
+    #[test]
+    fn priorities_round_trip_and_cycle() {
+        for priority in Priority::ALL {
+            assert_eq!(Priority::from_value(priority.value()), priority);
+            assert_eq!(Priority::named(priority.name()), Some(priority));
+        }
+        assert_eq!(Priority::High.next(), Priority::Medium);
+        assert_eq!(Priority::None.next(), Priority::High);
+    }
+
+    #[test]
+    fn a_change_sends_only_what_changes() {
+        let zone = TimeZone::get("America/Los_Angeles").unwrap();
+        let raise = Change {
+            priority: Some(Priority::High),
+            ..Change::default()
+        };
+        assert_eq!(
+            change_body("t1", "p1", &raise, &zone),
+            json!({ "id": "t1", "projectId": "p1", "priority": 5 })
+        );
+        let move_day = Change {
+            due: Some(Due::Day(date(2026, 11, 26))),
+            title: Some("Quiz prep".into()),
+            ..Change::default()
+        };
+        let body = change_body("t1", "p1", &move_day, &zone);
+        assert_eq!(body["dueDate"], "2026-11-26T08:00:00+0000");
+        assert_eq!(body["isAllDay"], true);
+        assert_eq!(body["title"], "Quiz prep");
+        assert!(body.get("priority").is_none());
     }
 
     #[test]
