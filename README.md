@@ -38,7 +38,10 @@ After an app update, Maverick asks the extension to reload itself. Extension 0.2
 
 ## Fill an application form
 
-Maverick fills application forms on `jobs.ashbyhq.com`. It never clicks Submit.
+Maverick fills application forms on two systems. It never clicks Submit.
+
+- Ashby, on `jobs.ashbyhq.com`.
+- Greenhouse, on the boards Greenhouse hosts: `job-boards.greenhouse.io`, the older `boards.greenhouse.io`, and their `eu.` variants. A company's own careers page that shows a Greenhouse form inside it is not covered.
 
 1. Click **Jobs** in Maverick. The list holds the open postings from your imported tracker, best score first.
 2. Choose a job with a click or Enter. Maverick opens the form in a new Chrome tab and fills it.
@@ -55,7 +58,9 @@ Answers come from two places:
 
 The model leaves pay questions, demographic questions and agreements for you. Maverick lists every answer and every draft the model gave, with what it used, and every field it left.
 
-After a fill, Maverick watches the tab for Ashby's confirmation. When you submit, it marks the posting as applied in the local database, records the application, and takes the job off the list. The watch stops after 30 minutes or when the tab closes.
+On a Greenhouse form, Maverick leaves the demographic, equal opportunity and education sections alone. It splits `name` into the First Name and Last Name fields at the first space, unless a rule covers those titles.
+
+After a fill, Maverick watches the tab for the system's confirmation. When you submit, it marks the posting as applied in the local database, records the application, and takes the job off the list. The watch stops after 30 minutes or when the tab closes.
 
 Your standard answers live in `~/Library/Application Support/dev.maverick.app/answers.json`. The file is read on every fill:
 
@@ -110,7 +115,7 @@ The report counts what the rules would skip and lists each posting where the rul
 cargo test --workspace
 ```
 
-Three tests drive a real browser and do not run by default. They need a [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) binary, because Google Chrome no longer accepts `--load-extension`:
+Four tests drive a real browser and do not run by default. They need a [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) binary, because Google Chrome no longer accepts `--load-extension`:
 
 ```sh
 MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
@@ -122,7 +127,15 @@ The third test fills a live Ashby form with made-up answers and a blank PDF, and
 ```sh
 MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
 	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
-	cargo test -p maverick --test chrome a_live -- --ignored --nocapture
+	cargo test -p maverick --test chrome a_live_ashby -- --ignored --nocapture
+```
+
+The fourth test does the same on a live Greenhouse form:
+
+```sh
+MAVERICK_E2E_GREENHOUSE="https://job-boards.greenhouse.io/<board>/jobs/<posting id>" \
+	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
+	cargo test -p maverick --test chrome a_live_greenhouse -- --ignored --nocapture
 ```
 
 ## Layout

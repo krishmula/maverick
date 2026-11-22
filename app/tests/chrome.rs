@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::apply::{FieldResult, Outcome, Source};
+use maverick_core::apply::{FieldResult, Outcome, Source, System};
 use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
+use maverick_core::greenhouse;
 use maverick_core::page::{Locator, Page, PageError};
 use serde_json::json;
 use tempfile::TempDir;
@@ -409,6 +410,136 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
             .ends_with("/application"),
         "the form was not submitted"
     );
+}
+
+/// Fills a live Greenhouse form with made-up answers and prints what happened to each field.
+/// It uploads a blank PDF and never submits. Set `MAVERICK_E2E_GREENHOUSE` to a posting's address.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME and MAVERICK_E2E_GREENHOUSE, and reaches a live site"]
+async fn a_live_greenhouse_form_is_filled_and_not_submitted() {
+    let posting = std::env::var("MAVERICK_E2E_GREENHOUSE").expect("MAVERICK_E2E_GREENHOUSE");
+    let system = System::of(&posting).expect("MAVERICK_E2E_GREENHOUSE holds a posting's address");
+    assert_eq!(system, System::Greenhouse);
+    let Running {
+        bridge,
+        mut states,
+        scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+
+    let resume = scratch.path().join("Ada-Example-Resume.pdf");
+    fs::write(&resume, BLANK_PDF).unwrap();
+    let answers: Answers = serde_json::from_value(json!({
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "phone": "+1 415 555 0100",
+        "resume": resume,
+        "location": "Springfield, Illinois",
+        "rules": [
+            { "any": ["linkedin"], "answer": "https://www.linkedin.com/in/ada-example" },
+            { "any": ["start date", "when can you start"], "answer": "2027-01-18" },
+            { "any": ["how did you hear"], "answer": "LinkedIn" },
+            { "any": ["relocat"], "answer": "yes" },
+        ],
+        "facts": [
+            "Lives in Springfield, Illinois, United States, in the Central time zone.",
+            "Citizen of Canada. Authorized to work in the United States today.",
+            "Will need employer visa sponsorship in the future.",
+            "Can work in an office five days a week.",
+            "Current job: Software Engineer at Example Robotics.",
+        ],
+        "background": [
+            "Ada Example. Software Engineer at Example Robotics, 2023 to present.",
+            "Built a job queue in Rust that cut nightly batch time from 6 hours to 40 minutes.",
+            "Shipped a retrieval feature for support agents with reranking, judged on a held-out set of 300 tickets.",
+        ],
+    }))
+    .unwrap();
+
+    let tab = titled(&tabs, "First").unwrap();
+    let page = Page::attach(bridge.clone(), &tab).await.unwrap();
+    // The app opens the form's address, whatever shape the posting's link had.
+    page.navigate(&system.form_address(&posting).unwrap()).await.unwrap();
+    let report = system.fill(&page, &answers).await.unwrap();
+    assert_eq!(report.model_problem, None);
+    let outcomes = report.outcomes;
+    for outcome in &outcomes {
+        let required = if outcome.required { "required" } else { "optional" };
+        match &outcome.result {
+            FieldResult::Filled { shown, by } => {
+                let by = match by {
+                    Source::StandardAnswer => "filled ".to_owned(),
+                    Source::Model { basis } => format!("model   [{basis}]"),
+                    Source::Draft { basis } => format!("draft   [{basis}]"),
+                };
+                println!("{by} ({required}) {}: {shown}", outcome.title)
+            }
+            FieldResult::Left(why) => println!("left    ({required}) {}: {why}", outcome.title),
+            FieldResult::Failed(problem) => println!("FAILED  ({required}) {}: {problem}", outcome.title),
+        }
+    }
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome.result, FieldResult::Failed(_)))
+        .count();
+    assert_eq!(failed, 0, "every field with an answer was entered");
+    let filled_by_standard = |title: &str| {
+        outcomes.iter().any(|outcome| {
+            let by_standard = matches!(
+                &outcome.result,
+                FieldResult::Filled {
+                    by: Source::StandardAnswer,
+                    ..
+                }
+            );
+            by_standard && outcome.title == title
+        })
+    };
+    assert!(
+        filled_by_standard("First Name") && filled_by_standard("Last Name") && filled_by_standard("Email"),
+        "the fields every Greenhouse form has were filled"
+    );
+
+    // The extension can look at the page without the debugger. The form is there and unsent.
+    let has = |selector: &str| {
+        let check = Command::HasElement {
+            tab_id: tab.tab.id,
+            selector: selector.to_owned(),
+        };
+        let bridge = bridge.clone();
+        async move { bridge.request(tab.connection, &check).await.unwrap() }
+    };
+    assert_eq!(has("#application-form .application--submit button").await, true);
+    assert_eq!(has(system.submitted()).await, false);
+
+    // A second run finds the standard answers already in place and changes none of them.
+    let again = system.fill(&page, &answers).await.unwrap().outcomes;
+    let standard = |outcomes: &[Outcome]| -> Vec<Outcome> {
+        let by_standard = |outcome: &&Outcome| {
+            matches!(
+                &outcome.result,
+                FieldResult::Filled {
+                    by: Source::StandardAnswer,
+                    ..
+                }
+            )
+        };
+        outcomes.iter().filter(by_standard).cloned().collect()
+    };
+    assert_eq!(standard(&again), standard(&outcomes));
+    // A list refuses an option it already holds, so a second pick of one would show up here.
+    let failed_again: Vec<&Outcome> = again
+        .iter()
+        .filter(|outcome| matches!(outcome.result, FieldResult::Failed(_)))
+        .collect();
+    assert_eq!(failed_again, Vec::<&Outcome>::new());
+    assert_eq!(
+        greenhouse::form_address(page.evaluate("location.href").await.unwrap().as_str().unwrap()),
+        system.form_address(&posting),
+        "the tab is still on the form"
+    );
+    assert_eq!(has(system.submitted()).await, false, "the form was not submitted");
 }
 
 /// A one-page PDF with nothing on it.
