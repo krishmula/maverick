@@ -28,11 +28,53 @@ On each start, the app writes the extension to `~/Library/Application Support/de
 
 The app shows your tabs when Chrome connects. If the app starts after Chrome, Chrome reconnects within 30 seconds.
 
+After an app update, Maverick asks the extension to reload itself. Extension 0.2.0 and older cannot do that: open `chrome://extensions` and click the reload arrow on **Maverick Bridge** once.
+
 ## Use the tab list
 
 - Type to filter tabs by title or address. Every word you type must match.
 - Press the Up and Down arrow keys to move the selection.
 - Press Enter, or click a row, to switch Chrome to that tab.
+
+## Fill an application form
+
+Maverick fills application forms on `jobs.ashbyhq.com`. It never clicks Submit.
+
+1. Click **Jobs** in Maverick. The list holds the open postings from your imported tracker, best score first.
+2. Choose a job with a click or Enter. Maverick opens the form in a new Chrome tab and fills it.
+3. Review the form in Chrome, answer what Maverick left, and click Submit yourself.
+
+For a posting that is not in the list, open it in Chrome and click **Fill form** on that tab's row.
+
+Answers come from two places:
+
+- Your standard answers go in first. They are fixed rules, so the same question always gets the same answer.
+- A Claude model then answers what the rules left, using only the `facts` in your answers file. It runs through the `claude` command you are signed in to, so there is no API key. With no facts in the file, no model is asked.
+
+The model leaves pay questions, essay questions, demographic questions and agreements for you. Maverick lists every answer the model gave, with the fact it used, and every field it left.
+
+Your standard answers live in `~/Library/Application Support/dev.maverick.app/answers.json`. The file is read on every fill:
+
+```json
+{
+  "name": "Ada Example",
+  "email": "ada@example.com",
+  "phone": "+1 415 555 0100",
+  "resume": "/Users/ada/Documents/resume.pdf",
+  "location": "Springfield, Illinois",
+  "rules": [
+    { "any": ["linkedin"], "answer": "https://www.linkedin.com/in/ada-example" },
+    { "any": ["require sponsorship"], "not": ["without"], "answer": "no" },
+    { "any": ["start date"], "answer": "2027-01-18" }
+  ],
+  "facts": [
+    "Lives in Springfield, Illinois, in the Central time zone.",
+    "Citizen of Canada. Will need visa sponsorship in the future."
+  ]
+}
+```
+
+A rule answers every question that holds one of its `any` phrases and none of its `not` phrases. A yes or no question takes `yes` or `no`, a date takes `YYYY-MM-DD`, and a question with options takes the text of one option. `location` is optional.
 
 ## Import the job tracker
 
@@ -60,18 +102,26 @@ The report counts what the rules would skip and lists each posting where the rul
 cargo test --workspace
 ```
 
-One test drives a real browser and does not run by default. It needs a [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) binary, because Google Chrome no longer accepts `--load-extension`:
+Three tests drive a real browser and do not run by default. They need a [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) binary, because Google Chrome no longer accepts `--load-extension`:
 
 ```sh
 MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
 	cargo test -p maverick --test chrome -- --ignored --nocapture
 ```
 
+The third test fills a live Ashby form with made-up answers and a blank PDF, and never submits. It also needs a posting's address:
+
+```sh
+MAVERICK_E2E_ASHBY="https://jobs.ashbyhq.com/<company>/<posting id>" \
+	MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
+	cargo test -p maverick --test chrome a_live -- --ignored --nocapture
+```
+
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `core/` | The `maverick-core` crate. It has no UI code. It holds the bridge to Chrome, the relay, and the extension installer. |
+| `core/` | The `maverick-core` crate. It has no UI code. It holds the bridge to Chrome, page control, the form filler, the relay, the extension installer, and the job funnel's database and tracker import. |
 | `app/` | The `maverick` crate. It draws the window with GPUI and [GPUI Kit](https://gpui-kit.com). |
 | `extension/` | The Chrome extension. It reports tabs and runs the commands the app sends. |
 
@@ -80,3 +130,15 @@ MAVERICK_E2E_CHROME="/path/to/Google Chrome for Testing" \
 Chrome starts the `maverick` binary as a native messaging host and passes the extension's origin as the first argument. In that mode the binary is a relay. The relay copies bytes between Chrome's pipes and a Unix socket that the running app listens on.
 
 The app opens no network port. Chrome lets only this extension start the relay, and only the current user can open the socket.
+
+## How the app acts on a page
+
+`core/src/page.rs` sends Chrome DevTools Protocol commands to one tab. The extension passes them on with `chrome.debugger`, so this works in the Chrome you already use, on pages where you are signed in.
+
+- `fill` types text into a field. `click` uses the mouse. The page sees both as real input.
+- `upload` puts a file from this computer into a file input.
+- `navigate` opens an address and waits for the page to load.
+- `press` sends a key such as Enter, and `wait_for` waits for an element to appear.
+
+Chrome shows a bar that says Maverick Bridge is debugging the browser while a tab is attached. Closing the bar detaches the tab. The app attaches only while it acts on a tab.
+

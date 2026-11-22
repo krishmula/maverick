@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,10 +19,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// A page command can wait on a web server, as `Page.navigate` does.
+const PAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const HELD_EVENTS: usize = 256;
 
 pub type ConnectionId = u32;
 
@@ -56,6 +60,41 @@ pub enum Command {
     Ping,
     #[serde(rename = "tabs.activate", rename_all = "camelCase")]
     ActivateTab { tab_id: i32, window_id: i32 },
+    /// Opens a tab. The result holds the new tab's `id` and `windowId`.
+    #[serde(rename = "tabs.create")]
+    OpenTab { url: String, active: bool },
+    /// Loads the extension again from disk.
+    #[serde(rename = "reload")]
+    ReloadExtension,
+    #[serde(rename = "debugger.attach", rename_all = "camelCase")]
+    AttachDebugger { tab_id: i32 },
+    #[serde(rename = "debugger.detach", rename_all = "camelCase")]
+    DetachDebugger { tab_id: i32 },
+    /// One Chrome DevTools Protocol command, such as `Runtime.evaluate`.
+    #[serde(rename = "debugger.send", rename_all = "camelCase")]
+    Debug {
+        tab_id: i32,
+        command: String,
+        params: Value,
+    },
+}
+
+impl Command {
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::Debug { .. } => PAGE_COMMAND_TIMEOUT,
+            _ => REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// A Chrome DevTools Protocol event from a tab the extension holds a debugger on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebuggerEvent {
+    pub connection: ConnectionId,
+    pub tab_id: i32,
+    pub method: String,
+    pub params: Value,
 }
 
 #[derive(Serialize)]
@@ -68,9 +107,26 @@ struct Request<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FromBrowser {
-    Tabs { tabs: Vec<BrowserTab> },
-    Result { id: u64, value: Value },
-    Error { id: u64, message: String },
+    Hello {
+        version: String,
+    },
+    Tabs {
+        tabs: Vec<BrowserTab>,
+    },
+    Result {
+        id: u64,
+        value: Value,
+    },
+    Error {
+        id: u64,
+        message: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Event {
+        tab_id: i32,
+        method: String,
+        params: Value,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -100,6 +156,8 @@ struct Connection {
     outbox: mpsc::UnboundedSender<Vec<u8>>,
     pending: HashMap<u64, oneshot::Sender<Reply>>,
     tabs: Vec<BrowserTab>,
+    /// The extension's version, once it has said it. Versions before 0.3.0 never say.
+    extension: Option<String>,
 }
 
 #[derive(Default)]
@@ -112,6 +170,10 @@ struct Inner {
 pub struct Bridge {
     inner: Mutex<Inner>,
     state: watch::Sender<BrowserState>,
+    events: broadcast::Sender<DebuggerEvent>,
+    /// Set once this app has asked an out-of-date extension to reload, so a reload that
+    /// brings back the same old version cannot loop.
+    asked_reload: AtomicBool,
 }
 
 /// The socket the relay connects to, plus the lock that keeps a second app from taking it.
@@ -150,6 +212,8 @@ impl Bridge {
         Arc::new(Self {
             inner: Mutex::default(),
             state: watch::Sender::new(BrowserState::Disconnected),
+            events: broadcast::Sender::new(HELD_EVENTS),
+            asked_reload: AtomicBool::new(false),
         })
     }
 
@@ -159,6 +223,21 @@ impl Bridge {
 
     pub fn subscribe(&self) -> watch::Receiver<BrowserState> {
         self.state.subscribe()
+    }
+
+    /// Debugger events from every tab, starting now.
+    pub fn events(&self) -> broadcast::Receiver<DebuggerEvent> {
+        self.events.subscribe()
+    }
+
+    /// True when a connected browser runs an extension other than the one this app ships.
+    /// The extension says its version before its first tab report, so ask after one.
+    pub fn extension_is_outdated(&self) -> bool {
+        let current = crate::extension::version();
+        self.lock()
+            .connections
+            .values()
+            .any(|held| held.extension.as_deref() != Some(current.as_str()))
     }
 
     pub fn connections(&self) -> Vec<ConnectionId> {
@@ -189,7 +268,7 @@ impl Bridge {
             target.pending.insert(id, reply);
             id
         };
-        match tokio::time::timeout(REQUEST_TIMEOUT, answered).await {
+        match tokio::time::timeout(command.timeout(), answered).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(_)) => Err(BridgeError::Disconnected),
             Err(_) => {
@@ -230,6 +309,7 @@ impl Bridge {
                     outbox,
                     pending: HashMap::new(),
                     tabs: Vec::new(),
+                    extension: None,
                 },
             );
             self.publish(&inner);
@@ -264,12 +344,34 @@ impl Bridge {
             return false;
         };
         match message {
+            FromBrowser::Hello { version } => {
+                source.extension = Some(version.clone());
+                if version != crate::extension::version() && !self.asked_reload.swap(true, Ordering::Relaxed) {
+                    // Nobody waits for the answer: the extension restarts and connects again.
+                    let request = Request {
+                        id: 0,
+                        command: &Command::ReloadExtension,
+                    };
+                    let _ = source
+                        .outbox
+                        .send(serde_json::to_vec(&request).expect("a request is plain JSON"));
+                }
+            }
             FromBrowser::Tabs { tabs } => {
                 source.tabs = tabs;
                 self.publish(&inner);
             }
             FromBrowser::Result { id, value } => settle(source, id, Ok(value)),
             FromBrowser::Error { id, message } => settle(source, id, Err(BridgeError::Browser(message))),
+            FromBrowser::Event { tab_id, method, params } => {
+                // Sending fails only when nobody listens, which is fine.
+                let _ = self.events.send(DebuggerEvent {
+                    connection,
+                    tab_id,
+                    method,
+                    params,
+                });
+            }
         }
         true
     }
@@ -295,7 +397,7 @@ impl Bridge {
 }
 
 fn settle(connection: &mut Connection, id: u64, reply: Reply) {
-    // A reply with no waiter belongs to a request that already timed out.
+    // A reply with no waiter belongs to a request that already timed out, or to a reload.
     if let Some(waiter) = connection.pending.remove(&id) {
         let _ = waiter.send(reply);
     }

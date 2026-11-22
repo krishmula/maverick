@@ -1,5 +1,6 @@
 mod browser;
 mod cli;
+mod jobs;
 mod main_view;
 mod tabs;
 
@@ -83,7 +84,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             })
             .detach();
 
-            let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, cx));
+            let answers_file = maverick_core::answers_path();
+            let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, cx));
+            let jobs = stored_jobs();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(880.), px(620.)), cx)),
                 window_min_size: Some(size(px(420.), px(360.))),
@@ -94,11 +97,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, window, cx))
             })
             .expect("the main window opens");
             cx.activate(true);
         });
     drop(runtime);
     Ok(())
+}
+
+/// The open postings from the local database. A missing or unreadable database gives an empty list.
+fn stored_jobs() -> Vec<jobs::Job> {
+    let postings = maverick_core::database_path()
+        .filter(|path| path.is_file())
+        .and_then(|path| maverick_core::store::Store::open(&path).ok())
+        .and_then(|store| store.postings().ok())
+        .unwrap_or_default();
+    jobs::open_jobs(&postings)
 }

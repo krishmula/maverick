@@ -208,3 +208,48 @@ async fn a_second_app_cannot_take_the_socket_from_a_running_one() {
     let _browser = UnixStream::connect(&socket).unwrap();
     next(&mut states, &BrowserState::Connected { tabs: vec![] }).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_out_of_date_extension_is_asked_to_reload_once() {
+    let scratch = tempfile::tempdir().unwrap();
+    let socket = scratch.path().join("bridge.sock");
+    let (bridge, _states) = serve(&socket);
+    let connected = async |count: usize| {
+        timeout(WAIT, async {
+            while bridge.connections().len() < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        *bridge.connections().last().unwrap()
+    };
+    // The first thing a connection hears after its hello, with a ping queued behind any reload.
+    let hears_first = async |browser: &mut UnixStream, connection| {
+        let bridge = bridge.clone();
+        tokio::spawn(async move { bridge.ping(connection).await });
+        receive(browser)["method"].clone()
+    };
+
+    let mut current = UnixStream::connect(&socket).unwrap();
+    send(
+        &mut current,
+        json!({ "kind": "hello", "version": maverick_core::extension::version() }),
+    );
+    let first = connected(1).await;
+    send(&mut current, json!({ "kind": "tabs", "tabs": [] }));
+    assert_eq!(hears_first(&mut current, first).await, "ping");
+    assert!(!bridge.extension_is_outdated());
+
+    let mut old = UnixStream::connect(&socket).unwrap();
+    send(&mut old, json!({ "kind": "hello", "version": "0.0.1" }));
+    assert_eq!(receive(&mut old)["method"], "reload");
+
+    // The reload brought back the same old version. Asking again would loop.
+    let mut still_old = UnixStream::connect(&socket).unwrap();
+    send(&mut still_old, json!({ "kind": "hello", "version": "0.0.1" }));
+    let third = connected(3).await;
+    send(&mut still_old, json!({ "kind": "tabs", "tabs": [] }));
+    assert_eq!(hears_first(&mut still_old, third).await, "ping");
+    assert!(bridge.extension_is_outdated());
+}

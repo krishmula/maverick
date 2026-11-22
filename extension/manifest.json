@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Maverick Bridge",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Connects Chrome to the Maverick app on this computer.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwPyDi8SVHQYBnLv5bK1DNLkayPXRCwWp+YTkSvc2Cnn+TV39oWhQJjipO7sr47PyKBrwl+uJu7LAuR3rzWW9+CmmbgAMmB4vdRyLXMH166Zsv/LqoqgQhh/5j+/6NDDM+gemql8Rg8WPEnhWGFBLEvnLk69yClc+YTOnHHHLHL0ZUW68J0YECJHHKbwqI8ma5D/R9VSp3diIp/FvFcIpfcC8zztdoWnz3z/jzoOu1lYpOLl0P/DBc4+HWzd9fxOipA0O8EHoGfEZy4T42WbZjoVlFG5vcd70/JJ3LNtjaAAUX5PWA8xx7HYYseOrov6+8uK6UZne2Gd2ts8IWXEnTQIDAQAB",
   "minimum_chrome_version": "116",
-  "permissions": ["alarms", "nativeMessaging", "tabs"],
+  "permissions": ["alarms", "debugger", "nativeMessaging", "tabs"],
   "background": {
     "service_worker": "background.js"
   }
