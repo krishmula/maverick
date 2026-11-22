@@ -1,16 +1,20 @@
+mod band;
 mod browser;
 mod cli;
+mod icon;
 mod jobs;
 mod main_view;
+mod report;
 mod tabs;
+mod ui;
 
 use std::error::Error;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-use gpui_kit::component::Theme;
-use gpui_kit::{AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size};
+use gpui_kit::component::TitleBar;
+use gpui_kit::{AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, point, px, size};
 use maverick_core::bridge::{self, Bridge};
 use maverick_core::extension;
 
@@ -74,7 +78,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            Theme::sync_system_appearance(None, cx);
+            ui::install(cx);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_window_closed(|cx, _| {
@@ -87,18 +91,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             let answers_file = maverick_core::answers_path();
             let database = maverick_core::database_path();
             let browser = cx.new(|cx| Browser::new(bridge, background, extension_dir, answers_file, database, cx));
-            let jobs = stored_jobs();
+            let (jobs, cells) = stored_jobs();
+            let icon_file = maverick_core::data_dir().map(|dir| dir.join("icon"));
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(880.), px(620.)), cx)),
-                window_min_size: Some(size(px(420.), px(360.))),
+                window_bounds: Some(WindowBounds::centered(size(px(1080.), px(720.)), cx)),
+                window_min_size: Some(size(px(760.), px(520.))),
+                // The bar is the title bar, with the traffic lights centered in it.
                 titlebar: Some(TitlebarOptions {
                     title: Some("Maverick".into()),
-                    ..Default::default()
+                    traffic_light_position: Some(point(px(14.), px(13.))),
+                    ..TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, window, cx))
+                cx.new(|cx| MainView::new(browser, jobs, cells, icon_file, window, cx))
             })
             .expect("the main window opens");
             cx.activate(true);
@@ -107,16 +114,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The open postings from the local database. A missing or unreadable database gives an empty list.
-fn stored_jobs() -> Vec<jobs::Job> {
+/// The open postings from the local database, and one band cell for every posting in it.
+/// A missing or unreadable database gives none of either.
+fn stored_jobs() -> (Vec<jobs::Job>, Vec<band::Cell>) {
     let store = maverick_core::database_path()
         .filter(|path| path.is_file())
         .and_then(|path| maverick_core::store::Store::open(&path).ok());
     let Some(store) = store else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    jobs::open_jobs(
-        &store.postings().unwrap_or_default(),
-        &store.applications().unwrap_or_default(),
-    )
+    let postings = store.postings().unwrap_or_default();
+    let jobs = jobs::open_jobs(&postings, &store.applications().unwrap_or_default());
+    let cells = band::cells(&postings, &jobs);
+    (jobs, cells)
 }

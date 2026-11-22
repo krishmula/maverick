@@ -10,6 +10,7 @@ use crate::ashby;
 use crate::greenhouse;
 use crate::model;
 use crate::page::{Locator, Page, PageError};
+use crate::workday;
 
 /// How long a page gets to show an answer after it was entered.
 const SETTLE_WAIT: Duration = Duration::from_secs(3);
@@ -20,6 +21,7 @@ const SETTLE_GAP: Duration = Duration::from_millis(50);
 pub enum System {
     Ashby,
     Greenhouse,
+    Workday,
 }
 
 impl System {
@@ -28,6 +30,7 @@ impl System {
         ashby::is_posting(address)
             .then_some(Self::Ashby)
             .or_else(|| greenhouse::is_posting(address).then_some(Self::Greenhouse))
+            .or_else(|| workday::is_posting(address).then_some(Self::Workday))
     }
 
     /// The posting's address without anything a tracker or a campaign added to it.
@@ -35,6 +38,7 @@ impl System {
         match self {
             Self::Ashby => ashby::posting_address(address),
             Self::Greenhouse => greenhouse::posting_address(address),
+            Self::Workday => workday::posting_address(address),
         }
     }
 
@@ -43,6 +47,7 @@ impl System {
         match self {
             Self::Ashby => ashby::form_address(address),
             Self::Greenhouse => greenhouse::form_address(address),
+            Self::Workday => workday::form_address(address),
         }
     }
 
@@ -51,6 +56,7 @@ impl System {
         match self {
             Self::Ashby => ashby::SUBMITTED,
             Self::Greenhouse => greenhouse::SUBMITTED,
+            Self::Workday => workday::SUBMITTED,
         }
     }
 
@@ -60,6 +66,7 @@ impl System {
         match self {
             Self::Ashby => ashby::fill(page, answers).await,
             Self::Greenhouse => greenhouse::fill(page, answers).await,
+            Self::Workday => workday::fill(page, answers).await,
         }
     }
 }
@@ -82,6 +89,10 @@ pub enum FillError {
     /// The posting is no longer listed.
     Closed,
     UnexpectedForm(String),
+    /// The application is behind an account, and only the user signs in to it.
+    SignInNeeded {
+        system: &'static str,
+    },
     Page(PageError),
     /// The link to the tab broke. `during` says what the filler was doing.
     Interrupted {
@@ -98,6 +109,11 @@ impl fmt::Display for FillError {
             Self::UnexpectedForm(problem) => {
                 write!(f, "the form is described in a way Maverick cannot read: {problem}")
             }
+            Self::SignInNeeded { system } => write!(
+                f,
+                "{system} shows the application only to a signed-in account. \
+                 Sign in to {system} in that tab, then click Fill form again."
+            ),
             Self::Page(error) => write!(f, "{error}"),
             Self::Interrupted { during, error } => write!(f, "{error} This happened while {during}."),
         }
@@ -140,6 +156,8 @@ pub struct Report {
     pub outcomes: Vec<Outcome>,
     /// Why the model could not be asked, when it could not. The standard answers still went in.
     pub model_problem: Option<String>,
+    /// What else the user should know about this fill, when an application system has something to say.
+    pub note: Option<String>,
 }
 
 /// Where an answer came from.
@@ -276,6 +294,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
     Ok(Report {
         outcomes,
         model_problem,
+        note: None,
     })
 }
 

@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches the app version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' app/Cargo.toml | head -n 1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match app version $version"; exit 1; }
+      - name: Build Maverick.app
+        run: scripts/bundle.sh
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/dist/*.dmg target/dist/*.zip --title "Maverick $GITHUB_REF_NAME" --generate-notes
