@@ -50,6 +50,9 @@ pub struct Browser {
     answers_file: Option<PathBuf>,
     database: Option<PathBuf>,
     applied: Vec<Applied>,
+    /// The connections the last latency measurement covered.
+    measured: Vec<ConnectionId>,
+    measures: u64,
     extension_is_outdated: bool,
     fill: Fill,
     state: BrowserState,
@@ -84,6 +87,8 @@ impl Browser {
             answers_file,
             database,
             applied: Vec::new(),
+            measured: Vec::new(),
+            measures: 0,
             extension_is_outdated: false,
             fill: Fill::Idle,
             latency: Latency::Measuring,
@@ -92,6 +97,7 @@ impl Browser {
         };
         if browser.is_connected() {
             browser.extension_is_outdated = browser.bridge.extension_is_outdated();
+            browser.measured = browser.bridge.connections();
             browser.measure(cx);
         }
         browser
@@ -117,6 +123,8 @@ impl Browser {
 
     pub fn measure(&mut self, cx: &mut Context<Self>) {
         self.latency = Latency::Measuring;
+        self.measures += 1;
+        let measure = self.measures;
         cx.notify();
         let bridge = self.bridge.clone();
         let pinged = self.background.spawn(async move { bridge.slowest_ping().await });
@@ -127,8 +135,11 @@ impl Browser {
                 Err(error) => Latency::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
-                this.latency = latency;
-                cx.notify();
+                // An older measurement can finish last, for example one cut off by a reconnect.
+                if this.measures == measure {
+                    this.latency = latency;
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -273,11 +284,16 @@ impl Browser {
     }
 
     fn set_state(&mut self, state: BrowserState, cx: &mut Context<Self>) {
-        let was_connected = self.is_connected();
         self.state = state;
         self.extension_is_outdated = self.is_connected() && self.bridge.extension_is_outdated();
-        if self.is_connected() && !was_connected {
-            self.measure(cx);
+        // States can arrive merged, so a reconnect may never show as a disconnect.
+        // A changed set of connections is the reliable sign that the link is new.
+        let connections = self.bridge.connections();
+        if connections != self.measured {
+            self.measured = connections;
+            if self.is_connected() {
+                self.measure(cx);
+            }
         }
         cx.notify();
     }
