@@ -18,6 +18,7 @@ use gpui_kit::TestSupportExt as _;
 
 use crate::band::{Band, Cell, Mark};
 use crate::browser::{Browser, Fill, Latency, Subject};
+use crate::connections::Connections;
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
@@ -42,6 +43,8 @@ enum Showing {
     Jobs,
     /// What is due in TickTick.
     Mav,
+    /// The Google profiles, TickTick, the model and Chrome.
+    Connections,
 }
 
 pub struct MainView {
@@ -52,6 +55,7 @@ pub struct MainView {
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     mav: Entity<Mav>,
+    connections: Entity<Connections>,
     /// How many of the applications sent in this run Mav has offered a follow-up for.
     followed_up: usize,
     band: Band,
@@ -76,6 +80,7 @@ impl MainView {
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
         let mav = cx.new(|cx| Mav::new(background, window, cx));
+        let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let _subscriptions = vec![
             // The bar counts what is due.
             cx.observe(&mav, |_, _, cx| cx.notify()),
@@ -153,6 +158,7 @@ impl MainView {
             jobs,
             tabs,
             mav,
+            connections,
             followed_up: 0,
             band: Band::new(cells),
             funnel_status: None,
@@ -192,6 +198,9 @@ impl MainView {
                 mav.load(cx);
                 mav.focus(window, cx);
             }),
+            Showing::Connections => self
+                .connections
+                .update(cx, |connections, cx| connections.refresh(window, cx)),
         }
         cx.notify();
     }
@@ -321,7 +330,15 @@ impl MainView {
                             .truncate()
                             .child(status)
                     }))
-                    .child(self.link(palette, cx)),
+                    .child(self.link(palette, cx))
+                    .child(tab(
+                        "show-connections",
+                        "Connections".to_owned(),
+                        "connections",
+                        None,
+                        Showing::Connections,
+                        cx,
+                    )),
             )
     }
 
@@ -522,7 +539,7 @@ impl MainView {
                 Some(tab) => self.tab_pane(&tab, palette, cx),
                 None => v_flex(),
             },
-            Showing::Mav => v_flex(),
+            Showing::Mav | Showing::Connections => v_flex(),
         }
     }
 
@@ -868,9 +885,15 @@ impl Render for MainView {
             .child(self.bar(&palette, cx))
             .children(self.notices(&palette, cx))
             // The band tracks jobs, so the Mav view leaves it out.
-            .children((self.showing != Showing::Mav).then(|| self.band(&palette, cx)))
+            .children(matches!(self.showing, Showing::Jobs | Showing::Tabs).then(|| self.band(&palette, cx)))
             .child(if self.showing == Showing::Mav {
                 div().flex_1().min_h_0().child(self.mav.clone()).into_any_element()
+            } else if self.showing == Showing::Connections {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.connections.clone())
+                    .into_any_element()
             } else if connected {
                 h_flex()
                     .flex_1()
@@ -887,7 +910,7 @@ impl Render for MainView {
                                 Showing::Tabs => List::new(&self.tabs)
                                     .search_placeholder("search tabs")
                                     .into_any_element(),
-                                Showing::Jobs | Showing::Mav => List::new(&self.jobs)
+                                Showing::Jobs | Showing::Mav | Showing::Connections => List::new(&self.jobs)
                                     .search_placeholder("search jobs")
                                     .into_any_element(),
                             }),

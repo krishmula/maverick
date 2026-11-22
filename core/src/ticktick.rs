@@ -4,11 +4,12 @@
 //! (Account, API Token). The token lives in the Keychain, never in this repository.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan as _, ZonedDateTime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::credentials::{self, Password};
@@ -37,6 +38,65 @@ pub async fn save_token(token: &Password) -> Result<(), String> {
 
 pub async fn forget_token() -> Result<(), String> {
     credentials::forget(TOKEN_SERVICE, TOKEN_ACCOUNT).await
+}
+
+/// What the user set for TickTick under Connections.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Settings {
+    /// The id of the list new tasks go to when the user names none. `None` means the Inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_list: Option<String>,
+    /// The ids of the lists Mav leaves out. The Inbox is `inbox`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_lists: Vec<String>,
+}
+
+pub fn settings_path() -> Option<PathBuf> {
+    crate::data_dir().map(|dir| dir.join("ticktick.json"))
+}
+
+impl Settings {
+    /// The saved settings, or the defaults when there are none.
+    pub fn load(file: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(file) {
+            Ok(text) => {
+                serde_json::from_str(&text).map_err(|error| format!("{} did not parse: {error}", file.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("could not read {}: {error}", file.display())),
+        }
+    }
+
+    pub fn save(&self, file: &Path) -> Result<(), String> {
+        if let Some(folder) = file.parent() {
+            std::fs::create_dir_all(folder)
+                .map_err(|error| format!("could not create {}: {error}", folder.display()))?;
+        }
+        let text = serde_json::to_string_pretty(self).expect("settings always serialize");
+        std::fs::write(file, text + "\n").map_err(|error| format!("could not write {}: {error}", file.display()))
+    }
+
+    /// True when Mav shows the list with `id`.
+    pub fn shows(&self, id: &str) -> bool {
+        let id = if id.starts_with("inbox") { "inbox" } else { id };
+        !self.hidden_lists.iter().any(|hidden| hidden == id)
+    }
+
+    /// Shows or hides the list with `id`.
+    pub fn set_shown(&mut self, id: &str, shown: bool) {
+        let id = if id.starts_with("inbox") { "inbox" } else { id };
+        self.hidden_lists.retain(|hidden| hidden != id);
+        if !shown {
+            self.hidden_lists.push(id.to_owned());
+        }
+    }
+
+    /// Reads the saved settings, falling back to the defaults when the file is missing or broken.
+    pub fn current() -> Self {
+        settings_path()
+            .and_then(|file| Self::load(&file).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// A task as TickTick sends it. Only the fields Maverick reads.
@@ -258,7 +318,9 @@ pub async fn agenda(token: &Password, now: &ZonedDateTime) -> Result<Agenda, Str
         .checked_sub(OVERDUE_DAYS.days())
         .map_err(|error| error.to_string())?;
     let to = from.checked_add(MOST_DAYS.days()).map_err(|error| error.to_string())?;
-    let (projects, tasks) = tokio::try_join!(projects(token), undone(token, from.timestamp(), to.timestamp()))?;
+    let (projects, mut tasks) = tokio::try_join!(projects(token), undone(token, from.timestamp(), to.timestamp()))?;
+    let settings = Settings::current();
+    tasks.retain(|task| settings.shows(&task.project_id));
     Ok(Agenda::of(&tasks, &projects, now))
 }
 
@@ -394,6 +456,24 @@ mod tests {
 
         let undated = NewTask { due: None, ..all_day };
         assert!(new_task_body(&undated, &zone).get("dueDate").is_none());
+    }
+
+    #[test]
+    fn hidden_lists_are_kept_by_id_and_the_inbox_by_name() {
+        let mut settings = Settings::default();
+        settings.set_shown("inbox118293", false);
+        settings.set_shown("p2", false);
+        settings.set_shown("p2", false);
+        assert_eq!(settings.hidden_lists, ["inbox", "p2"]);
+        assert!(!settings.shows("inbox118293") && !settings.shows("p2") && settings.shows("p1"));
+        settings.set_shown("p2", true);
+        assert!(settings.shows("p2"));
+
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("ticktick.json");
+        assert_eq!(Settings::load(&file), Ok(Settings::default()));
+        settings.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), Ok(settings));
     }
 
     #[test]

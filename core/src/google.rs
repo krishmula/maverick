@@ -85,12 +85,64 @@ impl Client {
     }
 }
 
-/// A connected account. The refresh token is in the Keychain under its email address.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// The most Google accounts Maverick connects at once.
+pub const MOST_ACCOUNTS: usize = 5;
+
+/// A connected account, which the user names as a profile such as Work or School.
+/// The refresh token is in the Keychain under its email address.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Account {
     pub email: String,
     pub scopes: Vec<String>,
     pub connected_at: String,
+    /// The profile's name. `None` until the user names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The ids of the calendars Mav reads. Empty means the primary calendar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendars: Vec<String>,
+    /// True for the one account new calendar blocks go to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adds_blocks: bool,
+}
+
+impl Account {
+    /// The profile's name, or the email address before it has one.
+    pub fn name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.email)
+    }
+
+    pub fn can(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|granted| granted == scope)
+    }
+
+    /// True when the account lacks a permission Maverick now asks for, so it should sign in again.
+    pub fn needs_sign_in(&self) -> bool {
+        SCOPES
+            .iter()
+            .filter(|scope| scope.starts_with("https://"))
+            .any(|scope| !self.can(scope))
+    }
+}
+
+/// Changes the account with `email` and saves the file. Making one account the place new
+/// blocks go clears that mark from the others.
+pub fn update(file: &Path, email: &str, change: impl FnOnce(&mut Account)) -> Result<Account, String> {
+    let mut all = accounts(file)?;
+    let index = all
+        .iter()
+        .position(|account| account.email == email)
+        .ok_or_else(|| format!("{email} is not connected"))?;
+    let before = all[index].adds_blocks;
+    change(&mut all[index]);
+    if all[index].adds_blocks && !before {
+        for (other, account) in all.iter_mut().enumerate() {
+            account.adds_blocks = other == index;
+        }
+    }
+    let changed = all[index].clone();
+    save_accounts(file, &all)?;
+    Ok(changed)
 }
 
 /// The accounts file in the data directory.
@@ -115,14 +167,29 @@ fn save_accounts(file: &Path, accounts: &[Account]) -> Result<(), String> {
     std::fs::write(file, text + "\n").map_err(|error| format!("could not write {}: {error}", file.display()))
 }
 
-/// Adds `account` to the file, or replaces the entry with the same email.
-fn remember(file: &Path, account: Account) -> Result<(), String> {
+/// Adds `account` to the file, or refreshes the entry with the same email and keeps
+/// what the user set on it. A new account beyond the limit is refused.
+fn remember(file: &Path, account: Account) -> Result<Account, String> {
     let mut all = accounts(file)?;
-    match all.iter_mut().find(|known| known.email == account.email) {
-        Some(known) => *known = account,
-        None => all.push(account),
-    }
-    save_accounts(file, &all)
+    let kept = match all.iter().position(|known| known.email == account.email) {
+        Some(index) => {
+            all[index].scopes = account.scopes;
+            all[index].connected_at = account.connected_at;
+            all[index].clone()
+        }
+        None if all.len() >= MOST_ACCOUNTS => {
+            return Err(format!(
+                "{MOST_ACCOUNTS} Google accounts are connected already; disconnect one before adding {}",
+                account.email
+            ));
+        }
+        None => {
+            all.push(account.clone());
+            account
+        }
+    };
+    save_accounts(file, &all)?;
+    Ok(kept)
 }
 
 /// Signs one account in through the browser and stores it. `open` shows the sign-in page.
@@ -153,6 +220,15 @@ pub async fn connect(client: &Client, file: &Path, open: impl FnOnce(&str)) -> R
     )
     .await?;
     let email = email_in(&reply)?;
+    if !accounts(file)?.iter().any(|known| known.email == email) && accounts(file)?.len() >= MOST_ACCOUNTS {
+        // The grant is new, so Google forgets it again rather than keep an account Maverick will not use.
+        if let Some(refresh) = reply["refresh_token"].as_str() {
+            let _ = post_form(REVOKE, &[("token", refresh)]).await;
+        }
+        return Err(format!(
+            "{MOST_ACCOUNTS} Google accounts are connected already; disconnect one before adding {email}"
+        ));
+    }
     let refresh = reply["refresh_token"]
         .as_str()
         .ok_or("Google gave no refresh token; remove Maverick's access in the account's settings and connect again")?;
@@ -166,9 +242,9 @@ pub async fn connect(client: &Client, file: &Path, open: impl FnOnce(&str)) -> R
             .map(str::to_owned)
             .collect(),
         connected_at: Timestamp::now().to_string(),
+        ..Account::default()
     };
-    remember(file, account.clone())?;
-    Ok(account)
+    remember(file, account)
 }
 
 /// Removes an account: Google forgets the grant, then the Keychain and the file forget the account.
@@ -405,13 +481,69 @@ mod tests {
             email: email.into(),
             scopes: vec![scope.into()],
             connected_at: "2026-11-22T17:00:00Z".into(),
+            ..Account::default()
         };
         remember(&file, account("ada@example.com", "email")).unwrap();
         remember(&file, account("bo@example.com", "email")).unwrap();
+        update(&file, "ada@example.com", |ada| ada.label = Some("Work".into())).unwrap();
         remember(&file, account("ada@example.com", SHEETS)).unwrap();
-        assert_eq!(
-            accounts(&file).unwrap(),
-            [account("ada@example.com", SHEETS), account("bo@example.com", "email")]
-        );
+        let mut ada = account("ada@example.com", SHEETS);
+        ada.label = Some("Work".into());
+        assert_eq!(accounts(&file).unwrap(), [ada, account("bo@example.com", "email")]);
+    }
+
+    #[test]
+    fn no_more_than_five_accounts_are_kept() {
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("google-accounts.json");
+        let account = |n: usize| Account {
+            email: format!("p{n}@example.com"),
+            ..Account::default()
+        };
+        for n in 0..MOST_ACCOUNTS {
+            remember(&file, account(n)).unwrap();
+        }
+        assert!(remember(&file, account(9)).unwrap_err().contains("disconnect one"));
+        // An account already connected can always sign in again.
+        assert!(remember(&file, account(0)).is_ok());
+        assert_eq!(accounts(&file).unwrap().len(), MOST_ACCOUNTS);
+    }
+
+    #[test]
+    fn only_one_account_takes_new_blocks() {
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("google-accounts.json");
+        for email in ["a@example.com", "b@example.com"] {
+            remember(
+                &file,
+                Account {
+                    email: email.into(),
+                    ..Account::default()
+                },
+            )
+            .unwrap();
+        }
+        update(&file, "a@example.com", |a| a.adds_blocks = true).unwrap();
+        update(&file, "b@example.com", |b| b.adds_blocks = true).unwrap();
+        let marked: Vec<bool> = accounts(&file)
+            .unwrap()
+            .iter()
+            .map(|account| account.adds_blocks)
+            .collect();
+        assert_eq!(marked, [false, true]);
+    }
+
+    #[test]
+    fn an_account_without_a_permission_maverick_asks_for_should_sign_in_again() {
+        let old = Account {
+            scopes: vec![CALENDAR_READ.into()],
+            ..Account::default()
+        };
+        assert!(old.needs_sign_in());
+        let current = Account {
+            scopes: SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            ..Account::default()
+        };
+        assert!(!current.needs_sign_in());
     }
 }

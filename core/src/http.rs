@@ -107,7 +107,7 @@ pub(crate) fn quoted(text: &str) -> String {
     out
 }
 
-pub(crate) fn form_encoded(text: &str) -> String {
+pub fn form_encoded(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {

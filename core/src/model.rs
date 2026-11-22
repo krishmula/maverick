@@ -109,6 +109,14 @@ pub(crate) async fn run(instructions: &str, request: String, schema: &Value) -> 
     Ok(reply)
 }
 
+/// True when the `claude` command can be found.
+pub fn claude_found() -> bool {
+    let command = claude_command();
+    command.is_absolute()
+        || std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&command).is_file()))
+}
+
 /// `claude` is often installed where an app started from the Dock does not look.
 fn claude_command() -> PathBuf {
     dirs::home_dir()

@@ -44,7 +44,7 @@ After an app update, Maverick asks the extension to reload itself. Extension 0.2
 
 ## The window
 
-The bar at the top switches between the **jobs** and **tabs** lists and the **mav** view, and shows the link to Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
+The bar at the top switches between the **jobs** and **tabs** lists and the **mav** view, and shows the link to Chrome. **connections** at the right end sets up Google, TickTick, the model and Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
 
 On the jobs and tabs lists, the band is under the bar. Each cell is one posting from your tracker, oldest at the left:
 
@@ -239,9 +239,17 @@ Mav runs the `claude` command you are signed in to, like the form filler. To see
 maverick mav "find me 2 hours tomorrow for take-home prep"
 ```
 
+### Connections
+
+**connections** in the bar shows everything Maverick is linked to:
+
+- **Google profiles.** Up to 5 Google accounts, each named by you, such as Work or School. Click a profile to rename it, choose which of its calendars Mav reads (the primary one unless you choose others), and mark the one profile new calendar blocks go to. Mav knows the names, so "put it on my school calendar" goes to School. **sign in again** in orange means the account has not granted something Maverick now asks for, such as adding events. **+ add account** opens the Google sign-in in your browser.
+- **TickTick.** Paste your API token to connect. Choose the list new tasks go to, and which lists Mav shows.
+- **Model and Chrome.** Whether the `claude` command is found, and whether Chrome is connected.
+
 ### Connect TickTick
 
-Maverick uses a personal API token. In TickTick on the web, open **Settings**, then **Account**, then **API Token**, and create one. Then store it:
+Maverick uses a personal API token. In TickTick on the web, open **Settings**, then **Account**, then **API Token**, and create one. Paste it under **connections**, or store it from the terminal:
 
 ```sh
 maverick ticktick token < file-with-the-token   # checks the token with TickTick, then stores it
@@ -253,7 +261,7 @@ The token is kept in the macOS Keychain under `dev.maverick.ticktick`.
 
 ### Connect your calendar
 
-Mav reads the primary calendar of every Google account you connected (see [Connect Google accounts](#connect-google-accounts)). It adds blocks to the first account that granted permission to change events. An account connected before that permission was added only allows reading: run `maverick google add` and sign in to that account again to grant it.
+Mav reads the calendars you chose in each Google profile under **connections** (see also [Connect Google accounts](#connect-google-accounts)). It adds blocks to the profile you name, or else to the one marked for new blocks. An account connected before that permission was added only allows reading: click **sign in again** on its profile.
 
 Free time is counted between 8:00 and 22:00. Events marked free do not block time.
 

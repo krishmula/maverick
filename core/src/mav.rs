@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::calendar::{self, Event, Slot};
+use crate::google;
 use crate::model;
 use crate::ticktick::{self, Agenda, Due, NewTask, Project};
 
@@ -24,7 +25,8 @@ A task with no time the user named gets a date only, or no date if none was name
 remind_minutes_before is 0 when the user asks to be reminded at the time, null when they did not ask for a reminder. \
 A block needs a date, a time and an end_time. When the user asks you to find time, choose from the free time listed, \
 the earliest stretch that fits, and never one that overlaps an event. \
-list is the exact name of one of the user's lists, or null for the Inbox. \
+list is the exact name of one of the user's lists, or null for their default list. \
+calendar is the exact name of one of the user's Google profiles when they say which calendar a block goes on, such as work or school, otherwise null. \
 For a question about their schedule or tasks, answer from what you see, with no proposals. \
 In reply, say in one or two short plain sentences what you propose or what you found. No em dashes. \
 Never invent tasks or events.";
@@ -37,6 +39,9 @@ pub struct Context {
     pub agenda: Agenda,
     /// The calendar from the start of today through the coming week.
     pub events: Vec<Event>,
+    /// The names of the user's Google profiles.
+    pub profiles: Vec<String>,
+    pub ticktick: ticktick::Settings,
 }
 
 impl Context {
@@ -55,11 +60,20 @@ impl Context {
         };
         let events = calendar::events(start.timestamp(), end.timestamp(), now.time_zone());
         let ((lists, agenda), events) = tokio::try_join!(ticktick, events)?;
+        let profiles = match google::accounts_path() {
+            Some(file) => google::accounts(&file)?
+                .iter()
+                .map(|account| account.name().to_owned())
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(Context {
             now,
             lists,
             agenda,
             events,
+            profiles,
+            ticktick: ticktick::Settings::current(),
         })
     }
 
@@ -85,6 +99,9 @@ impl Context {
         for list in self.lists.iter().filter(|list| !list.closed) {
             let _ = write!(text, ", {}", list.name);
         }
+        if !self.profiles.is_empty() {
+            let _ = write!(text, "\nGoogle profiles: {}", self.profiles.join(", "));
+        }
         text.push_str("\n\nUndone tasks:\n");
         let sections = [
             ("overdue", &self.agenda.overdue),
@@ -109,7 +126,13 @@ impl Context {
                 calendar::Span::At(start, _) => start.strftime("%a %Y-%m-%d").to_string(),
             };
             let free = if event.busy { "" } else { ", marked free" };
-            let _ = writeln!(text, "- {day} {}: {}{free}", event.hours(), event.title);
+            let _ = writeln!(
+                text,
+                "- {day} {}: {} [{}]{free}",
+                event.hours(),
+                event.title,
+                event.profile
+            );
         }
         text.push_str("\nFree time:\n");
         for slot in self.free() {
@@ -143,6 +166,8 @@ pub struct Draft {
     pub time: Option<String>,
     pub end_time: Option<String>,
     pub remind_minutes_before: Option<i64>,
+    /// The Google profile a block goes on.
+    pub calendar: Option<String>,
 }
 
 /// What Mav says back.
@@ -167,6 +192,8 @@ pub enum Action {
         end: ZonedDateTime,
         /// The busy events it overlaps, which the user should see before confirming.
         clashes: Vec<String>,
+        /// The Google profile it goes to. `None` means the one marked for new blocks.
+        profile: Option<String>,
     },
 }
 
@@ -210,12 +237,17 @@ impl Action {
                 facts
             }
             Action::Block {
-                start, end, clashes, ..
+                start,
+                end,
+                clashes,
+                profile,
+                ..
             } => {
                 let mut facts = vec![(
                     "When",
                     format!("{} to {}", start.strftime("%a %-d %b · %H:%M"), end.strftime("%H:%M")),
                 )];
+                facts.push(("Calendar", profile.clone().unwrap_or_else(|| "default".to_owned())));
                 if !clashes.is_empty() {
                     facts.push(("Clashes", clashes.join(", ")));
                 }
@@ -238,9 +270,15 @@ impl Action {
                 ticktick::create(&token, task, &zone).await?;
                 Ok(format!("Added to {list} in TickTick"))
             }
-            Action::Block { title, start, end, .. } => {
-                let account = calendar::add(title, start, end).await?;
-                Ok(format!("Added to the calendar of {account}"))
+            Action::Block {
+                title,
+                start,
+                end,
+                profile,
+                ..
+            } => {
+                let account = calendar::add(title, start, end, profile.as_deref()).await?;
+                Ok(format!("Added to the {account} calendar"))
             }
         }
     }
@@ -285,8 +323,9 @@ fn schema() -> Value {
                         "time": { "type": ["string", "null"], "description": "HH:MM, 24-hour" },
                         "end_time": { "type": ["string", "null"], "description": "HH:MM, 24-hour, blocks only" },
                         "remind_minutes_before": maybe("integer"),
+                        "calendar": maybe("string"),
                     },
-                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before"],
+                    "required": ["kind", "title", "list", "date", "time", "end_time", "remind_minutes_before", "calendar"],
                     "additionalProperties": false,
                 },
             },
@@ -325,7 +364,13 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
     };
     match draft.kind.as_str() {
         "task" => {
-            let (list_id, list) = list_named(draft.list.as_deref(), &context.lists);
+            let default = context
+                .ticktick
+                .default_list
+                .as_deref()
+                .and_then(|id| context.lists.iter().find(|list| list.id == id))
+                .map(|list| list.name.as_str());
+            let (list_id, list) = list_named(draft.list.as_deref().or(default), &context.lists);
             let due = match (date, start) {
                 (Some(date), Some(time)) => Some(Due::At(at(date, time)?)),
                 (Some(date), None) => Some(Due::Day(date)),
@@ -354,11 +399,23 @@ pub fn check(draft: &Draft, context: &Context) -> Result<Action, String> {
                 .into_iter()
                 .map(|event| event.title.clone())
                 .collect();
+            let profile = match draft.calendar.as_deref() {
+                None => None,
+                Some(name) => Some(
+                    context
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.eq_ignore_ascii_case(name.trim()))
+                        .cloned()
+                        .ok_or_else(|| format!("Mav named a calendar Maverick does not have: {name}"))?,
+                ),
+            };
             Ok(Action::Block {
                 title: title.to_owned(),
                 start,
                 end,
                 clashes,
+                profile,
             })
         }
         other => Err(format!("Mav proposed a kind of thing Maverick cannot do: {other}")),
@@ -432,9 +489,15 @@ mod tests {
             agenda: Agenda::default(),
             events: vec![Event {
                 title: "Screen".into(),
+                profile: "Work".into(),
                 span: Span::At(at(10), at(11)),
                 busy: true,
             }],
+            profiles: vec!["Work".into(), "School".into()],
+            ticktick: ticktick::Settings {
+                default_list: Some("p1".into()),
+                hidden_lists: Vec::new(),
+            },
         }
     }
 
@@ -508,9 +571,31 @@ mod tests {
             action.facts(),
             [
                 ("When", "Mon 23 Nov · 10:30 to 12:00".to_owned()),
+                ("Calendar", "default".to_owned()),
                 ("Clashes", "Screen".to_owned())
             ]
         );
+        let school = Draft {
+            calendar: Some("school".into()),
+            ..over.clone()
+        };
+        let Ok(Action::Block { profile, .. }) = check(&school, &context) else {
+            panic!("not a block")
+        };
+        assert_eq!(profile.as_deref(), Some("School"));
+        let gym = Draft {
+            calendar: Some("Gym".into()),
+            ..over
+        };
+        assert!(check(&gym, &context).unwrap_err().contains("Gym"));
+    }
+
+    #[test]
+    fn a_task_with_no_list_goes_to_the_default_list() {
+        let Ok(Action::Task { task, list }) = check(&draft("task"), &context()) else {
+            panic!("not a task")
+        };
+        assert_eq!((task.list_id.as_str(), list.as_str()), ("p1", "Job search"));
     }
 
     #[test]
@@ -545,7 +630,8 @@ mod tests {
         let described = context().describe();
         assert!(described.contains("Now: Sunday 2026-11-22 16:00 (America/Los_Angeles)"));
         assert!(described.contains("TickTick lists: Inbox, Job search\n"));
-        assert!(described.contains("- Mon 2026-11-23 10:00 to 11:00: Screen"));
+        assert!(described.contains("- Mon 2026-11-23 10:00 to 11:00: Screen [Work]"));
+        assert!(described.contains("Google profiles: Work, School"));
         assert!(described.contains("- Mon 2026-11-23 08:00 to 10:00 (2 h)"));
     }
 
