@@ -29,6 +29,14 @@ pub enum Fill {
     Failed { title: String, reason: String },
 }
 
+/// What a fill run is about, so a view can tell whether the run belongs to the row it shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Subject {
+    /// A posting from the jobs list, by its address.
+    Posting(String),
+    Tab(ConnectionId, i32),
+}
+
 /// An application the user submitted in this run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Applied {
@@ -55,6 +63,9 @@ pub struct Browser {
     measures: u64,
     extension_is_outdated: bool,
     fill: Fill,
+    subject: Option<Subject>,
+    /// The tab the last finished fill left its form in.
+    filled_tab: Option<Tab>,
     state: BrowserState,
     latency: Latency,
     failure: Option<String>,
@@ -91,6 +102,8 @@ impl Browser {
             measures: 0,
             extension_is_outdated: false,
             fill: Fill::Idle,
+            subject: None,
+            filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
             _watch,
@@ -181,25 +194,41 @@ impl Browser {
         &self.applied
     }
 
+    #[cfg(test)]
     pub fn fill(&self) -> &Fill {
         &self.fill
     }
 
+    /// The latest fill run, when it is about `subject`.
+    pub fn fill_of(&self, subject: &Subject) -> Option<&Fill> {
+        (self.subject.as_ref() == Some(subject) && self.fill != Fill::Idle).then_some(&self.fill)
+    }
+
+    /// Brings the tab with the last filled form forward, so the user can review it and submit.
+    pub fn review(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.filled_tab.clone() {
+            self.activate(&tab, cx);
+        }
+    }
+
     /// Fills the application form in a tab with the standard answers. It never submits the form.
     pub fn fill_form(&mut self, tab: &Tab, cx: &mut Context<Self>) {
-        self.start_fill(tab.tab.title.clone(), Target::Tab(tab.clone()), cx);
+        let subject = Subject::Tab(tab.connection, tab.tab.id);
+        self.start_fill(tab.tab.title.clone(), subject, Target::Tab(tab.clone()), cx);
     }
 
     /// Opens a posting's application form in a new tab and fills it. It never submits the form.
     pub fn apply(&mut self, title: String, address: String, cx: &mut Context<Self>) {
-        self.start_fill(title, Target::Posting(address), cx);
+        self.start_fill(title, Subject::Posting(address.clone()), Target::Posting(address), cx);
     }
 
-    fn start_fill(&mut self, title: String, target: Target, cx: &mut Context<Self>) {
+    fn start_fill(&mut self, title: String, subject: Subject, target: Target, cx: &mut Context<Self>) {
         if matches!(self.fill, Fill::Running { .. }) {
             return;
         }
         self.fill = Fill::Running { title: title.clone() };
+        self.subject = Some(subject);
+        self.filled_tab = None;
         cx.notify();
         let filled = self.background.spawn(fill_form(
             self.bridge.clone(),
@@ -228,6 +257,7 @@ impl Browser {
             this.update(cx, |this, cx| {
                 this.fill = fill;
                 if let Some(filled) = filled {
+                    this.filled_tab = Some(filled.tab.clone());
                     this.watch_for_submit(filled, cx);
                 }
                 cx.notify();
@@ -289,6 +319,7 @@ impl Browser {
     pub fn dismiss_fill(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.fill, Fill::Running { .. }) {
             self.fill = Fill::Idle;
+            self.subject = None;
             cx.notify();
         }
     }
