@@ -92,7 +92,8 @@ impl MainView {
         let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
-        let mav = cx.new(|cx| Mav::new(background, window, cx));
+        let database = browser.read(cx).database();
+        let mav = cx.new(|cx| Mav::new(background, database, window, cx));
         let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let setup = cx.new(|cx| Setup::new(connections.clone(), cx));
         let _subscriptions = vec![

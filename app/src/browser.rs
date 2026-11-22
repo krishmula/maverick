@@ -184,6 +184,11 @@ impl Browser {
         .detach();
     }
 
+    /// The local database, where applications and Mav's chats are kept.
+    pub fn database(&self) -> Option<PathBuf> {
+        self.database.clone()
+    }
+
     /// The tokio runtime that runs work off the main thread.
     pub fn background(&self) -> Handle {
         self.background.clone()

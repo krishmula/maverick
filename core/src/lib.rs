@@ -5,6 +5,7 @@ pub mod apply;
 pub mod ashby;
 pub mod bridge;
 pub mod calendar;
+pub mod chats;
 pub mod credentials;
 pub mod description;
 pub mod extension;

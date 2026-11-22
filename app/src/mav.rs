@@ -10,7 +10,9 @@ use gpui_kit::{
 };
 use jiff::ZonedDateTime;
 use maverick_core::calendar::{self, Event, Slot, Stretch};
+use maverick_core::chats::{Chat, Line};
 use maverick_core::mav::{self, Action, Context as Seen, Speaker};
+use maverick_core::store::Store;
 use maverick_core::ticktick::{self, Board, Change, Entry, NewTask, Priority, Project};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -86,11 +88,38 @@ pub enum Item {
     Proposal(Box<Action>, Card),
     /// A proposal Maverick could not use, and why.
     Refused(String),
+    /// A proposal from a saved chat: what its card showed and how it ended. It cannot be confirmed again.
+    Past {
+        label: String,
+        title: String,
+        facts: Vec<(String, String)>,
+        outcome: String,
+    },
 }
+
+/// What a card's state reads as in a saved chat.
+fn outcome_of(card: &Card) -> String {
+    match card {
+        Card::Proposed | Card::Adding => "proposed".to_owned(),
+        Card::Skipped => "skipped".to_owned(),
+        Card::Done(done) => done.to_lowercase(),
+        Card::Failed(error) => format!("failed: {error}"),
+    }
+}
+
+/// How many chats the list shows.
+const CHATS_SHOWN: usize = 50;
 
 pub struct Mav {
     loaded: Loaded,
     items: Vec<Item>,
+    /// The saved line behind each item, by position. `None` when nothing is saved.
+    lines: Vec<Option<i64>>,
+    /// The local database that keeps chats. `None` keeps nothing, as in tests.
+    database: Option<std::path::PathBuf>,
+    /// The open chat, once it has its first line.
+    chat: Option<i64>,
+    chats: Vec<Chat>,
     /// True while Mav works out an answer.
     thinking: bool,
     input: Entity<InputState>,
@@ -115,7 +144,12 @@ pub struct Mav {
 }
 
 impl Mav {
-    pub fn new(background: Handle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        background: Handle,
+        database: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Tell Mav what to remember or plan"));
         let _typed = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
@@ -137,6 +171,10 @@ impl Mav {
         Self {
             loaded: Loaded::Not,
             items: Vec::new(),
+            lines: Vec::new(),
+            database,
+            chat: None,
+            chats: Vec::new(),
             thinking: false,
             input,
             background,
@@ -153,6 +191,121 @@ impl Mav {
             _added,
             _blocked,
         }
+    }
+
+    fn store(&self) -> Option<Store> {
+        let path = self.database.as_deref()?;
+        Store::open(path).ok()
+    }
+
+    /// Reads the list of chats again.
+    fn load_chats(&mut self) {
+        if let Some(store) = self.store() {
+            self.chats = store.chats(CHATS_SHOWN).unwrap_or_default();
+        }
+    }
+
+    /// Shows an item and saves it in the open chat, starting the chat on its first line.
+    fn push(&mut self, item: Item) {
+        let line = match &item {
+            Item::Said(Speaker::User, text) => Some(Line::User { text: text.clone() }),
+            Item::Said(Speaker::Mav, text) => Some(Line::Mav { text: text.clone() }),
+            Item::Refused(text) => Some(Line::Refused { text: text.clone() }),
+            Item::Proposal(action, card) => Some(Line::Proposal {
+                label: action.kind().to_owned(),
+                title: action.title().to_owned(),
+                facts: action
+                    .facts()
+                    .into_iter()
+                    .map(|(label, value)| (label.to_owned(), value))
+                    .collect(),
+                outcome: outcome_of(card),
+            }),
+            Item::Past { .. } => None,
+        };
+        let saved = line.and_then(|line| {
+            let store = self.store()?;
+            let now = jiff::Timestamp::now();
+            let chat = match self.chat {
+                Some(chat) => chat,
+                None => {
+                    let title = match &line {
+                        Line::User { text } | Line::Mav { text } | Line::Refused { text } => text.clone(),
+                        Line::Proposal { title, .. } => title.clone(),
+                    };
+                    let chat = store.new_chat(&title, now).ok()?;
+                    self.chat = Some(chat);
+                    chat
+                }
+            };
+            store.add_line(chat, &line, now).ok()
+        });
+        self.items.push(item);
+        self.lines.push(saved);
+        self.load_chats();
+    }
+
+    /// Saves how the proposal at `index` ended.
+    fn save_outcome(&self, index: usize) {
+        let (Some(Some(line)), Some(Item::Proposal(_, card))) = (self.lines.get(index), self.items.get(index)) else {
+            return;
+        };
+        if let Some(store) = self.store() {
+            let _ = store.set_outcome(*line, &outcome_of(card));
+        }
+    }
+
+    /// Starts a new, empty chat.
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat = None;
+        self.items.clear();
+        self.lines.clear();
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Opens a saved chat. Its proposals show how they ended and cannot be confirmed again.
+    fn open_chat(&mut self, chat: i64, cx: &mut Context<Self>) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let Ok(lines) = store.lines(chat) else {
+            return;
+        };
+        self.chat = Some(chat);
+        self.items.clear();
+        self.lines.clear();
+        for (id, line) in lines {
+            self.items.push(match line {
+                Line::User { text } => Item::Said(Speaker::User, text),
+                Line::Mav { text } => Item::Said(Speaker::Mav, text),
+                Line::Refused { text } => Item::Refused(text),
+                Line::Proposal {
+                    label,
+                    title,
+                    facts,
+                    outcome,
+                } => Item::Past {
+                    label,
+                    title,
+                    facts,
+                    outcome,
+                },
+            });
+            self.lines.push(Some(id));
+        }
+        cx.notify();
+    }
+
+    fn delete_chat(&mut self, chat: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.delete_chat(chat);
+        }
+        if self.chat == Some(chat) {
+            self.new_chat(window, cx);
+        }
+        self.load_chats();
+        cx.notify();
     }
 
     /// Runs one TickTick write from the side panel, then reads everything again.
@@ -304,6 +457,7 @@ impl Mav {
 
     /// Reads TickTick and the calendar again. What is on screen stays until the new read arrives.
     pub fn load(&mut self, cx: &mut Context<Self>) {
+        self.load_chats();
         if matches!(self.loaded, Loaded::Not | Loaded::Failed(_)) {
             self.loaded = Loaded::Loading;
             cx.notify();
@@ -356,7 +510,7 @@ impl Mav {
                 _ => None,
             })
             .collect();
-        self.items.push(Item::Said(Speaker::User, message.clone()));
+        self.push(Item::Said(Speaker::User, message.clone()));
         self.thinking = true;
         cx.notify();
         let asked = self.background.spawn(async move {
@@ -377,7 +531,7 @@ impl Mav {
                         this.loaded = ready(seen);
                         this.answer(reply, cx);
                     }
-                    Err(error) => this.items.push(Item::Refused(format!("Mav could not answer: {error}"))),
+                    Err(error) => this.push(Item::Refused(format!("Mav could not answer: {error}"))),
                 }
                 cx.notify();
             })
@@ -388,10 +542,10 @@ impl Mav {
 
     pub fn answer(&mut self, reply: mav::Reply, cx: &mut Context<Self>) {
         if !reply.text.is_empty() {
-            self.items.push(Item::Said(Speaker::Mav, reply.text));
+            self.push(Item::Said(Speaker::Mav, reply.text));
         }
         for proposal in reply.proposals {
-            self.items.push(match proposal {
+            self.push(match proposal {
                 Ok(action) => Item::Proposal(Box::new(action), Card::Proposed),
                 Err(why) => Item::Refused(why),
             });
@@ -401,8 +555,8 @@ impl Mav {
 
     /// Offers a proposal Mav came up with itself, such as a follow-up after an application.
     pub fn suggest(&mut self, why: String, action: Action, cx: &mut Context<Self>) {
-        self.items.push(Item::Said(Speaker::Mav, why));
-        self.items.push(Item::Proposal(Box::new(action), Card::Proposed));
+        self.push(Item::Said(Speaker::Mav, why));
+        self.push(Item::Proposal(Box::new(action), Card::Proposed));
         cx.notify();
     }
 
@@ -428,6 +582,7 @@ impl Mav {
                 if let Some(Item::Proposal(_, shown)) = this.items.get_mut(index) {
                     *shown = card;
                 }
+                this.save_outcome(index);
                 if done {
                     this.load(cx);
                 }
@@ -443,6 +598,7 @@ impl Mav {
             && matches!(card, Card::Proposed | Card::Failed(_))
         {
             *card = Card::Skipped;
+            self.save_outcome(index);
             cx.notify();
         }
     }
@@ -467,6 +623,7 @@ impl Render for Mav {
         h_flex()
             .size_full()
             .items_start()
+            .child(self.history(&palette, cx))
             .child(self.chat(&palette, cx))
             .child(if self.view.collapsed {
                 self.strip(&palette, cx).into_any_element()
@@ -476,7 +633,108 @@ impl Render for Mav {
     }
 }
 
+/// A proposal from a saved chat, with how it ended instead of buttons.
+fn past_card(
+    index: usize,
+    label: &str,
+    title: &str,
+    facts: &[(String, String)],
+    outcome: &str,
+    palette: &Palette,
+) -> Div {
+    let color = if outcome.starts_with("failed") {
+        palette.signal(Signal::Failed)
+    } else if outcome == "proposed" || outcome == "skipped" {
+        palette.faint
+    } else {
+        palette.signal(Signal::Done)
+    };
+    v_flex()
+        .max_w(px(560.))
+        .gap(px(8.))
+        .px(px(14.))
+        .py(px(12.))
+        .border_1()
+        .border_color(palette.line)
+        .child(
+            div()
+                .id(("card", index))
+                .test_support()
+                .role(gpui_kit::Role::Label)
+                .aria_label(format!("{label} · {title} · {outcome}"))
+                .child(ui::boxed(label, palette.muted)),
+        )
+        .child(ui::serif(title.to_owned()).text_size(px(16.)).line_height(px(21.)))
+        .children(facts.iter().map(|(label, value)| {
+            h_flex()
+                .gap(px(10.))
+                .child(ui::caps(label).w(px(70.)).flex_none().text_color(palette.faint))
+                .child(div().text_size(px(12.)).child(value.clone()))
+        }))
+        .child(ui::caps(outcome).text_color(color))
+}
+
 impl Mav {
+    /// The list of saved chats, with a way to start a new one.
+    fn history(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.chats.iter().map(|chat| {
+            let open = self.chat == Some(chat.id);
+            let (id, gone) = (chat.id, chat.id);
+            let when = chat
+                .updated_at
+                .to_zoned_datetime(jiff::tz::TimeZone::system())
+                .strftime("%a %-d %b · %-I:%M %p")
+                .to_string();
+            let row = v_flex()
+                .id(("chat", chat.id as usize))
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(chat.title.clone())
+                .px(px(8.))
+                .py(px(6.))
+                .gap(px(2.))
+                .cursor_pointer()
+                .child(ui::serif(chat.title.clone()).text_size(px(13.5)).line_height(px(17.)))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .child(ui::caps(when).text_color(palette.faint))
+                        .children(open.then(|| {
+                            ui::button(
+                                ("delete-chat", gone as usize),
+                                "Delete this chat",
+                                ui::caps("delete").text_color(palette.faint),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| this.delete_chat(gone, window, cx)))
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.open_chat(id, cx)));
+            if open { row.bg(palette.line.opacity(0.6)) } else { row }
+        });
+        v_flex()
+            .id("chat-history")
+            .flex_none()
+            .w(px(210.))
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(12.))
+            .py(px(16.))
+            .gap(px(2.))
+            .border_r_1()
+            .border_color(palette.line)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .pb(px(8.))
+                    .child(ui::caps("chats").text_color(palette.muted))
+                    .child(
+                        ui::button("new-chat", "Start a new chat", ui::quiet_face("+ new", palette))
+                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+                    ),
+            )
+            .children(rows)
+    }
+
     fn chat(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
         let intro = "Tell Mav what to remember or plan. It proposes TickTick tasks and calendar blocks, \
                      and adds each one only when you confirm it.";
@@ -543,6 +801,12 @@ impl Mav {
                 .child(ui::serif(text.clone()).max_w(px(560.))),
             Item::Refused(why) => v_flex().child(ui::serif(why.clone()).text_color(palette.signal(Signal::Failed))),
             Item::Proposal(action, card) => self.card(index, action, card, palette, cx),
+            Item::Past {
+                label,
+                title,
+                facts,
+                outcome,
+            } => past_card(index, label, title, facts, outcome, palette),
         }
     }
 
@@ -1095,7 +1359,7 @@ mod tests {
         let background = runtime.handle().clone();
         let (window, mav) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| Mav::new(background, window, cx))
+                cx.new(|cx| Mav::new(background, None, window, cx))
             })
             .unwrap()
         });
@@ -1205,6 +1469,60 @@ mod tests {
                 Some("TickTick · New task · Call the bank · skipped")
             );
             assert!(matches!(mav.read(cx).items()[1], Item::Proposal(_, Card::Skipped)));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn chats_are_saved_and_reopen_with_how_each_card_ended(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let background = runtime.handle().clone();
+        let (window, mav) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Mav::new(background, Some(database), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            mav.update(cx, |mav, cx| {
+                mav.push(Item::Said(
+                    maverick_core::mav::Speaker::User,
+                    "remind me to call the bank".into(),
+                ));
+                mav.answer(
+                    Reply {
+                        text: "I propose a task.".into(),
+                        proposals: vec![Ok(task("Call the bank"))],
+                    },
+                    cx,
+                );
+                mav.skip(2, cx);
+            });
+            window.render_frame(cx);
+            let chat = mav.read(cx).chat.expect("the first line started a chat");
+            assert_eq!(
+                window.find(("chat", chat as usize)).label(),
+                Some("remind me to call the bank")
+            );
+
+            mav.update(cx, |mav, cx| mav.new_chat(window, cx));
+            window.render_frame(cx);
+            assert!(mav.read(cx).items().is_empty());
+
+            mav.update(cx, |mav, cx| mav.open_chat(chat, cx));
+            window.render_frame(cx);
+            assert_eq!(mav.read(cx).items().len(), 3);
+            assert_eq!(
+                window.find(("card", 2usize)).label(),
+                Some("TickTick · New task · Call the bank · skipped")
+            );
+            assert!(window.try_find(("confirm", 2usize)).is_none());
         })
         .unwrap();
     }
