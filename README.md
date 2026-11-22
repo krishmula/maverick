@@ -245,7 +245,32 @@ maverick mav "find me 2 hours tomorrow for take-home prep"
 
 - **Google profiles.** Up to 5 Google accounts, each named by you, such as Work or School. Click a profile to rename it, choose which of its calendars Mav reads (the primary one unless you choose others), and mark the one profile new calendar blocks go to. Mav knows the names, so "put it on my school calendar" goes to School. **sign in again** in orange means the account has not granted something Maverick now asks for, such as adding events. **+ add account** opens the Google sign-in in your browser.
 - **TickTick.** Paste your API token to connect. Choose the list new tasks go to, and which lists Mav shows.
-- **Model and Chrome.** Whether the `claude` command is found, and whether Chrome is connected.
+- **Models.** Which model providers can run, and which provider and model each job uses: Mav chat, form filling and scoring. See [Choose the models](#choose-the-models).
+- **Chrome.** Whether Chrome is connected.
+
+### Choose the models
+
+Maverick can run its model calls through a command line tool you are signed in to, or through an API key:
+
+| Provider | Kind | Set up |
+|---|---|---|
+| Claude Code | command | install it and run `claude` once to sign in |
+| Codex | command | `npm i -g @openai/codex`, then `codex login` |
+| OpenCode | command | install from opencode.ai, then `opencode auth login` |
+| Anthropic | API key | create a key at platform.claude.com |
+| OpenAI | API key | create a key at platform.openai.com |
+| OpenRouter | API key | create a key at openrouter.ai |
+
+Under **connections**, paste an API key and press Enter: Maverick checks it with the provider before it counts as ready, and keeps it in the macOS Keychain under `dev.maverick.api-key`. **test** sends a command line tool a tiny question. For each job, click a provider and optionally type a model; an empty model means the provider's default (Claude Code uses `sonnet`, Anthropic `claude-opus-5-5`, OpenAI `gpt-5-mini`, OpenRouter `openrouter/auto`, Codex and OpenCode their own). Without a choice, every job uses Claude Code with `sonnet`. The choices are saved as `models.json` in the data directory.
+
+From the terminal:
+
+```sh
+maverick models list                        # what is installed or keyed, and what each job uses
+maverick models check [provider]            # a real test of one provider, or all of them
+maverick models key openrouter < key-file   # stores and checks an API key
+maverick models use scoring codex [model]   # jobs: mav, forms, scoring
+```
 
 ### Connect TickTick
 

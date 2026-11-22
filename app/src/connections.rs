@@ -18,6 +18,7 @@ use maverick_core::ticktick::{self, Project, Settings};
 use tokio::runtime::Handle;
 
 use crate::browser::Browser;
+use crate::models::Models;
 use crate::ui::{self, Palette, Signal};
 
 const DETAIL_WIDTH: f32 = 400.0;
@@ -45,7 +46,7 @@ pub struct Connections {
     problem: Option<String>,
     ticktick: TickTick,
     settings: Settings,
-    claude: bool,
+    models: Entity<Models>,
     label: Entity<InputState>,
     token: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -56,6 +57,7 @@ impl Connections {
         let background = browser.read(cx).background();
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Name this profile, such as Work"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("Paste your TickTick API token"));
+        let models = cx.new(|cx| Models::new(background.clone(), window, cx));
         let _subscriptions = vec![
             cx.subscribe_in(&label, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -82,7 +84,7 @@ impl Connections {
             problem: None,
             ticktick: TickTick::Reading,
             settings: Settings::current(),
-            claude: false,
+            models,
             label,
             token,
             _subscriptions,
@@ -93,7 +95,7 @@ impl Connections {
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_accounts(window, cx);
         self.settings = Settings::current();
-        self.claude = maverick_core::model::claude_found();
+        self.models.update(cx, |models, cx| models.refresh(window, cx));
         let client = self.background.spawn(Client::stored());
         let lists = self.background.spawn(async {
             match ticktick::stored_token().await? {
@@ -612,23 +614,14 @@ impl Connections {
     }
 
     fn others(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
-        let (model, model_signal) = if self.claude {
-            ("claude found · sonnet", Signal::Done)
-        } else {
-            ("claude not found · install claude code and sign in", Signal::Yours)
-        };
         let (chrome, chrome_signal) = match self.browser.read(cx).state() {
             BrowserState::Connected { tabs } => (format!("connected · {} tabs", tabs.len()), Signal::Done),
             BrowserState::Disconnected => ("not connected".to_owned(), Signal::Yours),
         };
         v_flex()
-            .gap(px(12.))
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(ui::caps("model").text_color(palette.muted))
-                    .child(status_line("model-status", model, palette.signal(model_signal))),
-            )
+            .gap(px(22.))
+            .child(self.models.clone())
+            .child(rule(palette))
             .child(
                 h_flex()
                     .justify_between()

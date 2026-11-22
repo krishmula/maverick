@@ -1,20 +1,14 @@
 //! Asks a Claude model to answer form questions from the user's facts.
 //!
-//! It runs the `claude` command the user is already signed in to, so there is no API key.
+//! It runs the provider the user chose for form filling under Connections (see `providers`).
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 use crate::answers::{Kind, Question};
-
-const MODEL: &str = "sonnet";
-const TIME_LIMIT: Duration = Duration::from_secs(90);
+use crate::providers::{self, Job};
 
 const INSTRUCTIONS: &str = "You fill in a job application for the applicant described in the facts. \
 Answer each question only from the facts. If the facts do not settle a question, the answer is null. \
@@ -72,57 +66,8 @@ pub async fn draft(
 }
 
 async fn ask(instructions: &str, request: String, questions: usize) -> Result<Vec<ModelAnswer>, String> {
-    let reply = run(instructions, request, &reply_schema()).await?;
+    let reply = providers::run(Job::Forms, instructions, request, &reply_schema()).await?;
     answers_in(&reply, questions)
-}
-
-/// Runs one model call whose reply must match `schema`, and returns the command's JSON output.
-/// The model's reply is under `structured_output`.
-pub(crate) async fn run(instructions: &str, request: String, schema: &Value) -> Result<Value, String> {
-    let run = Command::new(claude_command())
-        .arg("--print")
-        .arg(request)
-        .args(["--model", MODEL, "--output-format", "json"])
-        // No tools, no project or user settings, no saved session: one question in, one answer out.
-        .args(["--tools", "", "--strict-mcp-config", "--setting-sources", ""])
-        .args(["--no-session-persistence", "--disable-slash-commands"])
-        .args(["--system-prompt", instructions])
-        .args(["--json-schema", &schema.to_string()])
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(TIME_LIMIT, run)
-        .await
-        .map_err(|_| "the model did not answer in time".to_owned())?
-        .map_err(|error| format!("could not run the claude command: {error}"))?;
-    let reply: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        let said = String::from_utf8_lossy(&output.stderr);
-        format!("the claude command failed: {}", said.trim())
-    })?;
-    if reply["is_error"] == true {
-        return Err(format!(
-            "the model failed: {}",
-            reply["result"].as_str().unwrap_or("no reason given")
-        ));
-    }
-    Ok(reply)
-}
-
-/// True when the `claude` command can be found.
-pub fn claude_found() -> bool {
-    let command = claude_command();
-    command.is_absolute()
-        || std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&command).is_file()))
-}
-
-/// `claude` is often installed where an app started from the Dock does not look.
-fn claude_command() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".local/bin/claude"))
-        .filter(|command| command.is_file())
-        .unwrap_or_else(|| "claude".into())
 }
 
 fn request(facts: &[String], job: &str, questions: &[&Question]) -> String {
@@ -177,7 +122,7 @@ fn answers_in(reply: &Value, questions: usize) -> Result<Vec<ModelAnswer>, Strin
         answer: Option<String>,
         basis: String,
     }
-    let given: Vec<Given> = serde_json::from_value(reply["structured_output"]["answers"].clone())
+    let given: Vec<Given> = serde_json::from_value(reply["answers"].clone())
         .map_err(|error| format!("the model's reply was not in the agreed form: {error}"))?;
     let mut answers = vec![
         ModelAnswer {
@@ -242,14 +187,13 @@ mod tests {
     #[test]
     fn answers_come_back_in_question_order_and_gaps_stay_unanswered() {
         let reply = json!({
-            "is_error": false,
-            "structured_output": { "answers": [
+            "answers": [
                 { "id": 3, "answer": "United States", "basis": "Lives in Illinois." },
                 { "id": 1, "answer": "yes", "basis": "Central time." },
                 { "id": 2, "answer": null, "basis": "No fact covers pay." },
                 { "id": 9, "answer": "stray", "basis": "" },
                 { "id": 4, "answer": "  ", "basis": "blank" },
-            ] },
+            ],
         });
         let answers = answers_in(&reply, 5).unwrap();
         let said: Vec<Option<&str>> = answers.iter().map(|answer| answer.answer.as_deref()).collect();
