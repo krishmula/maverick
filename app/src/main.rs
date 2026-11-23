@@ -9,6 +9,7 @@ mod main_view;
 mod mav;
 mod models;
 mod pane_widths;
+mod queue;
 mod report;
 mod schedule;
 mod setup;

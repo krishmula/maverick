@@ -1,11 +1,18 @@
 //! The decision board: the postings that wait on the user's Approve or Skip, and the applications already sent.
 //!
 //! Decisions are kept in the local database, apart from the postings a sheet sync rewrites.
-//! They never go to the sheet.
+//! They never go to the sheet. Approving a posting puts it in the apply queue.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::browser::Browser;
+use crate::jobs::system_name;
+use crate::main_view::header;
+use crate::queue::{Run, Step};
+use crate::report;
+use crate::tabs::host_of;
+use crate::ui::{self, Palette, Signal};
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::{IndexPath, h_flex, v_flex};
 use gpui_kit::{
@@ -18,12 +25,6 @@ use maverick_core::apply;
 use maverick_core::jobs::{Application, ApplicationStatus, Decision, Posting, Sponsorship, Stage, posting_address};
 use maverick_core::score::APPLY_READY;
 use maverick_core::store::Store;
-use tokio::runtime::Handle;
-
-use crate::jobs::system_name;
-use crate::main_view::header;
-use crate::tabs::host_of;
-use crate::ui::{self, Palette, Signal};
 
 /// A posting on the board.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +54,11 @@ impl Entry {
     /// The application system the posting is on, as the user knows it.
     pub fn system(&self) -> &'static str {
         system_label(&self.address)
+    }
+
+    /// The name an application is recorded under.
+    pub fn role(&self) -> String {
+        format!("{} at {}", self.title, self.company)
     }
 }
 
@@ -191,6 +197,7 @@ pub enum Section {
 }
 
 pub struct Rows {
+    browser: Entity<Browser>,
     section: Section,
     entries: Vec<Entry>,
     submitted: Vec<Application>,
@@ -231,6 +238,16 @@ fn sponsorship_chip(sponsorship: Sponsorship, palette: &Palette) -> Div {
     }
 }
 
+/// Where a queued posting is, in the signal that says whose move it is.
+fn step_chip(step: &Step, palette: &Palette) -> Div {
+    match step {
+        Step::Queued | Step::Opening | Step::Filling => ui::boxed(step.word(), palette.muted),
+        Step::NeedsYou(_) | Step::Ready => ui::chip(Signal::Yours, step.word(), palette),
+        Step::Applied => ui::chip(Signal::Done, step.word(), palette),
+        Step::Failed(_) => ui::chip(Signal::Failed, step.word(), palette),
+    }
+}
+
 fn decision_chip(decision: Decision, palette: &Palette) -> Div {
     match decision {
         Decision::Approved => ui::chip(Signal::Done, "approved", palette),
@@ -251,6 +268,7 @@ impl ListDelegate for Rows {
         let row = match self.section {
             Section::Pending => {
                 let entry = self.entries.get(ix.row)?;
+                let run = self.browser.read(cx).queue().get(&entry.address).cloned();
                 let tone = match (entry.decision, entry.score) {
                     _ if selected => palette.ink,
                     (Some(_), _) => palette.faint,
@@ -279,7 +297,10 @@ impl ListDelegate for Rows {
                             .then(|| ui::chip(Signal::Yours, "apply-ready", &palette)),
                     )
                     .child(sponsorship_chip(entry.sponsorship, &palette))
-                    .children(entry.decision.map(|decision| decision_chip(decision, &palette)))
+                    .children(match (&run, entry.decision) {
+                        (Some(run), Some(Decision::Approved)) => Some(step_chip(&run.step, &palette)),
+                        (_, decision) => decision.map(|decision| decision_chip(decision, &palette)),
+                    })
             }
             Section::Submitted => {
                 let sent = self.submitted.get(ix.row)?;
@@ -330,8 +351,8 @@ impl ListDelegate for Rows {
 }
 
 pub struct Board {
+    browser: Entity<Browser>,
     database: Option<PathBuf>,
-    background: Handle,
     list: Entity<ListState<Rows>>,
     order: Order,
     submitted_order: SubmittedOrder,
@@ -340,35 +361,48 @@ pub struct Board {
     /// Why the last decision could not be saved.
     problem: Option<String>,
     focus: FocusHandle,
-    _subscription: Subscription,
+    /// How many of the applications sent in this run the board has moved to Submitted.
+    moved: usize,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Board {
     pub fn new(
+        browser: Entity<Browser>,
         data: BoardData,
         database: Option<PathBuf>,
-        background: Handle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let rows = Rows {
+            browser: browser.clone(),
             section: Section::Pending,
             entries: Vec::new(),
             submitted: Vec::new(),
             selected: None,
         };
         let list = cx.new(|cx| ListState::new(rows, window, cx));
-        let _subscription = cx.subscribe_in(&list, window, |_, _, _: &ListEvent, _, cx| cx.notify());
+        let _subscriptions = vec![
+            cx.subscribe_in(&list, window, |this, _, event: &ListEvent, _, cx| {
+                // Enter on a posting with an open tab brings the tab forward.
+                if let ListEvent::Confirm(_) = event {
+                    this.show_tab(cx);
+                }
+                cx.notify();
+            }),
+            cx.observe_in(&browser, window, |this, _, window, cx| this.move_applied(window, cx)),
+        ];
         let mut board = Self {
+            browser,
             database,
-            background,
             list,
             order: Order::TopScore,
             submitted_order: SubmittedOrder::Latest,
             made: Vec::new(),
             problem: None,
             focus: cx.focus_handle(),
-            _subscription,
+            moved: 0,
+            _subscriptions,
         };
         board.replace(data, window, cx);
         board
@@ -443,8 +477,75 @@ impl Board {
         });
         if let Some((link, before)) = decided {
             self.save(link.clone(), Some(decision), cx);
+            self.sync_queue(&link, Some(decision), cx);
             self.made.push((link, before));
         }
+        cx.notify();
+    }
+
+    /// Puts an approved posting in the apply queue, and takes any other out while it waits.
+    fn sync_queue(&mut self, link: &str, decision: Option<Decision>, cx: &mut Context<Self>) {
+        let rows = self.list.read(cx).delegate();
+        let Some(entry) = rows.entries.iter().find(|entry| entry.link == link) else {
+            return;
+        };
+        let (role, address) = (entry.role(), entry.address.clone());
+        self.browser.update(cx, |browser, cx| match decision {
+            Some(Decision::Approved) => browser.enqueue(role, address, cx),
+            _ => browser.withdraw(&address, cx),
+        });
+    }
+
+    /// Queues every approved posting that is not in the queue yet, such as those approved before a restart.
+    fn apply_approved(&mut self, cx: &mut Context<Self>) {
+        let waiting: Vec<String> = self.waiting_approved(cx).into_iter().map(|entry| entry.link).collect();
+        for link in waiting {
+            self.sync_queue(&link, Some(Decision::Approved), cx);
+        }
+    }
+
+    /// Approved postings that have not been queued in this run.
+    fn waiting_approved(&self, cx: &App) -> Vec<Entry> {
+        let queue = self.browser.read(cx).queue();
+        self.list
+            .read(cx)
+            .delegate()
+            .entries
+            .iter()
+            .filter(|entry| entry.decision == Some(Decision::Approved) && queue.get(&entry.address).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Brings the selected posting's tab forward, when the queue opened one.
+    fn show_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.list.read(cx).delegate().selected_entry().cloned() {
+            self.browser
+                .update(cx, |browser, cx| browser.show_run(&entry.address, cx));
+        }
+    }
+
+    /// Moves each posting whose application went through to the Submitted list.
+    fn move_applied(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let applied = self.browser.read(cx).applied();
+        let new: Vec<_> = applied[self.moved.min(applied.len())..].to_vec();
+        self.moved = applied.len();
+        if new.is_empty() {
+            cx.notify();
+            return;
+        }
+        let submitted_order = self.submitted_order;
+        self.list.update(cx, |list, cx| {
+            let row = list.selected_index().map_or(0, |ix| ix.row);
+            let rows = list.delegate_mut();
+            for sent in new {
+                rows.entries.retain(|entry| entry.address != sent.address);
+                rows.submitted
+                    .push(Application::submitted_today(&sent.title, &sent.address));
+            }
+            sort_submitted(&mut rows.submitted, submitted_order);
+            select_row(list, row, window, cx);
+        });
         cx.notify();
     }
 
@@ -464,14 +565,15 @@ impl Board {
             let row = rows.entries.iter().position(|entry| entry.link == link).unwrap_or(0);
             select_row(list, row, window, cx);
         });
-        self.save(link, before, cx);
+        self.save(link.clone(), before, cx);
+        self.sync_queue(&link, before, cx);
         cx.notify();
     }
 
     /// Writes a decision to the database off the main thread. A failure shows on the board.
     fn save(&mut self, link: String, decision: Option<Decision>, cx: &mut Context<Self>) {
         let database = self.database.clone();
-        let saved = self.background.spawn_blocking(move || {
+        let saved = self.browser.read(cx).background().spawn_blocking(move || {
             let database = database.ok_or("this system has no application data directory")?;
             Store::open(&database)
                 .and_then(|mut store| store.decide(&link, decision))
@@ -572,12 +674,76 @@ impl Board {
                 .on_click(cx.listener(|this, _, window, cx| this.show(Section::Submitted, window, cx))),
             )
             .child(div().flex_1())
+            .children(self.queue_controls(palette, cx))
             .child(ui::caps("sort").text_color(palette.faint))
             .children(orders)
             .children((!self.made.is_empty()).then(|| {
                 ui::button("undo-decision", "Undo", ui::quiet_face("undo ⌘z", palette))
                     .on_click(cx.listener(|this, _, window, cx| this.undo(window, cx)))
             }))
+    }
+
+    /// The queue's counts, how many forms fill at once, and a way to start approvals from before.
+    fn queue_controls(&self, palette: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let browser = self.browser.read(cx);
+        let queue = browser.queue();
+        let parallel = queue.parallel();
+        let count = |pick: fn(&Step) -> bool| queue.runs().iter().filter(|run| pick(&run.step)).count();
+        let (running, waiting, yours) = (
+            count(Step::is_running),
+            count(|step| *step == Step::Queued),
+            count(|step| matches!(step, Step::NeedsYou(_) | Step::Ready)),
+        );
+        let mut controls = Vec::new();
+        if !queue.runs().is_empty() {
+            let status = format!("{running} running · {waiting} queued · {yours} yours");
+            controls.push(
+                ui::caps(status.clone())
+                    .id("queue-status")
+                    .test_support()
+                    .role(gpui_kit::Role::Label)
+                    .aria_label(status)
+                    .text_color(palette.muted)
+                    .into_any_element(),
+            );
+        }
+        let waiting_approved = self.waiting_approved(cx).len();
+        if waiting_approved > 0 {
+            controls.push(
+                ui::button(
+                    "apply-approved",
+                    format!("Apply approved · {waiting_approved}"),
+                    ui::quiet_face(format!("apply approved {waiting_approved}"), palette),
+                )
+                .tip("Queue the postings approved before Maverick last started.")
+                .on_click(cx.listener(|this, _, _, cx| this.apply_approved(cx)))
+                .into_any_element(),
+            );
+        }
+        let step = |id: &'static str, name: &'static str, word: &'static str, to: usize| {
+            ui::button(id, name, ui::quiet_face(word, palette))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.browser.update(cx, |browser, cx| browser.set_parallel(to, cx));
+                }))
+                .into_any_element()
+        };
+        controls.push(step(
+            "fewer-parallel",
+            "Fill fewer at once",
+            "-",
+            parallel.saturating_sub(1),
+        ));
+        controls.push(
+            ui::caps(format!("{parallel} at once"))
+                .id("parallel")
+                .test_support()
+                .role(gpui_kit::Role::Label)
+                .aria_label(format!("{parallel} at once"))
+                .text_color(palette.muted)
+                .into_any_element(),
+        );
+        controls.push(step("more-parallel", "Fill more at once", "+", parallel + 1));
+        controls
     }
 
     /// The selected row in full, with the decision buttons for a posting.
@@ -616,14 +782,49 @@ impl Board {
             ("verdict", entry.notes.clone().unwrap_or_default()),
         ];
         let tag = format!("{} / {}", entry.company, entry.system());
-        let note = match entry.decision {
-            None => "a decision stays on this computer.",
-            Some(Decision::Approved) => "approved.",
-            Some(Decision::Skipped) => "skipped.",
+        let run = match entry.decision {
+            Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
+            _ => None,
+        };
+        let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
+            (None, _) => "approve queues it. nothing gets submitted.",
+            (Some(Decision::Skipped), _) => "skipped.",
+            (Some(Decision::Approved), None) => "approve again to queue it.",
+            (_, Some(Step::Queued | Step::Opening | Step::Filling)) => "filling. nothing gets submitted.",
+            (_, Some(Step::NeedsYou(_) | Step::Ready)) => "you click submit.",
+            (_, Some(Step::Applied)) => "applied.",
+            (_, Some(Step::Failed(_))) => "nothing was submitted.",
+        };
+        let (word, name) = match run.as_ref().map(|run| &run.step) {
+            None if entry.decision == Some(Decision::Approved) => ("apply", "Apply"),
+            None => ("approve", "Approve"),
+            Some(Step::Failed(_)) => ("try again", "Try again"),
+            Some(_) => ("", ""),
+        };
+        let reviewable = run
+            .as_ref()
+            .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
+        let primary = if reviewable {
+            Some(
+                ui::button(
+                    "review-run",
+                    "Review in Chrome",
+                    ui::primary_face("review in chrome", Some("enter"), palette),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.show_tab(cx)))
+                .into_any_element(),
+            )
+        } else {
+            (!word.is_empty()).then(|| {
+                ui::button("approve", name, ui::primary_face(word, Some("a"), palette))
+                    .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Approved, window, cx)))
+                    .into_any_element()
+            })
         };
         v_flex()
             .size_full()
             .child(header(&tag, &entry.title, Some(entry.score), palette))
+            .children(run.as_ref().map(|run| run_status(run, palette)))
             .child(
                 div()
                     .id("board-facts")
@@ -632,7 +833,10 @@ impl Board {
                     .overflow_y_scroll()
                     .px_4()
                     .py_3()
-                    .child(ui::facts(&facts, palette)),
+                    .child(match run.as_ref().and_then(|run| run.report.as_ref()) {
+                        Some(report) => report::sections(report, palette),
+                        None => ui::facts(&facts, palette),
+                    }),
             )
             .child(
                 h_flex()
@@ -643,10 +847,7 @@ impl Board {
                     .min_h(px(46.))
                     .border_t_1()
                     .border_color(palette.line)
-                    .child(
-                        ui::button("approve", "Approve", ui::primary_face("approve", Some("a"), palette))
-                            .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Approved, window, cx))),
-                    )
+                    .children(primary)
                     .child(
                         ui::button("skip", "Skip", ui::quiet_face("skip  s", palette))
                             .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Skipped, window, cx))),
@@ -654,6 +855,41 @@ impl Board {
                     .child(ui::serif(note).ml_auto().text_size(px(13.5)).text_color(palette.muted)),
             )
     }
+}
+
+/// Where a queued posting is, and the fill report's map once there is one.
+fn run_status(run: &Run, palette: &Palette) -> impl IntoElement + use<> {
+    let (signal, text) = match &run.step {
+        Step::Queued => (None, "Queued. It starts when a slot is free.".to_owned()),
+        Step::Opening => (None, "Opening the form in a background tab.".to_owned()),
+        Step::Filling => (Some(Signal::Model), "Filling the form in a background tab.".to_owned()),
+        Step::NeedsYou(why) => (Some(Signal::Yours), why.clone()),
+        Step::Ready => (
+            Some(Signal::Yours),
+            "Every required field is answered. Review it and click Submit.".to_owned(),
+        ),
+        Step::Applied => (Some(Signal::Done), "Submitted and recorded.".to_owned()),
+        Step::Failed(why) => (Some(Signal::Failed), why.clone()),
+    };
+    v_flex()
+        .id("run-status")
+        .test_support()
+        .role(gpui_kit::Role::Label)
+        .aria_label(format!("{}: {text}", run.step.word()))
+        .flex_none()
+        .gap_2()
+        .px_4()
+        .pb_3()
+        .border_b_1()
+        .border_color(palette.line)
+        .child(
+            h_flex()
+                .items_start()
+                .gap(px(9.))
+                .child(ui::square(signal.map_or(palette.faint, |signal| palette.signal(signal))).mt(px(6.)))
+                .child(ui::serif(text).flex_1().min_w_0().text_size(px(13.5))),
+        )
+        .children(run.report.as_ref().map(|report| report::form_map(report, palette)))
 }
 
 /// Selects `row`, or the last row when the list is shorter, and brings it into view.
@@ -903,6 +1139,13 @@ mod tests {
         });
         let data = BoardData::new(&postings, applications, &HashMap::new());
         let background = runtime.handle().clone();
+        // Chrome is not connected, so approved postings wait in the queue.
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                let bridge = maverick_core::bridge::Bridge::new();
+                Browser::new(bridge, background, Err("none".into()), None, None, cx)
+            })
+        });
         let (window, board) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -912,7 +1155,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Board::new(data, Some(database.clone()), background, window, cx))
+                cx.new(|cx| Board::new(browser.clone(), data, Some(database.clone()), window, cx))
             })
             .expect("the test window opens")
         });
@@ -967,6 +1210,17 @@ mod tests {
             decisions().get("https://simplify.jobs/p/3") == Some(&Decision::Approved)
         });
         assert_eq!(decisions().len(), 2);
+        let queued: Vec<(String, Step)> = browser.read_with(cx, |browser, _| {
+            let runs = browser.queue().runs();
+            runs.iter().map(|run| (run.title.clone(), run.step.clone())).collect()
+        });
+        assert_eq!(
+            queued,
+            [
+                ("Ready at Example Co".to_owned(), Step::Queued),
+                ("High but not ready at Example Co".to_owned(), Step::Queued),
+            ]
+        );
         assert_eq!(
             shown(cx),
             (
