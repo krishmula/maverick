@@ -44,11 +44,11 @@ After an app update, Maverick asks the extension to reload itself. Extension 0.2
 
 ## The window
 
-The bar at the top switches between the **jobs** list, the **approvals** board, the **tabs** list and the **mav** view, and shows the link to Chrome. **connections** at the right end sets up Google, TickTick, the model and Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
+The bar at the top switches between the **jobs** tab, the **tabs** list, the **mav** view and the **posts** tab, and shows the link to Chrome. **connections** at the right end sets up Google, TickTick, the model and Chrome. The number next to **jobs** counts the postings that wait on a decision. The number next to **mav** counts the TickTick tasks that are overdue or due today. The number next to **posts** counts the hiring-post notes that wait on you. Click the link to measure the round trip again.
 
-On the jobs and tabs lists, the band is under the bar. Each cell is one posting from your tracker, oldest at the left:
+On the jobs tab and the tabs list, the band is under the bar. Each cell is one posting from your tracker, oldest at the left:
 
-- An orange cell is an open posting, one that is on the jobs list.
+- An orange cell is an open posting, one that waits on a decision on the jobs tab.
 - A teal cell is a posting you applied to.
 - Every other cell lights up only when a current drifts over it. A higher score makes a brighter cell.
 - The selected job is the target. Lines run from it to the next best open jobs.
@@ -82,10 +82,9 @@ Maverick fills application forms on two systems. It never clicks Submit.
 - Ashby, on `jobs.ashbyhq.com`.
 - Greenhouse, on the boards Greenhouse hosts: `job-boards.greenhouse.io`, the older `boards.greenhouse.io`, and their `eu.` variants. A company's own careers page that shows a Greenhouse form inside it is not covered.
 
-1. Click **jobs** in the bar. The list holds the open postings from your imported tracker, best score first.
-2. Choose a job with a click or Enter. Maverick opens the form in a new Chrome tab and fills it.
-3. Read the report in the detail pane. It has one square per form field, and it lists the fields left for you and the answers the model gave.
-4. Press Enter again to bring the filled form forward. Answer what Maverick left, and click Submit yourself.
+1. Click **jobs** in the bar and approve a posting. Maverick queues it and fills its form in a background tab, several at once (see [The apply queue](#the-apply-queue)).
+2. Read the report in the detail pane. It has one square per form field, and it lists the fields left for you and the answers the model gave.
+3. Press Enter to bring the filled form forward. Answer what Maverick left, and click Submit yourself.
 
 For a posting that is not in the list, open it in Chrome and click **Fill form** on that tab's row.
 
@@ -326,10 +325,10 @@ A decision goes only into a row whose Status still says Found when Maverick writ
 
 ## Approve or skip postings
 
-**approvals** in the bar opens the decision board. The number next to it counts the postings that wait on a decision. The window opens on the board while any wait.
+**jobs** in the bar opens the jobs tab, and the window opens on it. The number next to it counts the postings that wait on a decision.
 
-- **Pending** lists the postings in Review or Found that you have not applied to. Each row shows the score, the company, the application system, the variant, the found date, the location, the flags, and a sponsorship badge: sponsors, no sponsorship, or unknown.
-- Sort by **top score** (apply-ready first, the default) or by **latest** found. Decided rows always sort below pending ones.
+- **Pending** lists the postings in Review or Found that you have not applied to. Each card shows the score, the company, the application system, the variant, the found date, the location, the flags, a sponsorship badge (sponsors, no sponsorship, or unknown), and who you can reach at the company. See [Reach someone at the company](#reach-someone-at-the-company).
+- Sort by **latest** found, by **top score** (apply-ready first, the default), or by **outreach** (postings with someone to reach first, then by top score). Decided rows always sort below pending ones.
 - Press `a` to approve the selected posting and `s` to skip it, or click **approve** or **skip**. The selection moves to the next pending posting. `⌘Z` or **undo** takes back the last decision.
 - **Submitted** lists the applications, latest first or by company.
 
@@ -346,11 +345,23 @@ Approving a posting puts it in the apply queue. Maverick fills queued forms seve
 
 Select a posting that is ready or needs you and press Enter, or click **review in chrome**, to bring its tab forward. Approvals from before Maverick last started are not queued by themselves: click **apply approved** to queue them.
 
-Decisions stay in the local database, apart from the postings, so a sheet sync or a tracker import never undoes them. They are not written to the sheet: the sheet only takes decisions on rows that still say Found, and an approval has no sheet status. A posting you skip leaves the jobs list.
+Decisions stay in the local database, apart from the postings, so a sheet sync or a tracker import never undoes them. They are not written to the sheet: the sheet only takes decisions on rows that still say Found, and an approval has no sheet status.
+
+### Reach someone at the company
+
+Every hour while the app is open, Maverick looks on LinkedIn for people at the companies of the postings to review, apply-ready first. It never sends anything.
+
+- Each card's last line names the first person found, such as a connection, a team member or the hiring manager, or says there is no one, the lookup was deferred, or the posting is not checked yet. A card with a note shows a **note** badge with where the note stands.
+- The detail pane lists the people. Click **draft note** to have the model write a connection note to the best one.
+- Read the draft in the pane. Click **approve, type it** to have Maverick type it into LinkedIn in your Chrome, then click Send yourself and **mark sent**. You can also **edit** it, **skip** it, or rewrite it as an InMail with **use InMail**.
+
+## Answer hiring posts
+
+**posts** in the bar opens the posts tab. Every two hours while the app is open, Maverick searches LinkedIn for posts about hiring new grads and backend or infrastructure engineers. It drafts a note to the poster for each post that fits, up to 10 a day. Each draft works the same way as a draft on the jobs tab: approve it, and Maverick types it, and you click Send. **check and sweep now** runs the people lookup and the post search at once.
 
 ## Find new postings
 
-While the app is open, it runs the funnel every hour from 8 AM to 11 PM Pacific time, starting a minute after launch. Each pass pulls new postings and then scores what is found. The bar shows what the last pass did, and the Jobs list updates. A pass never submits an application.
+While the app is open, it runs the funnel every hour from 8 AM to 11 PM Pacific time, starting a minute after launch. Each pass pulls new postings and then scores what is found. The bar shows what the last pass did, and the jobs tab updates. A pass never submits an application.
 
 Intake reads [Simplify's new-grad list](https://github.com/SimplifyJobs/New-Grad-Positions), which is also the source of the SWE List email, about a day earlier than the email. It adds open Software and AI/ML/Data listings from the last 72 hours that the database does not hold yet. It records each one by its Simplify page and keeps the original application address.
 
@@ -374,7 +385,7 @@ A run takes these steps, cheapest first:
 
 1. It marks a posting that repeats an earlier posting or an application as a duplicate.
 2. It skips a posting the title and location rules rule out.
-3. It reads the description over plain HTTP, for at most 30 postings. It can read Simplify, Ashby, Greenhouse, Lever, Workday and Amazon postings. For a Simplify copy, it also records the original posting's address, so the Jobs list can fill that posting's form.
+3. It reads the description over plain HTTP, for at most 30 postings. It can read Simplify, Ashby, Greenhouse, Lever, Workday and Amazon postings. For a Simplify copy, it also records the original posting's address, so Maverick can fill that posting's form.
 4. A Claude model, run through the `claude` command, scores the fit from 0 to 100 against `background` and `target` in your answers file. It also reads the facts that the rules in code act on: sponsorship, citizenship or clearance, minimum years, frontend focus and US location.
 5. Code decides. A posting is skipped if it requires citizenship or clearance, requires 5 or more years, is mainly frontend, has no US location, or scores under 60. It is apply-ready at 75 or more with no blocking flag, such as "no sponsorship". All other postings go to review. A closed posting is skipped.
 

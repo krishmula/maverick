@@ -1,9 +1,11 @@
-//! The Outreach view: who to reach at each company, and the LinkedIn drafts waiting for the user.
+//! LinkedIn outreach: who to reach at each posting's company, the hiring posts worth a note, and the
+//! drafts for both. The Jobs tab shows a posting's people and drafts on its card; the Posts tab
+//! shows the hiring posts.
 //!
 //! Approving a draft types it into LinkedIn in the user's Chrome and stops. The user clicks Send.
 //! While the app is open, checks run every hour and the hiring-post sweep every two hours.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +20,7 @@ use jiff::Timestamp;
 use maverick_core::answers::Answers;
 use maverick_core::bridge::{Bridge, BrowserState};
 use maverick_core::jobs::{HiringPost, Outreach, Posting};
-use maverick_core::linkedin::Slot;
+use maverick_core::linkedin::{Person, Slot};
 use maverick_core::outreach::{self, About, Check, Draft, Verdict};
 use maverick_core::score::Profile;
 use maverick_core::store::Store;
@@ -33,43 +35,6 @@ const BETWEEN_RUNS: Duration = Duration::from_secs(60 * 60);
 /// The sweep runs on every second run, so every two hours.
 const SWEEP_EVERY: u32 = 2;
 
-/// Which checks the list shows.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Filter {
-    PeopleFound,
-    ApplyCold,
-    All,
-}
-
-impl Filter {
-    const ALL: [Filter; 3] = [Filter::PeopleFound, Filter::ApplyCold, Filter::All];
-
-    fn name(self) -> &'static str {
-        match self {
-            Filter::PeopleFound => "people found",
-            Filter::ApplyCold => "apply cold",
-            Filter::All => "all",
-        }
-    }
-
-    fn keeps(self, verdict: Verdict) -> bool {
-        match self {
-            Filter::PeopleFound => verdict.found_people(),
-            Filter::ApplyCold => !verdict.found_people(),
-            Filter::All => true,
-        }
-    }
-}
-
-/// A check with the posting it is about.
-#[derive(Clone, Debug)]
-pub struct CheckRow {
-    pub check: Check,
-    pub company: String,
-    pub title: String,
-    pub score: Option<u8>,
-}
-
 /// A draft with what it is about, as one line.
 #[derive(Clone, Debug)]
 pub struct DraftRow {
@@ -78,8 +43,6 @@ pub struct DraftRow {
     pub score: Option<u8>,
 }
 
-/// Reads the checks and drafts from the store, with the postings and posts they are about.
-/// The slot a draft is in, as its card labels it.
 /// A slot as a sentence names it.
 fn slot_name(slot: Slot) -> &'static str {
     match slot {
@@ -89,6 +52,7 @@ fn slot_name(slot: Slot) -> &'static str {
     }
 }
 
+/// The slot a draft is in, as its card labels it.
 pub fn slot_label(draft: &Draft) -> String {
     match draft.slot {
         Slot::Note => format!("connection note · {} chars", draft.text.chars().count()),
@@ -97,24 +61,46 @@ pub fn slot_label(draft: &Draft) -> String {
     }
 }
 
-pub fn rows(store: &Store) -> (Vec<CheckRow>, Vec<DraftRow>) {
+/// The color a check's verdict shows in: people found, a lookup still to do, or no one.
+pub fn verdict_signal(verdict: Verdict) -> Signal {
+    match verdict {
+        Verdict::Connection | Verdict::TeamMember | Verdict::HiringManager => Signal::Done,
+        Verdict::Deferred => Signal::Yours,
+        Verdict::Cold => Signal::Failed,
+    }
+}
+
+/// One person as a line: name, title and connection degree.
+pub fn person_line(person: &Person) -> String {
+    let mut line = person.name.clone();
+    if !person.title.is_empty() {
+        line.push_str(", ");
+        line.push_str(&person.title);
+    }
+    if let Some(degree) = &person.degree {
+        line.push_str(" · ");
+        line.push_str(degree);
+    }
+    line
+}
+
+/// Where a draft stands, as a card or a job's row says it.
+pub fn draft_state(status: Outreach) -> (Signal, &'static str) {
+    match status {
+        Outreach::Drafted => (Signal::Model, "drafted"),
+        Outreach::Typed => (Signal::Yours, "typed, click send in chrome"),
+        Outreach::Sent => (Signal::Done, "sent"),
+        Outreach::Replied => (Signal::Done, "replied"),
+        Outreach::Skipped | Outreach::NotStarted => (Signal::Failed, "skipped"),
+    }
+}
+
+/// Reads the checks, and the drafts with the postings and posts they are about.
+pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>) {
     let postings: Vec<Posting> = store.postings().unwrap_or_default();
     let posts: Vec<HiringPost> = store.hiring_posts().unwrap_or_default();
     let posting_of = |link: &str| postings.iter().find(|posting| posting.link == link);
-    let checks = store
-        .checks()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|check| {
-            let posting = posting_of(&check.posting_link)?;
-            Some(CheckRow {
-                company: posting.company.clone(),
-                title: posting.title.clone(),
-                score: posting.score,
-                check,
-            })
-        })
-        .collect();
+    let checks = store.checks().unwrap_or_default();
     let drafts = store
         .drafts()
         .unwrap_or_default()
@@ -173,8 +159,7 @@ pub struct OutreachView {
     background: Handle,
     database: Option<PathBuf>,
     answers: Option<PathBuf>,
-    filter: Filter,
-    checks: Vec<CheckRow>,
+    checks: Vec<Check>,
     drafts: Vec<DraftRow>,
     /// The draft open in the editor.
     editing: Option<i64>,
@@ -207,7 +192,6 @@ impl OutreachView {
             background,
             database,
             answers,
-            filter: Filter::PeopleFound,
             checks: Vec::new(),
             drafts: Vec::new(),
             editing: None,
@@ -223,12 +207,44 @@ impl OutreachView {
         view
     }
 
-    /// Drafts waiting for the user's decision, for the bar.
+    /// Hiring-post drafts waiting for the user's decision, for the bar.
     pub fn waiting(&self) -> usize {
         self.drafts
             .iter()
-            .filter(|row| row.draft.status == Outreach::Drafted)
+            .filter(|row| matches!(row.draft.about, About::Post(_)) && row.draft.status == Outreach::Drafted)
             .count()
+    }
+
+    /// The check for the posting at `link`, if one ran.
+    pub fn check(&self, link: &str) -> Option<&Check> {
+        self.checks.iter().find(|check| check.posting_link == link)
+    }
+
+    /// The links of the postings with someone to reach.
+    pub fn reachable(&self) -> HashSet<String> {
+        self.checks
+            .iter()
+            .filter(|check| check.verdict.found_people())
+            .map(|check| check.posting_link.clone())
+            .collect()
+    }
+
+    /// Where the newest live draft for the posting at `link` stands. A skipped one counts only when it is the only one.
+    pub fn draft_status(&self, link: &str) -> Option<Outreach> {
+        let about = About::Posting(link.to_owned());
+        let mut drafts: Vec<&Draft> = self
+            .drafts
+            .iter()
+            .map(|row| &row.draft)
+            .filter(|draft| draft.about == about)
+            .collect();
+        drafts.sort_by_key(|draft| (draft.status != Outreach::Skipped, draft.id));
+        drafts.last().map(|draft| draft.status)
+    }
+
+    /// True while a draft is open in the editor, so the keys typed there are not shortcuts.
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some()
     }
 
     pub fn reload(&mut self) {
@@ -516,7 +532,7 @@ impl OutreachView {
                 let draft = outreach::draft_for_check(&database, &profile, &posting_link).await?;
                 Ok(Finished {
                     said: format!(
-                        "Drafted a {} to {}. It is first under Drafts, outlined.",
+                        "Drafted a {} to {}. It is below, outlined.",
                         slot_name(draft.slot),
                         draft.person
                     ),
@@ -607,74 +623,39 @@ impl OutreachView {
         }));
     }
 
-    fn checks_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let filters = h_flex().gap(px(6.)).children(Filter::ALL.map(|filter| {
-            let count = self.checks.iter().filter(|row| filter.keeps(row.check.verdict)).count();
-            let text = format!("{} · {count}", filter.name());
-            let face = if filter == self.filter {
-                ui::boxed(&text, palette.ink).py(px(1.))
-            } else {
-                ui::quiet_face(&text, palette)
-            };
-            ui::button(
-                SharedString::from(format!("filter-{}", filter.name())),
-                text.clone(),
-                face,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.filter = filter;
-                cx.notify();
-            }))
-        }));
-        let rows: Vec<AnyElement> = self
-            .checks
-            .iter()
-            .filter(|row| self.filter.keeps(row.check.verdict))
-            .map(|row| self.check_row(row, palette, cx).into_any_element())
-            .collect();
-        let empty = rows.is_empty().then(|| {
-            ui::serif("Nothing here yet. Checks run for postings to review, apply-ready first.")
-                .text_color(palette.muted)
-        });
-        v_flex()
-            .id("outreach-checks")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scroll()
-            .px(px(20.))
-            .py(px(16.))
-            .gap(px(12.))
-            .border_r_1()
+    /// A posting's outreach for its card on the Jobs tab: the check, the people, and the drafts to them.
+    pub fn posting_section(&self, link: &str, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let section = v_flex()
+            .id(SharedString::from(format!("outreach-{link}")))
+            .gap(px(6.))
+            .pb(px(12.))
+            .mb(px(12.))
+            .border_b_1()
             .border_color(palette.line)
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(ui::caps("per-job verdicts").text_color(palette.muted))
-                    .child(filters),
-            )
-            .children(empty)
-            .children(rows)
-    }
-
-    fn check_row(&self, row: &CheckRow, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let verdict = row.check.verdict;
-        let signal = match verdict {
-            Verdict::Connection | Verdict::TeamMember | Verdict::HiringManager => Signal::Done,
-            Verdict::Deferred => Signal::Yours,
-            Verdict::Cold => Signal::Failed,
+            .child(ui::caps("outreach").text_color(palette.muted));
+        let Some(check) = self.check(link) else {
+            return section
+                .child(
+                    ui::serif("Not checked yet. Checks run every hour, apply-ready postings first.")
+                        .text_size(px(13.5))
+                        .text_color(palette.muted),
+                )
+                .into_any_element();
         };
-        let label = match (verdict, &row.check.team) {
+        let verdict = check.verdict;
+        let signal = verdict_signal(verdict);
+        let label = match (verdict, &check.team) {
             (Verdict::Deferred, Some(_)) => "team named, lookup deferred".to_owned(),
             (verdict, _) => verdict.label().to_lowercase(),
         };
-        let has_draft = self
+        let drafts: Vec<&DraftRow> = self
             .drafts
             .iter()
-            .any(|draft| draft.draft.about == About::Posting(row.check.posting_link.clone()));
-        let can_draft = !has_draft && row.check.people.iter().any(|person| person.profile_url.is_some());
-        let link = row.check.posting_link.clone();
-        let key = RowKey::Posting(link.clone());
+            .filter(|row| row.draft.about == About::Posting(link.to_owned()))
+            .collect();
+        let can_draft = drafts.is_empty() && check.people.iter().any(|person| person.profile_url.is_some());
+        let key = RowKey::Posting(link.to_owned());
+        let owned = link.to_owned();
         let draft_button: Option<AnyElement> = match self.row_states.get(&key) {
             Some(RowState::Working(doing)) => {
                 Some(Self::pending(format!("draft-{link}"), doing, palette).into_any_element())
@@ -682,57 +663,39 @@ impl OutreachView {
             _ => can_draft.then(|| {
                 ui::button(
                     SharedString::from(format!("draft-{link}")),
-                    format!("Draft a note for {}", row.company),
+                    "Draft a note",
                     ui::quiet_face("draft note", palette),
                 )
-                .on_click(cx.listener(move |this, _, window, cx| this.draft_for(link.clone(), window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.draft_for(owned.clone(), window, cx)))
                 .into_any_element()
             }),
         };
-        let said = self.row_said(&key, format!("said-{}", row.check.posting_link), palette);
-        v_flex()
-            .id(SharedString::from(format!("check-{}", row.check.posting_link)))
-            .test_support()
-            .role(gpui_kit::Role::Group)
-            .aria_label(format!("{} · {} · {}", row.company, row.title, row.check.summary()))
-            .gap(px(5.))
-            .pb(px(10.))
-            .border_b_1()
-            .border_color(palette.line)
+        let said = self.row_said(&key, format!("said-{link}"), palette);
+        let cards: Vec<AnyElement> = drafts
+            .into_iter()
+            .map(|row| self.draft_card(row, palette, cx).into_any_element())
+            .collect();
+        section
             .child(
                 h_flex()
-                    .gap(px(10.))
-                    .items_start()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(3.))
-                            .child(
-                                h_flex()
-                                    .gap(px(6.))
-                                    .child(ui::chip(signal, label, palette))
-                                    .children(row.check.team.as_ref().map(|team| ui::boxed(team, palette.faint))),
-                            )
-                            .child(ui::serif(format!("{} · {}", row.company, row.title)).text_color(palette.ink)),
-                    )
-                    .child(ui::score(row.score, 22.).text_color(palette.muted)),
+                    .id(SharedString::from(format!("check-{link}")))
+                    .test_support()
+                    .role(gpui_kit::Role::Label)
+                    .aria_label(check.summary())
+                    .gap(px(6.))
+                    .child(ui::chip(signal, label, palette))
+                    .children(check.team.as_ref().map(|team| ui::boxed(team, palette.faint))),
             )
-            .children(row.check.people.iter().map(|person| {
-                let degree = person
-                    .degree
-                    .as_deref()
-                    .map(|degree| format!(" · {degree}"))
-                    .unwrap_or_default();
+            .children(check.people.iter().map(|person| {
                 h_flex().gap(px(8.)).child(ui::square(palette.signal(signal))).child(
                     div()
                         .min_w_0()
                         .truncate()
                         .text_color(palette.muted)
-                        .child(SharedString::from(format!("{}, {}{degree}", person.name, person.title))),
+                        .child(SharedString::from(person_line(person))),
                 )
             }))
-            .children(row.check.note.as_ref().map(|note| {
+            .children(check.note.as_ref().map(|note| {
                 div()
                     .text_size(px(11.))
                     .text_color(palette.faint)
@@ -740,10 +703,17 @@ impl OutreachView {
             }))
             .children(draft_button.map(|button| h_flex().child(button)))
             .children(said)
+            .children(cards)
+            .into_any_element()
     }
 
-    fn drafts_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let mut rows: Vec<&DraftRow> = self.drafts.iter().collect();
+    /// The Posts tab: the drafts for hiring posts, and the run that finds them.
+    fn posts_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut rows: Vec<&DraftRow> = self
+            .drafts
+            .iter()
+            .filter(|row| matches!(row.draft.about, About::Post(_)))
+            .collect();
         // Drafts waiting for a decision come first; decided ones keep their order below.
         rows.sort_by_key(|row| row.draft.status != Outreach::Drafted);
         let cards: Vec<AnyElement> = rows
@@ -751,8 +721,11 @@ impl OutreachView {
             .map(|row| self.draft_card(row, palette, cx).into_any_element())
             .collect();
         let empty = cards.is_empty().then(|| {
-            ui::serif("No drafts yet. The sweep drafts notes for hiring posts, up to 10 a day.")
-                .text_color(palette.muted)
+            ui::serif(
+                "No drafts yet. Every two hours the sweep reads LinkedIn for hiring posts \
+                 and drafts a note for the ones that fit, up to 10 a day.",
+            )
+            .text_color(palette.muted)
         });
         let run_now = ui::button(
             "run-outreach",
@@ -762,9 +735,8 @@ impl OutreachView {
         .on_click(cx.listener(|this, _, window, cx| this.run_now(true, window, cx)));
         v_flex()
             .id("outreach-drafts")
-            .flex_1()
-            .min_w_0()
-            .h_full()
+            .size_full()
+            .max_w(px(760.))
             .overflow_y_scroll()
             .px(px(20.))
             .py(px(16.))
@@ -772,7 +744,7 @@ impl OutreachView {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(ui::caps(format!("drafts · {} waiting", self.waiting())).text_color(palette.muted))
+                    .child(ui::caps(format!("hiring posts · {} waiting", self.waiting())).text_color(palette.muted))
                     .children(self.working.is_none().then_some(run_now)),
             )
             .children(
@@ -798,13 +770,7 @@ impl OutreachView {
     fn draft_card(&self, row: &DraftRow, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let draft = &row.draft;
         let id = draft.id;
-        let (signal, state) = match draft.status {
-            Outreach::Drafted => (Signal::Model, "drafted"),
-            Outreach::Typed => (Signal::Yours, "typed, click send in chrome"),
-            Outreach::Sent => (Signal::Done, "sent"),
-            Outreach::Replied => (Signal::Done, "replied"),
-            Outreach::Skipped | Outreach::NotStarted => (Signal::Failed, "skipped"),
-        };
+        let (signal, state) = draft_state(draft.status);
         let slot = slot_label(draft);
         let editing = self.editing == Some(id);
         let body: AnyElement = if editing {
@@ -993,8 +959,7 @@ impl Render for OutreachView {
         h_flex()
             .size_full()
             .items_start()
-            .child(self.checks_column(&palette, cx))
-            .child(self.drafts_column(&palette, cx))
+            .child(self.posts_column(&palette, cx))
     }
 }
 
@@ -1097,11 +1062,33 @@ mod tests {
         assert_eq!(slot_label(&draft), "inmail · subject: The backend role on Storage");
     }
 
-    /// A view over the seeded database, with work running on a real runtime so rows can finish.
+    /// Postings' outreach sections, as their cards on the Jobs tab show them.
+    struct Cards {
+        outreach: Entity<OutreachView>,
+        links: Vec<String>,
+    }
+
+    impl Render for Cards {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let palette = Palette::of(cx);
+            let links = self.links.clone();
+            let sections: Vec<AnyElement> = links
+                .iter()
+                .map(|link| {
+                    self.outreach
+                        .update(cx, |outreach, cx| outreach.posting_section(link, &palette, cx))
+                })
+                .collect();
+            v_flex().children(sections)
+        }
+    }
+
+    /// The cards for `links` over the seeded database, with work running on a real runtime so rows can finish.
     fn opened(
         cx: &mut TestAppContext,
         database: &std::path::Path,
         runtime: &tokio::runtime::Runtime,
+        links: &[&str],
     ) -> (gpui_kit::AnyWindowHandle, Entity<OutreachView>) {
         cx.executor().allow_parking();
         cx.update(|cx| {
@@ -1113,12 +1100,19 @@ mod tests {
         let browser = cx.update(|cx| {
             cx.new(|cx| Browser::new(Bridge::new(), background, Ok("/x".into()), None, Some(database), cx))
         });
-        cx.update(|cx| {
+        let links: Vec<String> = links.iter().map(|link| (*link).to_owned()).collect();
+        let (window, cards) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| OutreachView::new(browser, None, window, cx))
+                let outreach = cx.new(|cx| OutreachView::new(browser, None, window, cx));
+                cx.new(|cx| {
+                    cx.observe(&outreach, |_, _, cx| cx.notify()).detach();
+                    Cards { outreach, links }
+                })
             })
             .unwrap()
-        })
+        });
+        let outreach = cards.read_with(cx, |cards, _| cards.outreach.clone());
+        (window, outreach)
     }
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -1165,7 +1159,12 @@ mod tests {
             })
             .unwrap();
         let runtime = runtime();
-        let (window, view) = opened(cx, &database, &runtime);
+        let (window, view) = opened(
+            cx,
+            &database,
+            &runtime,
+            &["https://simplify.jobs/p/1", "https://simplify.jobs/p/2"],
+        );
         let posting = RowKey::Posting("https://simplify.jobs/p/2".into());
         let draft = RowKey::Draft(id);
 
@@ -1232,7 +1231,7 @@ mod tests {
         ));
         finish_posting
             .send(Ok(Finished {
-                said: "Drafted a connection note to Cy Person. It is first under Drafts, outlined.".into(),
+                said: "Drafted a connection note to Cy Person. It is below, outlined.".into(),
                 draft: Some(id),
             }))
             .unwrap();
@@ -1241,7 +1240,7 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(
                 window.find("said-https://simplify.jobs/p/2").label(),
-                Some("Drafted a connection note to Cy Person. It is first under Drafts, outlined.")
+                Some("Drafted a connection note to Cy Person. It is below, outlined.")
             );
             assert_eq!(
                 window.find(SharedString::from(format!("said-draft-{id}"))).label(),
@@ -1259,7 +1258,7 @@ mod tests {
         let database = scratch.path().join("maverick.db");
         let id = seeded(&database);
         let runtime = runtime();
-        let (window, view) = opened(cx, &database, &runtime);
+        let (window, view) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"]);
         let checks = || Store::open(&database).unwrap().checks().unwrap();
         let before = checks();
         let at: Timestamp = "2026-11-23T18:00:00Z".parse().unwrap();
@@ -1282,7 +1281,10 @@ mod tests {
                     Some("Back to waiting for your approval.")
                 );
                 assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_some());
-                assert_eq!(view.read(cx).waiting(), 1);
+                assert_eq!(
+                    view.read(cx).draft_status("https://simplify.jobs/p/1"),
+                    Some(Outreach::Drafted)
+                );
             })
             .unwrap();
             let draft = Store::open(&database).unwrap().draft(id).unwrap().unwrap();
@@ -1304,19 +1306,101 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_view_lists_verdicts_by_filter_and_a_skip_decides_a_draft(cx: &mut TestAppContext) {
+    fn a_card_shows_its_postings_check_and_draft_and_a_skip_decides_the_draft(cx: &mut TestAppContext) {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let id = seeded(&database);
+        let runtime = runtime();
+        let (window, view) = opened(
+            cx,
+            &database,
+            &runtime,
+            &["https://simplify.jobs/p/1", "https://simplify.jobs/p/2"],
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("check-https://simplify.jobs/p/1").label(),
+                Some("Team member found: Bo Sample, Storage Engineer (2nd)")
+            );
+            assert_eq!(
+                window.find("check-https://simplify.jobs/p/2").label(),
+                Some("None, apply cold")
+            );
+            assert_eq!(
+                window.find(SharedString::from(format!("draft-{id}"))).label(),
+                Some("Bo Sample · Backend Engineer at Example Co · drafted")
+            );
+            // The draft exists, so the check offers no second one.
+            assert!(window.try_find("draft-https://simplify.jobs/p/1").is_none());
+            let outreach = view.read(cx);
+            assert_eq!(
+                outreach.reachable(),
+                HashSet::from(["https://simplify.jobs/p/1".to_owned()])
+            );
+            assert_eq!(
+                outreach.draft_status("https://simplify.jobs/p/1"),
+                Some(Outreach::Drafted)
+            );
+            assert_eq!(outreach.draft_status("https://simplify.jobs/p/2"), None);
+            // A posting's draft does not wait on the Posts tab.
+            assert_eq!(outreach.waiting(), 0);
+
+            view.update(cx, |view, cx| view.set_status(id, Outreach::Skipped, cx));
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(SharedString::from(format!("draft-{id}"))).label(),
+                Some("Bo Sample · Backend Engineer at Example Co · skipped")
+            );
+            assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_none());
+            assert_eq!(
+                view.read(cx).draft_status("https://simplify.jobs/p/1"),
+                Some(Outreach::Skipped)
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_posts_tab_lists_only_hiring_post_drafts(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::ui::install(cx);
         });
         let scratch = tempfile::tempdir().unwrap();
         let database = scratch.path().join("maverick.db");
-        let id = seeded(&database);
+        let posting_draft = seeded(&database);
+        let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
+        let post_draft = Store::open(&database)
+            .unwrap()
+            .add_draft(&Draft {
+                id: 0,
+                about: About::Post("https://www.linkedin.com/feed/update/urn:li:activity:1/".into()),
+                person: "Di Poster".into(),
+                headline: "Engineering Manager".into(),
+                profile_url: "https://www.linkedin.com/in/di-poster/".into(),
+                slot: Slot::Note,
+                subject: None,
+                text: "Hi Di, I saw your post about the backend team.".into(),
+                status: Outreach::Drafted,
+                created_at: at,
+                updated_at: at,
+            })
+            .unwrap()
+            .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let bridge = Bridge::new();
         let background = runtime.handle().clone();
         let browser = cx.update(|cx| {
-            cx.new(|cx| Browser::new(bridge, background, Ok("/x".into()), None, Some(database.clone()), cx))
+            cx.new(|cx| {
+                Browser::new(
+                    Bridge::new(),
+                    background,
+                    Ok("/x".into()),
+                    None,
+                    Some(database.clone()),
+                    cx,
+                )
+            })
         });
         let (window, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -1326,32 +1410,18 @@ mod tests {
         });
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(
-                window.find("check-https://simplify.jobs/p/1").label(),
-                Some("Example Co · Backend Engineer · Team member found: Bo Sample, Storage Engineer (2nd)")
+            assert!(
+                window
+                    .try_find(SharedString::from(format!("draft-{post_draft}")))
+                    .is_some()
             );
-            assert!(window.try_find("check-https://simplify.jobs/p/2").is_none());
-            assert_eq!(
-                window.find(SharedString::from(format!("draft-{id}"))).label(),
-                Some("Bo Sample · Backend Engineer at Example Co · drafted")
+            assert!(
+                window
+                    .try_find(SharedString::from(format!("draft-{posting_draft}")))
+                    .is_none()
             );
-            assert_eq!(view.read(cx).waiting(), 1);
-            // The draft exists, so the check offers no second one.
-            assert!(window.try_find("draft-https://simplify.jobs/p/1").is_none());
-
-            view.update(cx, |view, cx| {
-                view.filter = Filter::ApplyCold;
-                view.set_status(id, Outreach::Skipped, cx);
-            });
-            window.render_frame(cx);
             assert!(window.try_find("check-https://simplify.jobs/p/1").is_none());
-            assert!(window.try_find("check-https://simplify.jobs/p/2").is_some());
-            assert_eq!(
-                window.find(SharedString::from(format!("draft-{id}"))).label(),
-                Some("Bo Sample · Backend Engineer at Example Co · skipped")
-            );
-            assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_none());
-            assert_eq!(view.read(cx).waiting(), 0);
+            assert_eq!(view.read(cx).waiting(), 1);
         })
         .unwrap();
     }

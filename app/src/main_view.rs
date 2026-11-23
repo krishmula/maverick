@@ -17,12 +17,11 @@ use maverick_core::bridge::{BrowserState, Tab};
 use gpui_kit::TestSupportExt as _;
 
 use crate::band::{Band, Mark};
-use crate::board::Board;
+use crate::board::{Board, Entry, system_name};
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::connections::Connections;
 use crate::connections::OpenSetup;
 use crate::icon::AppIcon;
-use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
 use crate::outreach::OutreachView;
 use crate::pane_widths::Pane;
@@ -45,13 +44,12 @@ const TRACKED: usize = 6;
 #[derive(Clone, Copy, PartialEq)]
 enum Showing {
     Tabs,
+    /// The postings to approve or skip, the people to reach at each, and the applications sent.
     Jobs,
-    /// The decision board.
-    Approvals,
     /// What is due in TickTick.
     Mav,
-    /// Who to reach out to, and the LinkedIn drafts waiting for the user.
-    Outreach,
+    /// Hiring posts found on LinkedIn, and the notes drafted for them.
+    Posts,
     /// The Google profiles, TickTick, the model and Chrome.
     Connections,
     /// The first-run guide.
@@ -63,7 +61,6 @@ pub struct MainView {
     showing: Showing,
     icon: AppIcon,
     icon_file: Option<PathBuf>,
-    jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
     board: Entity<Board>,
     mav: Entity<Mav>,
@@ -89,27 +86,17 @@ impl MainView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let Lists { jobs, cells, board } = lists;
+        let Lists { cells, board } = lists;
         // A first start opens the guide, so a new user sets up a model before anything needs one.
-        let showing = if first_run {
-            Showing::Setup
-        } else if board.entries.iter().any(|entry| entry.decision.is_none()) {
-            // Postings that wait on a decision come first: approving one is what starts an application.
-            Showing::Approvals
-        } else if jobs.is_empty() {
-            Showing::Tabs
-        } else {
-            Showing::Jobs
-        };
-        let jobs = cx.new(|cx| ListState::new(JobList::new(browser.clone(), jobs), window, cx).searchable(true));
+        let showing = if first_run { Showing::Setup } else { Showing::Jobs };
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
         let database = browser.read(cx).database();
-        let board = cx.new(|cx| Board::new(browser.clone(), board, database.clone(), window, cx));
-        let mav = cx.new(|cx| Mav::new(background, database, window, cx));
-        let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let answers = browser.read(cx).answers_file();
         let outreach = cx.new(|cx| OutreachView::new(browser.clone(), answers, window, cx));
+        let board = cx.new(|cx| Board::new(browser.clone(), outreach.clone(), board, database.clone(), window, cx));
+        let mav = cx.new(|cx| Mav::new(background, database, window, cx));
+        let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let setup = cx.new(|cx| Setup::new(connections.clone(), cx));
         let _subscriptions = vec![
             cx.subscribe_in(&setup, window, |this, _, _: &Finished, window, cx| {
@@ -120,33 +107,14 @@ impl MainView {
             }),
             // The bar counts what is due and what waits on a decision.
             cx.observe(&mav, |_, _, cx| cx.notify()),
-            cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe(&outreach, |_, _, cx| cx.notify()),
             cx.observe_in(&browser, window, |this, browser, window, cx| {
                 this.show_current_tabs(window, cx);
-                // A job leaves the list once its application went through.
-                let applied: Vec<String> = browser
-                    .read(cx)
-                    .applied()
-                    .iter()
-                    .map(|sent| sent.address.clone())
-                    .collect();
-                for address in &applied {
-                    this.band.mark_applied(address);
+                // A job's cell turns applied once its application went through.
+                for sent in browser.read(cx).applied() {
+                    this.band.mark_applied(&sent.address);
                 }
                 this.offer_follow_ups(cx);
-                this.jobs.update(cx, |jobs, cx| {
-                    let listed = jobs.delegate().len();
-                    for address in &applied {
-                        jobs.delegate_mut().remove(address);
-                    }
-                    // Only a removal moves the selection. Anything else would undo the user's scrolling.
-                    if jobs.delegate().len() != listed {
-                        let shown = jobs.delegate().shown();
-                        keep_a_row_selected(jobs, shown, window, cx);
-                    }
-                    cx.notify();
-                });
                 cx.notify();
             }),
             cx.subscribe_in(&tabs, window, |this, tabs, event: &ListEvent, window, cx| {
@@ -160,15 +128,8 @@ impl MainView {
                 // The detail pane follows the selection.
                 cx.notify();
             }),
-            cx.subscribe_in(&jobs, window, |this, jobs, event: &ListEvent, window, cx| {
-                if let ListEvent::Confirm(ix) = event
-                    && let Some(job) = jobs.read(cx).delegate().job_at(*ix).cloned()
-                {
-                    this.act_on(&job, cx);
-                    jobs.update(cx, |jobs, cx| jobs.focus(window, cx));
-                }
-                cx.notify();
-            }),
+            // The band follows the selected posting.
+            cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |_, window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
             }),
@@ -193,7 +154,6 @@ impl MainView {
             showing,
             icon,
             icon_file,
-            jobs,
             tabs,
             board,
             mav,
@@ -208,10 +168,6 @@ impl MainView {
             _drift,
         };
         view.show_current_tabs(window, cx);
-        view.jobs.update(cx, |jobs, cx| {
-            let shown = jobs.delegate().shown();
-            keep_a_row_selected(jobs, shown, window, cx);
-        });
         view.show(showing, window, cx);
         view
     }
@@ -234,13 +190,12 @@ impl MainView {
         self.showing = showing;
         match showing {
             Showing::Tabs => self.tabs.update(cx, |tabs, cx| tabs.focus(window, cx)),
-            Showing::Jobs => self.jobs.update(cx, |jobs, cx| jobs.focus(window, cx)),
-            Showing::Approvals => self.board.update(cx, |board, cx| board.focus(window, cx)),
+            Showing::Jobs => self.board.update(cx, |board, cx| board.focus(window, cx)),
             Showing::Mav => self.mav.update(cx, |mav, cx| {
                 mav.load(cx);
                 mav.focus(window, cx);
             }),
-            Showing::Outreach => self.outreach.update(cx, |outreach, cx| {
+            Showing::Posts => self.outreach.update(cx, |outreach, cx| {
                 outreach.reload();
                 cx.notify();
             }),
@@ -272,27 +227,8 @@ impl MainView {
         });
     }
 
-    /// What Enter does to a job: opens its form and fills it, or, once that is done,
-    /// brings the filled form forward for the user to review.
-    fn act_on(&mut self, job: &Job, cx: &mut Context<Self>) {
-        let subject = Subject::Posting(job.address.clone());
-        let filled = matches!(self.browser.read(cx).fill_of(&subject), Some(Fill::Done { .. }));
-        if filled {
-            self.browser.update(cx, |browser, cx| browser.review(cx));
-            return;
-        }
-        let title = format!("{} at {}", job.title, job.company);
-        self.browser
-            .update(cx, |browser, cx| browser.apply(title, job.address.clone(), cx));
-        self.jobs.update(cx, |jobs, cx| {
-            jobs.delegate_mut().mark_opened(&job.address);
-            cx.notify();
-        });
-    }
-
-    /// The bar: the wordmark, the two lists, and the link to Chrome.
+    /// The bar: the wordmark, the views, and the link to Chrome.
     fn bar(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let jobs = self.jobs.read(cx).delegate().len();
         let showing_now = self.showing;
         let tab = |id: &'static str,
                    name: String,
@@ -342,22 +278,14 @@ impl MainView {
                     .child(
                         h_flex()
                             .gap_4()
-                            .child(tab(
-                                "show-jobs",
-                                format!("Jobs · {jobs}"),
-                                "jobs",
-                                Some(jobs),
-                                Showing::Jobs,
-                                cx,
-                            ))
                             .child({
                                 let pending = self.board.read(cx).pending(cx);
                                 tab(
-                                    "show-approvals",
-                                    format!("Approvals · {pending}"),
-                                    "approvals",
+                                    "show-jobs",
+                                    format!("Jobs · {pending}"),
+                                    "jobs",
                                     Some(pending),
-                                    Showing::Approvals,
+                                    Showing::Jobs,
                                     cx,
                                 )
                             })
@@ -370,9 +298,8 @@ impl MainView {
                             .child({
                                 let waiting = self.outreach.read(cx).waiting();
                                 let count = (waiting > 0).then_some(waiting);
-                                let name =
-                                    count.map_or("Outreach".to_owned(), |waiting| format!("Outreach · {waiting}"));
-                                tab("show-outreach", name, "outreach", count, Showing::Outreach, cx)
+                                let name = count.map_or("Posts".to_owned(), |waiting| format!("Posts · {waiting}"));
+                                tab("show-posts", name, "posts", count, Showing::Posts, cx)
                             }),
                     ),
             )
@@ -433,15 +360,9 @@ impl MainView {
     /// Shows the lists and the status a funnel pass left.
     fn refresh(&mut self, refreshed: Refreshed, window: &mut Window, cx: &mut Context<Self>) {
         self.funnel_status = Some(refreshed.status);
-        if let Some(Lists { jobs, cells, board }) = refreshed.lists {
+        if let Some(Lists { cells, board }) = refreshed.lists {
             self.band.replace(cells);
             self.board.update(cx, |shown, cx| shown.replace(board, window, cx));
-            self.jobs.update(cx, |list, cx| {
-                list.delegate_mut().replace(jobs);
-                let shown = list.delegate().shown();
-                keep_a_row_selected(list, shown, window, cx);
-                cx.notify();
-            });
         }
         cx.notify();
     }
@@ -580,17 +501,20 @@ impl MainView {
         notices
     }
 
-    /// The band, aimed at the selected job and tracking the next best ones.
+    /// The band, aimed at the selected posting and tracking the next best ones.
     fn band(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
-        let mark = |job: &Job| Mark {
-            address: job.address.clone(),
-            score: job.score,
-            title: job.title.clone(),
+        let mark = |entry: &Entry| Mark {
+            address: entry.address.clone(),
+            score: entry.score,
+            title: entry.title.clone(),
         };
-        let jobs = self.jobs.read(cx).delegate();
-        let target = (self.showing == Showing::Jobs).then(|| jobs.selected_job()).flatten();
-        let tracked = jobs
-            .best(TRACKED, target.map(|job| job.address.as_str()))
+        let board = self.board.read(cx);
+        let target = (self.showing == Showing::Jobs)
+            .then(|| board.selected_entry(cx))
+            .flatten();
+        let tracked = board
+            .best(TRACKED, target.map(|entry| entry.address.as_str()), cx)
+            .into_iter()
             .map(mark)
             .collect();
         div()
@@ -601,54 +525,12 @@ impl MainView {
             .child(self.band.element(target.map(mark), tracked, cx))
     }
 
-    /// The detail pane: the selected row, and its fill report once it has one.
+    /// The detail pane: the selected tab, and its fill report once it has one.
     fn pane(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
-        match self.showing {
-            Showing::Jobs => match self.jobs.read(cx).delegate().selected_job().cloned() {
-                Some(job) => self.job_pane(&job, palette, cx),
-                None => v_flex(),
-            },
-            Showing::Tabs => match self.tabs.read(cx).delegate().selected_tab().cloned() {
-                Some(tab) => self.tab_pane(&tab, palette, cx),
-                None => v_flex(),
-            },
-            Showing::Approvals | Showing::Mav | Showing::Outreach | Showing::Connections | Showing::Setup => v_flex(),
+        match self.tabs.read(cx).delegate().selected_tab().cloned() {
+            Some(tab) => self.tab_pane(&tab, palette, cx),
+            None => v_flex(),
         }
-    }
-
-    fn job_pane(&self, job: &Job, palette: &Palette, cx: &mut Context<Self>) -> Div {
-        let fill = self
-            .browser
-            .read(cx)
-            .fill_of(&Subject::Posting(job.address.clone()))
-            .cloned();
-        let tag = match system_name(&job.address) {
-            Some(system) => format!("{} / {system}", job.company),
-            None => job.company.clone(),
-        };
-        let facts = [
-            ("location", job.location.clone().unwrap_or_default()),
-            ("found", job.found_on.clone()),
-            ("source", job.source.clone()),
-            ("address", host_of(&job.address).to_owned()),
-        ];
-        let (word, name, note) = match &fill {
-            None => ("open and fill", "Open and fill", "you click submit."),
-            Some(Fill::Running { .. }) => ("", "", "filling. nothing gets submitted."),
-            Some(Fill::Failed { .. }) => ("try again", "Try again", "nothing was submitted."),
-            Some(_) => ("review in chrome", "Review in Chrome", "you click submit."),
-        };
-        let acted = job.clone();
-        let primary = (!word.is_empty()).then(|| {
-            ui::button("act-on-job", name, ui::primary_face(word, Some("enter"), palette))
-                .on_click(cx.listener(move |this, _, _, cx| this.act_on(&acted, cx)))
-                .into_any_element()
-        });
-        v_flex()
-            .size_full()
-            .child(header(&tag, &job.title, Some(job.score), palette))
-            .children(self.pane_body(fill.as_ref(), &facts, palette))
-            .child(self.footer(primary, fill.as_ref(), note, palette, cx))
     }
 
     fn tab_pane(&self, tab: &Tab, palette: &Palette, cx: &mut Context<Self>) -> Div {
@@ -944,11 +826,11 @@ impl Render for MainView {
             .children(self.notices(&palette, cx))
             // The band tracks jobs, so the Mav view leaves it out.
             .children(matches!(self.showing, Showing::Jobs | Showing::Tabs).then(|| self.band(&palette, cx)))
-            .child(if self.showing == Showing::Approvals {
+            .child(if self.showing == Showing::Jobs {
                 div().flex_1().min_h_0().child(self.board.clone()).into_any_element()
             } else if self.showing == Showing::Mav {
                 div().flex_1().min_h_0().child(self.mav.clone()).into_any_element()
-            } else if self.showing == Showing::Outreach {
+            } else if self.showing == Showing::Posts {
                 div().flex_1().min_h_0().child(self.outreach.clone()).into_any_element()
             } else if self.showing == Showing::Connections {
                 div()
@@ -964,19 +846,11 @@ impl Render for MainView {
                     .min_h_0()
                     .items_start()
                     .child(
-                        div().flex_1().min_w_0().h_full().child(match self.showing {
-                            Showing::Tabs => List::new(&self.tabs)
-                                .search_placeholder("search tabs")
-                                .into_any_element(),
-                            Showing::Jobs
-                            | Showing::Approvals
-                            | Showing::Mav
-                            | Showing::Outreach
-                            | Showing::Connections
-                            | Showing::Setup => List::new(&self.jobs)
-                                .search_placeholder("search jobs")
-                                .into_any_element(),
-                        }),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(List::new(&self.tabs).search_placeholder("search tabs")),
                     )
                     .child(ui::pane_divider(
                         Pane::Details,
@@ -1003,14 +877,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gpui_kit::test::TestWindowExt as _;
+    use std::collections::HashMap;
+
     use gpui_kit::{AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
     use maverick_core::bridge::{self, Bridge, BrowserState};
+    use maverick_core::jobs::{Posting, Stage};
     use serde_json::{Value, json};
 
     use super::MainView;
+    use crate::board::BoardData;
     use crate::browser::{Browser, Fill};
     use crate::icon::AppIcon;
-    use crate::jobs::{Job, job_row_id};
     use crate::tabs::{fill_button_id, row_id};
 
     /// Stands in for Chrome on the other end of the bridge.
@@ -1059,7 +936,7 @@ mod tests {
         runtime: &tokio::runtime::Runtime,
         cx: &mut TestAppContext,
     ) -> gpui_kit::AnyWindowHandle {
-        open_window_with_answers(bridge, runtime, None, Vec::new(), cx).0
+        open_window_with_answers(bridge, runtime, None, BoardData::default(), cx).0
     }
 
     fn open_window_with_icon_file(icon_file: PathBuf, cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {
@@ -1068,28 +945,36 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        open_window(&Bridge::new(), &runtime, None, Vec::new(), Some(icon_file), cx).0
+        open_window(
+            &Bridge::new(),
+            &runtime,
+            None,
+            BoardData::default(),
+            Some(icon_file),
+            cx,
+        )
+        .0
     }
 
     fn open_window_with_answers(
         bridge: &Arc<Bridge>,
         runtime: &tokio::runtime::Runtime,
         answers_file: Option<PathBuf>,
-        jobs: Vec<Job>,
+        board: BoardData,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
-        open_window(bridge, runtime, answers_file, jobs, None, cx)
+        open_window(bridge, runtime, answers_file, board, None, cx)
     }
 
     fn open_window(
         bridge: &Arc<Bridge>,
         runtime: &tokio::runtime::Runtime,
         answers_file: Option<PathBuf>,
-        jobs: Vec<Job>,
+        board: BoardData,
         icon_file: Option<PathBuf>,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Browser>) {
-        let (window, browser, _) = open_window_and_view(bridge, runtime, answers_file, jobs, icon_file, cx);
+        let (window, browser, _) = open_window_and_view(bridge, runtime, answers_file, board, icon_file, cx);
         (window, browser)
     }
 
@@ -1097,7 +982,7 @@ mod tests {
         bridge: &Arc<Bridge>,
         runtime: &tokio::runtime::Runtime,
         answers_file: Option<PathBuf>,
-        jobs: Vec<Job>,
+        board: BoardData,
         icon_file: Option<PathBuf>,
         cx: &mut TestAppContext,
     ) -> (
@@ -1126,7 +1011,7 @@ mod tests {
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     let lists = crate::schedule::Lists {
-                        jobs,
+                        board,
                         ..Default::default()
                     };
                     MainView::new(browser, lists, icon_file, false, window, cx)
@@ -1197,9 +1082,13 @@ mod tests {
             || matches!(bridge.state(), BrowserState::Connected { tabs } if tabs.len() == 2),
         );
         let answers_file = scratch.path().join("answers.json");
-        let (window, browser) = open_window_with_answers(&bridge, &runtime, Some(answers_file.clone()), Vec::new(), cx);
+        let (window, browser) =
+            open_window_with_answers(&bridge, &runtime, Some(answers_file.clone()), BoardData::default(), cx);
 
         cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The window opens on the Jobs tab.
+            window.click("show-tabs", cx);
             window.render_frame(cx);
             assert_eq!(window.find(fill_button_id(1, 21)).label(), Some("Fill form"));
             // This Chrome never said its extension version, as versions before 0.3.0 do not.
@@ -1257,6 +1146,31 @@ mod tests {
         .unwrap();
     }
 
+    /// The board for postings named `titles`, none decided yet.
+    fn board_of(titles: &[&str]) -> BoardData {
+        let postings: Vec<Posting> = titles
+            .iter()
+            .enumerate()
+            .map(|(id, title)| Posting {
+                link: format!("https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb94{id:02}"),
+                found_at: "2026-11-20T12:00:00Z".parse().unwrap(),
+                source: "Simplify".into(),
+                company: "Example Co".into(),
+                title: (*title).into(),
+                location: None,
+                email_subject: None,
+                stage: Stage::Review,
+                score: Some(80),
+                variant: None,
+                flags: None,
+                notes: None,
+                address: None,
+                sponsorship: None,
+            })
+            .collect();
+        BoardData::new(&postings, Vec::new(), &HashMap::new())
+    }
+
     #[gpui_kit::test]
     fn a_funnel_pass_replaces_the_jobs_and_a_failed_pass_keeps_them(cx: &mut TestAppContext) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1264,28 +1178,23 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let job = |id: u8, title: &str| Job {
-            company: "Example Co".into(),
-            title: title.into(),
-            score: Some(80),
-            address: format!("https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb94{id:02}"),
-            ..Job::default()
-        };
-        let (window, _, view) = open_window_and_view(&Bridge::new(), &runtime, None, vec![job(1, "First")], None, cx);
+        let (window, _, view) = open_window_and_view(&Bridge::new(), &runtime, None, board_of(&["First"]), None, cx);
 
-        let pass = |status: &str, lists: Option<Vec<Job>>| crate::schedule::Refreshed {
+        let pass = |status: &str, board: Option<BoardData>| crate::schedule::Refreshed {
             status: status.into(),
-            lists: lists.map(|jobs| crate::schedule::Lists {
-                jobs,
+            lists: board.map(|board| crate::schedule::Lists {
+                board,
                 ..Default::default()
             }),
         };
         cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("show-jobs").label(), Some("Jobs · 1"));
             view.update(cx, |view, cx| {
                 view.refresh(
                     pass(
                         "Checked at 9:00 AM: 2 new postings",
-                        Some(vec![job(1, "First"), job(2, "Second")]),
+                        Some(board_of(&["First", "Second"])),
                     ),
                     window,
                     cx,
@@ -1312,6 +1221,32 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_window_opens_on_the_jobs_tab_and_the_bar_names_posts_not_outreach(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (window, _, _) = open_window_and_view(&Bridge::new(), &runtime, None, board_of(&["First"]), None, cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The Jobs tab is the board, whether or not Chrome is connected.
+            assert_eq!(window.find("board-pending").label(), Some("Pending · 1"));
+            for sort in ["sort-latest", "sort-score", "sort-outreach"] {
+                assert!(window.try_find(sort).is_some(), "the Jobs tab sorts by {sort}");
+            }
+            assert!(window.try_find("show-approvals").is_none());
+            assert!(window.try_find("show-outreach").is_none());
+            assert_eq!(window.find("show-posts").label(), Some("Posts"));
+            window.click("show-posts", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("run-outreach").is_some());
+            assert!(window.try_find("board-pending").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn the_window_shows_how_to_connect_when_chrome_is_not_connected(cx: &mut TestAppContext) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1321,6 +1256,9 @@ mod tests {
         let window = open_main_window(&Bridge::new(), &runtime, cx);
 
         cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The window opens on the Jobs tab.
+            window.click("show-tabs", cx);
             window.render_frame(cx);
             assert_eq!(window.find("show-extension-folder").label(), Some("Show folder"));
             assert!(window.try_find("measure-latency").is_none());
@@ -1354,6 +1292,9 @@ mod tests {
         let window = open_main_window(&bridge, &runtime, cx);
 
         cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The window opens on the Jobs tab.
+            window.click("show-tabs", cx);
             window.render_frame(cx);
             let status = window.find("measure-latency").label().map(str::to_owned);
             assert!(
@@ -1400,128 +1341,5 @@ mod tests {
             None,
             "no tab matches, so Enter does nothing"
         );
-    }
-
-    #[gpui_kit::test]
-    fn choosing_a_job_opens_a_new_tab_for_its_form(cx: &mut TestAppContext) {
-        cx.executor().allow_parking();
-        let scratch = tempfile::tempdir().unwrap();
-        let socket = scratch.path().join("bridge.sock");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let bridge: Arc<Bridge> = Bridge::new();
-        runtime.spawn(bridge.clone().serve(bridge::bind(&socket).unwrap()));
-        let mut chrome = FakeBrowser(UnixStream::connect(&socket).unwrap());
-        chrome.send(json!({ "kind": "tabs", "tabs": [
-            { "id": 22, "windowId": 5, "title": "Inbox", "url": "https://mail.example.com/", "active": true },
-        ] }));
-        wait_until(
-            "the bridge holds the tab",
-            || matches!(bridge.state(), BrowserState::Connected { tabs } if tabs.len() == 1),
-        );
-        let answers_file = scratch.path().join("answers.json");
-        std::fs::write(
-            &answers_file,
-            r#"{ "name": "Ada Example", "email": "ada@example.com", "phone": "+1 555 0100", "resume": "/tmp/ada.pdf" }"#,
-        )
-        .unwrap();
-        let posting = "https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb9455";
-        let jobs = vec![Job {
-            company: "Example Co".into(),
-            title: "Backend Engineer".into(),
-            score: Some(82),
-            address: posting.into(),
-            ..Job::default()
-        }];
-        let (window, browser) = open_window_with_answers(&bridge, &runtime, Some(answers_file), jobs, cx);
-
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            // With a job to show, the window opens on the jobs list and its detail pane.
-            assert_eq!(window.find("show-jobs").label(), Some("Jobs · 1"));
-            assert_eq!(window.find("show-approvals").label(), Some("Approvals · 0"));
-            assert_eq!(window.find("act-on-job").label(), Some("Open and fill"));
-            window.click("show-approvals", cx);
-            window.render_frame(cx);
-            assert_eq!(window.find("board-pending").label(), Some("Pending · 0"));
-            assert!(window.try_find("act-on-job").is_none());
-            window.click("show-tabs", cx);
-            window.render_frame(cx);
-            assert!(window.try_find(job_row_id(0)).is_none());
-            assert!(window.try_find("act-on-job").is_none());
-            window.click("show-jobs", cx);
-            window.render_frame(cx);
-            window.click(job_row_id(0), cx);
-        })
-        .unwrap();
-
-        // Chrome opens an empty tab, the debugger attaches, and only then does the form load.
-        let mut asked = Vec::new();
-        loop {
-            let request = chrome
-                .next_command(Duration::from_secs(5))
-                .expect("the fill reaches Chrome");
-            let id = request["id"].clone();
-            let method = request["method"].as_str().unwrap().to_owned();
-            let command = request["command"].as_str().unwrap_or_default().to_owned();
-            asked.push(if command.is_empty() {
-                method.clone()
-            } else {
-                command.clone()
-            });
-            match (method.as_str(), command.as_str()) {
-                ("tabs.create", _) => {
-                    assert_eq!(
-                        (request["url"].clone(), request["active"].clone()),
-                        (json!("about:blank"), json!(true))
-                    );
-                    chrome.send(json!({ "kind": "result", "id": id, "value": { "id": 31, "windowId": 5 } }));
-                }
-                (_, "Page.navigate") => {
-                    assert_eq!(request["tabId"], json!(31));
-                    assert_eq!(request["params"]["url"], json!(format!("{posting}/application")));
-                    chrome.send(json!({ "kind": "result", "id": id, "value": { "errorText": "net::ERR_FAILED" } }));
-                }
-                ("debugger.detach", _) => {
-                    chrome.send(json!({ "kind": "result", "id": id, "value": null }));
-                    break;
-                }
-                _ => chrome.send(json!({ "kind": "result", "id": id, "value": {} })),
-            }
-        }
-        assert_eq!(
-            asked,
-            [
-                "tabs.create",
-                "debugger.attach",
-                "Page.enable",
-                "Emulation.setFocusEmulationEnabled",
-                "Page.navigate",
-                "debugger.detach"
-            ]
-        );
-        assert_eq!(
-            fill_ended(&browser, cx),
-            Fill::Failed {
-                title: "Backend Engineer at Example Co".into(),
-                reason: "the page did not load: net::ERR_FAILED".into()
-            }
-        );
-
-        // The detail pane now shows the failed run for this job. Its button does what Enter does.
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(window.find("act-on-job").label(), Some("Try again"));
-            assert_eq!(window.find("close-fill-report").label(), Some("Close"));
-            window.click("act-on-job", cx);
-        })
-        .unwrap();
-        let again = chrome
-            .next_command(Duration::from_secs(5))
-            .expect("Try again reaches Chrome");
-        assert_eq!(again["method"], "tabs.create");
     }
 }

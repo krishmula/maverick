@@ -1,14 +1,16 @@
-//! The decision board: the postings that wait on the user's Approve or Skip, and the applications already sent.
+//! The Jobs tab: the postings that wait on the user's Approve or Skip, the people to reach at each,
+//! and the applications already sent.
 //!
 //! Decisions are kept in the local database, apart from the postings a sheet sync rewrites.
-//! They never go to the sheet. Approving a posting puts it in the apply queue.
+//! They never go to the sheet. Approving a posting puts it in the apply queue, which fills
+//! several forms at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::browser::Browser;
-use crate::jobs::system_name;
 use crate::main_view::header;
+use crate::outreach::{OutreachView, draft_state, person_line, verdict_signal};
 use crate::queue::{Run, Step};
 use crate::report;
 use crate::tabs::host_of;
@@ -21,8 +23,11 @@ use gpui_kit::{
     Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
-use maverick_core::apply;
-use maverick_core::jobs::{Application, ApplicationStatus, Decision, Posting, Sponsorship, Stage, posting_address};
+use maverick_core::apply::{self, System};
+use maverick_core::jobs::{
+    Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage, posting_address,
+};
+use maverick_core::outreach::Check;
 use maverick_core::score::APPLY_READY;
 use maverick_core::store::Store;
 
@@ -62,6 +67,15 @@ impl Entry {
     }
 }
 
+/// The posting's own address when Maverick knows it, otherwise the link it was found by.
+pub fn address_of(posting: &Posting) -> String {
+    let address = posting
+        .address
+        .clone()
+        .unwrap_or_else(|| posting_address(&posting.link));
+    apply::posting_address(&address).unwrap_or(address)
+}
+
 /// What the board shows: the postings and the applications.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BoardData {
@@ -95,12 +109,7 @@ impl BoardData {
                 location: posting.location.clone(),
                 found_at: posting.found_at,
                 source: posting.source.clone(),
-                address: own_address(
-                    posting
-                        .address
-                        .clone()
-                        .unwrap_or_else(|| posting_address(&posting.link)),
-                ),
+                address: address_of(posting),
                 apply_ready: posting
                     .notes
                     .as_deref()
@@ -115,6 +124,15 @@ impl BoardData {
         entries.retain(|entry| seen.insert(entry.address.clone()));
         Self { entries, applications }
     }
+}
+
+/// The application system a posting is on, when Maverick can fill its form.
+pub fn system_name(address: &str) -> Option<&'static str> {
+    Some(match System::of(address)? {
+        System::Ashby => "Ashby",
+        System::Greenhouse => "Greenhouse",
+        System::Workday => "Workday",
+    })
 }
 
 /// The application system at `address`. Maverick fills the first three. The rest open for the user.
@@ -142,10 +160,32 @@ pub fn system_label(address: &str) -> &'static str {
 /// How the pending postings are ordered.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Order {
-    /// Apply-ready first, then the best score.
-    TopScore,
     /// The most recently found first.
     Latest,
+    /// Apply-ready first, then the best score.
+    TopScore,
+    /// Postings with someone to reach first, then as by top score.
+    Outreach,
+}
+
+impl Order {
+    const ALL: [Order; 3] = [Order::Latest, Order::TopScore, Order::Outreach];
+
+    fn id(self) -> &'static str {
+        match self {
+            Order::Latest => "sort-latest",
+            Order::TopScore => "sort-score",
+            Order::Outreach => "sort-outreach",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Order::Latest => "latest",
+            Order::TopScore => "top score",
+            Order::Outreach => "outreach",
+        }
+    }
 }
 
 /// How the applications are ordered.
@@ -156,17 +196,24 @@ pub enum SubmittedOrder {
     Company,
 }
 
-/// Puts the entries in `order`. Decided entries always come after the pending ones.
-pub fn sort(entries: &mut [Entry], order: Order) {
+/// Puts the entries in `order`. `reachable` holds the links of postings with someone to reach.
+/// Decided entries always come after the pending ones.
+pub fn sort(entries: &mut [Entry], order: Order, reachable: &HashSet<String>) {
+    let top_score = |a: &Entry, b: &Entry| {
+        b.apply_ready
+            .cmp(&a.apply_ready)
+            .then(b.score.cmp(&a.score))
+            .then(b.found_at.cmp(&a.found_at))
+    };
     entries.sort_by(|a, b| {
         let pending_first = a.decision.is_some().cmp(&b.decision.is_some());
         pending_first.then_with(|| match order {
-            Order::TopScore => b
-                .apply_ready
-                .cmp(&a.apply_ready)
-                .then(b.score.cmp(&a.score))
-                .then(b.found_at.cmp(&a.found_at)),
+            Order::TopScore => top_score(a, b),
             Order::Latest => b.found_at.cmp(&a.found_at).then(b.score.cmp(&a.score)),
+            Order::Outreach => reachable
+                .contains(&b.link)
+                .cmp(&reachable.contains(&a.link))
+                .then_with(|| top_score(a, b)),
         })
     });
 }
@@ -198,6 +245,7 @@ pub enum Section {
 
 pub struct Rows {
     browser: Entity<Browser>,
+    outreach: Entity<OutreachView>,
     section: Section,
     entries: Vec<Entry>,
     submitted: Vec<Application>,
@@ -248,6 +296,35 @@ fn step_chip(step: &Step, palette: &Palette) -> Div {
     }
 }
 
+/// The card's line on whom to reach: the people found, or why there is no one.
+fn reach_line(check: Option<&Check>, palette: &Palette) -> Div {
+    let Some(check) = check else {
+        return ui::caps("outreach not checked yet")
+            .truncate()
+            .text_color(palette.faint);
+    };
+    let Some(first) = check.people.first().filter(|_| check.verdict.found_people()) else {
+        let said = match check.verdict {
+            maverick_core::outreach::Verdict::Deferred => "outreach: lookup deferred",
+            _ => "outreach: no one, apply cold",
+        };
+        return ui::caps(said).truncate().text_color(palette.faint);
+    };
+    let more = match check.people.len() {
+        1 => String::new(),
+        count => format!("  +{}", count - 1),
+    };
+    h_flex()
+        .min_w_0()
+        .gap(px(7.))
+        .child(ui::square(palette.signal(verdict_signal(check.verdict))))
+        .child(
+            ui::caps(format!("reach {}{more}", person_line(first)))
+                .truncate()
+                .text_color(palette.muted),
+        )
+}
+
 fn decision_chip(decision: Decision, palette: &Palette) -> Div {
     match decision {
         Decision::Approved => ui::chip(Signal::Done, "approved", palette),
@@ -280,6 +357,13 @@ impl ListDelegate for Rows {
                 let mut more = vec![entry.found_at.strftime("%b %-d").to_string()];
                 more.extend(entry.location.clone());
                 more.extend(entry.flags.clone());
+                let outreach = self.outreach.read(cx);
+                let reach = reach_line(outreach.check(&entry.link), &palette);
+                let draft = outreach.draft_status(&entry.link).map(|status| {
+                    let (signal, word) = draft_state(status);
+                    let word = if status == Outreach::Typed { "typed" } else { word };
+                    ui::chip(signal, format!("note {word}"), &palette)
+                });
                 h_flex()
                     .gap_3()
                     .child(ui::score(entry.score, 19.).w(px(30.)).text_color(tone))
@@ -289,8 +373,10 @@ impl ListDelegate for Rows {
                             .min_w_0()
                             .child(ui::serif(entry.title.clone()).truncate().text_color(tone))
                             .child(ui::caps(from.join(" / ")).truncate().text_color(palette.faint))
-                            .child(ui::caps(more.join(" · ")).truncate().text_color(palette.faint)),
+                            .child(ui::caps(more.join(" · ")).truncate().text_color(palette.faint))
+                            .child(reach),
                     )
+                    .children(draft)
                     .children(
                         entry
                             .apply_ready
@@ -352,6 +438,7 @@ impl ListDelegate for Rows {
 
 pub struct Board {
     browser: Entity<Browser>,
+    outreach: Entity<OutreachView>,
     database: Option<PathBuf>,
     list: Entity<ListState<Rows>>,
     order: Order,
@@ -369,6 +456,7 @@ pub struct Board {
 impl Board {
     pub fn new(
         browser: Entity<Browser>,
+        outreach: Entity<OutreachView>,
         data: BoardData,
         database: Option<PathBuf>,
         window: &mut Window,
@@ -376,6 +464,7 @@ impl Board {
     ) -> Self {
         let rows = Rows {
             browser: browser.clone(),
+            outreach: outreach.clone(),
             section: Section::Pending,
             entries: Vec::new(),
             submitted: Vec::new(),
@@ -391,9 +480,15 @@ impl Board {
                 cx.notify();
             }),
             cx.observe_in(&browser, window, |this, _, window, cx| this.move_applied(window, cx)),
+            // A check or a draft changes what the cards say about outreach.
+            cx.observe(&outreach, |this, _, cx| {
+                this.list.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
         ];
         let mut board = Self {
             browser,
+            outreach,
             database,
             list,
             order: Order::TopScore,
@@ -411,11 +506,12 @@ impl Board {
     /// Shows what the database holds now, keeping the section and the orders.
     pub fn replace(&mut self, data: BoardData, window: &mut Window, cx: &mut Context<Self>) {
         let (order, submitted_order) = (self.order, self.submitted_order);
+        let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
             rows.entries = data.entries;
             rows.submitted = data.applications;
-            sort(&mut rows.entries, order);
+            sort(&mut rows.entries, order, &reachable);
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
         });
@@ -426,6 +522,26 @@ impl Board {
     pub fn pending(&self, cx: &App) -> usize {
         let rows = self.list.read(cx).delegate();
         rows.entries.iter().filter(|entry| entry.decision.is_none()).count()
+    }
+
+    /// The selected posting, when the pending list shows.
+    pub fn selected_entry<'a>(&self, cx: &'a App) -> Option<&'a Entry> {
+        self.list.read(cx).delegate().selected_entry()
+    }
+
+    /// The best pending postings, without the one at `except`.
+    pub fn best<'a>(&self, count: usize, except: Option<&str>, cx: &'a App) -> Vec<&'a Entry> {
+        let mut pending: Vec<&Entry> = self
+            .list
+            .read(cx)
+            .delegate()
+            .entries
+            .iter()
+            .filter(|entry| entry.decision.is_none() && Some(entry.address.as_str()) != except)
+            .collect();
+        pending.sort_by_key(|entry| std::cmp::Reverse(entry.score));
+        pending.truncate(count);
+        pending
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -443,8 +559,9 @@ impl Board {
 
     fn set_order(&mut self, order: Order, window: &mut Window, cx: &mut Context<Self>) {
         self.order = order;
+        let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
-            sort(&mut list.delegate_mut().entries, order);
+            sort(&mut list.delegate_mut().entries, order, &reachable);
             select_row(list, 0, window, cx);
         });
         cx.notify();
@@ -462,6 +579,7 @@ impl Board {
     /// Decides the selected posting. The selection stays in place, so it lands on the next pending one.
     pub fn decide(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.order;
+        let reachable = self.outreach.read(cx).reachable();
         let decided = self.list.update(cx, |list, cx| {
             let row = list.selected_index()?.row;
             let rows = list.delegate_mut();
@@ -471,7 +589,7 @@ impl Board {
             let entry = rows.entries.get_mut(row)?;
             let before = entry.decision.replace(decision);
             let link = entry.link.clone();
-            sort(&mut rows.entries, order);
+            sort(&mut rows.entries, order, &reachable);
             select_row(list, row, window, cx);
             Some((link, before))
         });
@@ -555,13 +673,14 @@ impl Board {
             return;
         };
         let order = self.order;
+        let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
             rows.section = Section::Pending;
             if let Some(entry) = rows.entries.iter_mut().find(|entry| entry.link == link) {
                 entry.decision = before;
             }
-            sort(&mut rows.entries, order);
+            sort(&mut rows.entries, order, &reachable);
             let row = rows.entries.iter().position(|entry| entry.link == link).unwrap_or(0);
             select_row(list, row, window, cx);
         });
@@ -595,6 +714,10 @@ impl Board {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Letters typed into a draft are text, not decisions.
+        if self.outreach.read(cx).is_editing() {
+            return;
+        }
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
             "z" if modifiers.platform => self.undo(window, cx),
@@ -620,17 +743,20 @@ impl Board {
             ui::button(id, name, face)
         };
         let orders: Vec<AnyElement> = match section {
-            Section::Pending => [
-                (Order::TopScore, "sort-score", "top score"),
-                (Order::Latest, "sort-latest", "latest"),
-            ]
-            .into_iter()
-            .map(|(order, id, word)| {
-                choice(id, format!("Sort by {word}"), word.to_owned(), self.order == order)
+            Section::Pending => Order::ALL
+                .into_iter()
+                .map(|order| {
+                    let word = order.word();
+                    choice(
+                        order.id(),
+                        format!("Sort by {word}"),
+                        word.to_owned(),
+                        self.order == order,
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| this.set_order(order, window, cx)))
                     .into_any_element()
-            })
-            .collect(),
+                })
+                .collect(),
             Section::Submitted => [
                 (SubmittedOrder::Latest, "sort-applied", "latest"),
                 (SubmittedOrder::Company, "sort-company", "company a-z"),
@@ -762,7 +888,7 @@ impl Board {
                 .child(header("submitted", &role, None, palette))
                 .child(div().px_4().py_3().child(ui::facts(&facts, palette)));
         }
-        let Some(entry) = rows.selected_entry() else {
+        let Some(entry) = rows.selected_entry().cloned() else {
             return v_flex();
         };
         let sponsorship = match entry.sponsorship {
@@ -801,6 +927,10 @@ impl Board {
             Some(Step::Failed(_)) => ("try again", "Try again"),
             Some(_) => ("", ""),
         };
+        let link = entry.link.clone();
+        let outreach = self
+            .outreach
+            .update(cx, |outreach, cx| outreach.posting_section(&link, palette, cx));
         let reviewable = run
             .as_ref()
             .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
@@ -833,6 +963,7 @@ impl Board {
                     .overflow_y_scroll()
                     .px_4()
                     .py_3()
+                    .child(outreach)
                     .child(match run.as_ref().and_then(|run| run.report.as_ref()) {
                         Some(report) => report::sections(report, palette),
                         None => ui::facts(&facts, palette),
@@ -1043,7 +1174,8 @@ mod tests {
         ]);
         let mut entries = BoardData::new(&postings, applications, &decisions).entries;
 
-        sort(&mut entries, Order::TopScore);
+        let none = HashSet::new();
+        sort(&mut entries, Order::TopScore, &none);
         assert_eq!(
             titles(&entries),
             [
@@ -1058,12 +1190,29 @@ mod tests {
         assert_eq!(entries[1].sponsorship, Sponsorship::Unknown);
         assert_eq!(entries[0].system(), "Simplify");
 
-        sort(&mut entries, Order::Latest);
+        sort(&mut entries, Order::Latest, &none);
         assert_eq!(
             titles(&entries),
             [
                 "Unscored",
                 "Middling",
+                "Ready",
+                "High but not ready",
+                "Skipped but decided"
+            ]
+        );
+
+        // Postings with someone to reach come first, each group by top score.
+        let reachable = HashSet::from([
+            "https://simplify.jobs/p/1".to_owned(),
+            "https://simplify.jobs/p/4".to_owned(),
+        ]);
+        sort(&mut entries, Order::Outreach, &reachable);
+        assert_eq!(
+            titles(&entries),
+            [
+                "Middling",
+                "Unscored",
                 "Ready",
                 "High but not ready",
                 "Skipped but decided"
@@ -1155,7 +1304,8 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Board::new(browser.clone(), data, Some(database.clone()), window, cx))
+                let outreach = cx.new(|cx| OutreachView::new(browser.clone(), None, window, cx));
+                cx.new(|cx| Board::new(browser.clone(), outreach, data, Some(database.clone()), window, cx))
             })
             .expect("the test window opens")
         });
