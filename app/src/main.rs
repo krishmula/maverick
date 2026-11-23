@@ -7,6 +7,7 @@ mod jobs;
 mod main_view;
 mod mav;
 mod models;
+mod pane_widths;
 mod report;
 mod schedule;
 mod setup;
@@ -113,6 +114,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            let widths_file = maverick_core::data_dir().map(|dir| dir.join("pane-widths.json"));
+            cx.set_global(pane_widths::PaneWidths::load(widths_file));
             ui::install(cx);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
