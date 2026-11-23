@@ -10,7 +10,7 @@ use gpui_kit::component::{IndexPath, Theme, TitleBar, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    canvas, div, fill, img, point, px, relative, size,
+    canvas, div, fill, img, point, px, size,
 };
 use maverick_core::bridge::{BrowserState, Tab};
 
@@ -23,6 +23,7 @@ use crate::connections::OpenSetup;
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
+use crate::pane_widths::Pane;
 use crate::report;
 use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Refreshed};
 use crate::setup::{Finished, Setup};
@@ -894,8 +895,15 @@ fn grid(color: gpui_kit::Hsla) -> impl IntoElement {
 }
 
 impl Render for MainView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::of(cx);
+        let available = window.viewport_size().width - ui::DIVIDER_WIDTH;
+        let pane_max = (available * 0.68).clamp(px(280.), px(900.));
+        let pane_default = (available * 0.52).min(px(PANE_WIDTH));
+        let pane_width = Pane::Details
+            .width(cx)
+            .unwrap_or(pane_default)
+            .clamp(px(280.), pane_max);
         let connected = matches!(self.browser.read(cx).state(), BrowserState::Connected { .. });
         v_flex()
             .relative()
@@ -926,31 +934,26 @@ impl Render for MainView {
                     .min_h_0()
                     .items_start()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .border_r_1()
-                            .border_color(palette.line)
-                            .child(match self.showing {
-                                Showing::Tabs => List::new(&self.tabs)
-                                    .search_placeholder("search tabs")
-                                    .into_any_element(),
-                                Showing::Jobs | Showing::Mav | Showing::Connections | Showing::Setup => {
-                                    List::new(&self.jobs)
-                                        .search_placeholder("search jobs")
-                                        .into_any_element()
-                                }
-                            }),
+                        div().flex_1().min_w_0().h_full().child(match self.showing {
+                            Showing::Tabs => List::new(&self.tabs)
+                                .search_placeholder("search tabs")
+                                .into_any_element(),
+                            Showing::Jobs | Showing::Mav | Showing::Connections | Showing::Setup => {
+                                List::new(&self.jobs)
+                                    .search_placeholder("search jobs")
+                                    .into_any_element()
+                            }
+                        }),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(relative(0.52))
-                            .max_w(px(PANE_WIDTH))
-                            .h_full()
-                            .child(self.pane(&palette, cx)),
-                    )
+                    .child(ui::pane_divider(
+                        Pane::Details,
+                        pane_width,
+                        px(280.)..=pane_max,
+                        true,
+                        &palette,
+                        cx,
+                    ))
+                    .child(div().flex_none().w(pane_width).h_full().child(self.pane(&palette, cx)))
                     .into_any_element()
             } else {
                 self.connect_guide(&palette, cx)

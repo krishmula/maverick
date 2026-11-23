@@ -7,8 +7,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Div, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div,
-    px,
+    Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window, div, px,
 };
 use maverick_core::bridge::BrowserState;
 use maverick_core::calendar::{self, Calendar};
@@ -19,9 +19,10 @@ use tokio::runtime::Handle;
 
 use crate::browser::Browser;
 use crate::models::Models;
+use crate::pane_widths::Pane;
 use crate::ui::{self, Palette, Signal};
 
-const DETAIL_WIDTH: f32 = 400.0;
+const DETAIL_WIDTH: Pixels = px(400.);
 
 /// One part of Connections, which the first-run guide shows on its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -434,8 +435,14 @@ impl Connections {
 }
 
 impl Render for Connections {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::of(cx);
+        let available = window.viewport_size().width - ui::DIVIDER_WIDTH;
+        let detail_max = (available * 0.62).clamp(px(280.), px(700.));
+        let detail_width = Pane::ProfileDetail
+            .width(cx)
+            .unwrap_or(DETAIL_WIDTH)
+            .clamp(px(280.), detail_max);
         h_flex()
             .size_full()
             .items_start()
@@ -449,8 +456,6 @@ impl Render for Connections {
                     .px(px(28.))
                     .py(px(20.))
                     .gap(px(22.))
-                    .border_r_1()
-                    .border_color(palette.line)
                     .children(
                         self.working
                             .clone()
@@ -473,7 +478,21 @@ impl Render for Connections {
                     }))
                     .children(self.sections(&palette, cx)),
             )
-            .children(matches!(self.only, None | Some(Section::Google)).then(|| self.detail(&palette, cx)))
+            .children(self.only.is_none().then(|| {
+                ui::pane_divider(
+                    Pane::ProfileDetail,
+                    detail_width,
+                    px(280.)..=detail_max,
+                    true,
+                    &palette,
+                    cx,
+                )
+            }))
+            .children(match self.only {
+                None => Some(self.detail(detail_width, &palette, cx)),
+                Some(Section::Google) => Some(self.detail(DETAIL_WIDTH, &palette, cx)),
+                _ => None,
+            })
     }
 }
 
@@ -761,11 +780,13 @@ impl Connections {
         section
     }
 
-    fn detail(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn detail(&self, width: Pixels, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = v_flex()
             .id("profile-detail")
             .flex_none()
-            .w(px(DETAIL_WIDTH))
+            .w(width)
+            .border_l(if self.only.is_some() { px(1.) } else { px(0.) })
+            .border_color(palette.line)
             .h_full()
             .overflow_y_scroll()
             .px(px(20.))
