@@ -333,6 +333,19 @@ A decision goes only into a row whose Status still says Found when Maverick writ
 - Press `a` to approve the selected posting and `s` to skip it, or click **approve** or **skip**. The selection moves to the next pending posting. `⌘Z` or **undo** takes back the last decision.
 - **Submitted** lists the applications, latest first or by company.
 
+### The apply queue
+
+Approving a posting puts it in the apply queue. Maverick fills queued forms several at once, each in its own background tab in Chrome, three at a time unless you change it with **-** and **+** in the board's toolbar. It never submits. Each row shows where its posting is:
+
+- **queued**: waiting for a free slot. The queue waits while Chrome is not connected.
+- **opening** and **filling**: the form is loading, then the answers go in.
+- **ready to submit**: every required field is answered.
+- **needs you**: required fields are left, there is a sign-in wall or an email to verify, or the posting is on a system Maverick cannot fill yet (Amazon, Oracle, Lever, company sites, unresolved Simplify links). Those open in a tab for you.
+- **applied**: the application system confirmed your submission, and the posting moves to Submitted.
+- **failed**: the reason shows in the pane. Approve it again to try again.
+
+Select a posting that is ready or needs you and press Enter, or click **review in chrome**, to bring its tab forward. Approvals from before Maverick last started are not queued by themselves: click **apply approved** to queue them.
+
 Decisions stay in the local database, apart from the postings, so a sheet sync or a tracker import never undoes them. They are not written to the sheet: the sheet only takes decisions on rows that still say Found, and an approval has no sheet status. A posting you skip leaves the jobs list.
 
 ## Find new postings

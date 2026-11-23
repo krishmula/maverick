@@ -100,7 +100,7 @@ impl MainView {
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
         let database = browser.read(cx).database();
-        let board = cx.new(|cx| Board::new(board, database.clone(), background.clone(), window, cx));
+        let board = cx.new(|cx| Board::new(browser.clone(), board, database.clone(), window, cx));
         let mav = cx.new(|cx| Mav::new(background, database, window, cx));
         let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let setup = cx.new(|cx| Setup::new(connections.clone(), cx));

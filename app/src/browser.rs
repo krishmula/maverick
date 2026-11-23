@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
-use maverick_core::apply::{self, Report, System};
+use maverick_core::apply::{self, FillError, Report, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
 use maverick_core::jobs::{Application, posting_address};
 use maverick_core::page::Page;
 use maverick_core::store::Store;
 use tokio::runtime::Handle;
+
+use crate::queue::{self, Queue, Step};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Latency {
@@ -64,6 +66,7 @@ pub struct Browser {
     extension_is_outdated: bool,
     fill: Fill,
     subject: Option<Subject>,
+    queue: Queue,
     /// The tab the last finished fill left its form in.
     filled_tab: Option<Tab>,
     state: BrowserState,
@@ -90,6 +93,7 @@ impl Browser {
                 }
             }
         });
+        let queue = Queue::new(saved_parallel(database.as_deref()));
         let mut browser = Self {
             state: bridge.state(),
             bridge,
@@ -103,6 +107,7 @@ impl Browser {
             extension_is_outdated: false,
             fill: Fill::Idle,
             subject: None,
+            queue,
             filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
@@ -229,7 +234,11 @@ impl Browser {
 
     /// Opens a posting's application form in a new tab and fills it. It never submits the form.
     pub fn apply(&mut self, title: String, address: String, cx: &mut Context<Self>) {
-        self.start_fill(title, Subject::Posting(address.clone()), Target::Posting(address), cx);
+        let target = Target::Posting {
+            address: address.clone(),
+            active: true,
+        };
+        self.start_fill(title, Subject::Posting(address), target, cx);
     }
 
     fn start_fill(&mut self, title: String, subject: Subject, target: Target, cx: &mut Context<Self>) {
@@ -245,6 +254,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
+            |_| {},
         ));
         cx.spawn(async move |this, cx| {
             let (fill, filled) = match filled.await {
@@ -255,7 +265,13 @@ impl Browser {
                     },
                     Some(filled),
                 ),
-                Ok(Err(reason)) => (Fill::Failed { title, reason }, None),
+                Ok(Err(stopped)) => (
+                    Fill::Failed {
+                        title,
+                        reason: stopped.reason,
+                    },
+                    None,
+                ),
                 Err(error) => (
                     Fill::Failed {
                         title,
@@ -268,7 +284,7 @@ impl Browser {
                 this.fill = fill;
                 if let Some(filled) = filled {
                     this.filled_tab = Some(filled.tab.clone());
-                    this.watch_for_submit(filled, cx);
+                    this.watch_for_submit(filled.system, filled.tab, filled.title, filled.address, cx);
                 }
                 cx.notify();
             })
@@ -277,15 +293,8 @@ impl Browser {
         .detach();
     }
 
-    /// Waits for the user to submit a filled form, then records the application.
-    fn watch_for_submit(&mut self, filled: Filled, cx: &mut Context<Self>) {
-        let Filled {
-            system,
-            tab,
-            title,
-            address,
-            ..
-        } = filled;
+    /// Waits for the user to submit the form in `tab`, then records the application.
+    fn watch_for_submit(&mut self, system: System, tab: Tab, title: String, address: String, cx: &mut Context<Self>) {
         let (bridge, database) = (self.bridge.clone(), self.database.clone());
         let recorded = self.background.spawn(async move {
             let confirmation = system.submitted();
@@ -317,11 +326,143 @@ impl Browser {
         cx.spawn(async move |this, cx| {
             if let Ok(Some(applied)) = recorded.await {
                 this.update(cx, |this, cx| {
+                    if let Some(run) = this.queue.get_mut(&applied.address) {
+                        run.step = Step::Applied;
+                    }
                     this.applied.push(applied);
                     cx.notify();
                 })
                 .ok();
             }
+        })
+        .detach();
+    }
+
+    /// The approved postings and where each one is.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// Queues an approved posting. It fills in a background tab once a slot is free. It never submits.
+    pub fn enqueue(&mut self, title: String, address: String, cx: &mut Context<Self>) {
+        self.queue.add(title, address);
+        self.pump(cx);
+        cx.notify();
+    }
+
+    /// Takes a posting out of the queue if it has not started.
+    pub fn withdraw(&mut self, address: &str, cx: &mut Context<Self>) {
+        self.queue.withdraw(address);
+        cx.notify();
+    }
+
+    /// How many forms fill at once. The number is kept next to the database.
+    pub fn set_parallel(&mut self, parallel: usize, cx: &mut Context<Self>) {
+        self.queue.set_parallel(parallel);
+        if let Some(file) = parallel_file(self.database.as_deref())
+            && let Err(error) = std::fs::write(&file, self.queue.parallel().to_string())
+        {
+            eprintln!("maverick: could not save {}: {error}", file.display());
+        }
+        self.pump(cx);
+        cx.notify();
+    }
+
+    /// Brings a queued posting's tab forward.
+    pub fn show_run(&mut self, address: &str, cx: &mut Context<Self>) {
+        if let Some(tab) = self.queue.get(address).and_then(|run| run.tab.clone()) {
+            self.activate(&tab, cx);
+        }
+    }
+
+    /// Starts queued runs while slots are free. Runs wait while Chrome is not connected.
+    fn pump(&mut self, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        for address in self.queue.start_next() {
+            self.start_run(address, cx);
+        }
+    }
+
+    fn start_run(&mut self, address: String, cx: &mut Context<Self>) {
+        let title = self
+            .queue
+            .get(&address)
+            .map(|run| run.title.clone())
+            .unwrap_or_default();
+        let (sender, mut progress) = tokio::sync::mpsc::unbounded_channel();
+        let target = Target::Posting {
+            address: address.clone(),
+            active: false,
+        };
+        let filled = self.background.spawn(fill_form(
+            self.bridge.clone(),
+            title.clone(),
+            target,
+            self.answers_file.clone(),
+            move |step| {
+                // The receiver goes away only with the window.
+                let _ = sender.send(step);
+            },
+        ));
+        cx.spawn(async move |this, cx| {
+            // The channel closes when the fill ends.
+            while let Some(step) = progress.recv().await {
+                let shown = this.update(cx, |this, cx| {
+                    if let Some(run) = this.queue.get_mut(&address) {
+                        match step {
+                            Progress::Opened(tab) => run.tab = Some(tab),
+                            Progress::Filling => run.step = Step::Filling,
+                        }
+                    }
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
+            let ended = filled.await;
+            this.update(cx, |this, cx| {
+                let watch = match ended {
+                    Ok(Ok(filled)) => {
+                        if let Some(run) = this.queue.get_mut(&address) {
+                            run.step = queue::after_fill(&filled.report);
+                            run.report = Some(filled.report);
+                        }
+                        Some((filled.system, filled.tab))
+                    }
+                    Ok(Err(stopped)) => {
+                        let run = this.queue.get_mut(&address);
+                        let tab = run.as_ref().and_then(|run| run.tab.clone());
+                        if let Some(run) = run {
+                            run.step = if stopped.needs_you {
+                                Step::NeedsYou(stopped.reason)
+                            } else {
+                                Step::Failed(stopped.reason)
+                            };
+                        }
+                        // At a sign-in wall the user can still apply in the tab.
+                        System::of(&address).zip(tab)
+                    }
+                    Err(stopped) => {
+                        if let Some(run) = this.queue.get_mut(&address) {
+                            run.step = Step::Failed(stopped.to_string());
+                        }
+                        None
+                    }
+                };
+                let waits = this
+                    .queue
+                    .get(&address)
+                    .is_some_and(|run| matches!(run.step, Step::Ready | Step::NeedsYou(_)));
+                if let Some((system, tab)) = watch.filter(|_| waits) {
+                    this.watch_for_submit(system, tab, title, address, cx);
+                }
+                this.pump(cx);
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -350,6 +491,7 @@ impl Browser {
                 self.measure(cx);
             }
         }
+        self.pump(cx);
         cx.notify();
     }
 }
@@ -358,8 +500,8 @@ impl Browser {
 enum Target {
     /// A tab the user already has open.
     Tab(Tab),
-    /// A posting's address, to open in a new tab.
-    Posting(String),
+    /// A posting's address, to open in a new tab. `active` brings the tab forward.
+    Posting { address: String, active: bool },
 }
 
 /// A form that was filled and now waits for the user to submit it.
@@ -399,6 +541,19 @@ async fn submitted(
     false
 }
 
+/// Where the number of parallel fills is kept.
+fn parallel_file(database: Option<&Path>) -> Option<PathBuf> {
+    Some(database?.parent()?.join("parallel-applies"))
+}
+
+/// The number of parallel fills the user picked, or the default.
+fn saved_parallel(database: Option<&Path>) -> usize {
+    parallel_file(database)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(queue::DEFAULT_PARALLEL)
+}
+
 /// Marks the posting applied in the local database and adds the application.
 fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<(), String> {
     let database = database.ok_or("This system has no application data directory.")?;
@@ -416,17 +571,71 @@ fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<
         .map_err(said)
 }
 
+/// What a fill reports while it runs.
+#[derive(Debug)]
+enum Progress {
+    /// Chrome opened the tab the form goes into.
+    Opened(Tab),
+    /// The form loaded and the answers are going in.
+    Filling,
+}
+
+/// Why a fill ended without filling the form.
+#[derive(Debug, PartialEq)]
+struct Stopped {
+    reason: String,
+    /// The tab waits on the user, as at a sign-in wall. Otherwise the fill failed.
+    needs_you: bool,
+}
+
+impl From<String> for Stopped {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            needs_you: false,
+        }
+    }
+}
+
+impl From<&str> for Stopped {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
 async fn fill_form(
     bridge: Arc<Bridge>,
     title: String,
     target: Target,
     answers_file: Option<PathBuf>,
-) -> Result<Filled, String> {
+    progress: impl Fn(Progress),
+) -> Result<Filled, Stopped> {
+    let said = |error: BridgeError| error.to_string();
+    // A posting on a system Maverick cannot fill opens for the user to apply by hand.
+    if let Target::Posting { address, active } = &target
+        && System::of(address).is_none()
+    {
+        let connection = *bridge
+            .connections()
+            .first()
+            .ok_or_else(|| said(BridgeError::NotConnected))?;
+        let open = Command::OpenTab {
+            url: address.clone(),
+            active: *active,
+        };
+        bridge.request(connection, &open).await.map_err(said)?;
+        return Err(Stopped {
+            reason: format!(
+                "Maverick cannot fill {} forms yet. The posting is open in a tab for you.",
+                crate::board::system_label(address)
+            ),
+            needs_you: true,
+        });
+    }
     let answers_file = answers_file.ok_or("This system has no application data directory.")?;
     // Read on every run, so an edit to the file counts at once.
     let answers = Answers::load(&answers_file)?;
-    let said = |error: BridgeError| error.to_string();
-    // Either way the tab comes forward, so the user can watch the form fill and then review it.
+    // A tab the user picked comes forward, so the user can watch the form fill and then review it.
     let (tab, form) = match target {
         Target::Tab(tab) => {
             let forward = Command::ActivateTab {
@@ -436,7 +645,7 @@ async fn fill_form(
             bridge.request(tab.connection, &forward).await.map_err(said)?;
             (tab, None)
         }
-        Target::Posting(address) => {
+        Target::Posting { address, active } => {
             let form = System::of(&address)
                 .and_then(|system| system.form_address(&address))
                 .ok_or_else(|| format!("{address} is not a posting Maverick can fill"))?;
@@ -447,7 +656,7 @@ async fn fill_form(
             // The tab starts empty, so the debugger is attached before the form loads.
             let blank = Command::OpenTab {
                 url: "about:blank".into(),
-                active: true,
+                active,
             };
             let opened = bridge.request(connection, &blank).await.map_err(said)?;
             let number = |key: &str| {
@@ -461,11 +670,12 @@ async fn fill_form(
                 window_id: number("windowId")?,
                 title: String::new(),
                 url: String::new(),
-                active: true,
+                active,
             };
             (Tab { connection, tab }, Some(form))
         }
     };
+    progress(Progress::Opened(tab.clone()));
     let on = form.as_deref().unwrap_or(&tab.tab.url);
     let not_fillable = "This tab is not on a posting Maverick can fill.";
     let system = System::of(on).ok_or(not_fillable)?;
@@ -473,14 +683,23 @@ async fn fill_form(
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
     let report = match form {
         Some(form) => match page.navigate(&form).await {
-            Ok(()) => system.fill(&page, &answers).await,
+            Ok(()) => {
+                progress(Progress::Filling);
+                system.fill(&page, &answers).await
+            }
             Err(error) => Err(error.into()),
         },
-        None => system.fill(&page, &answers).await,
+        None => {
+            progress(Progress::Filling);
+            system.fill(&page, &answers).await
+        }
     };
     // Chrome's debugging bar goes away with the detach, whether or not the fill worked.
     let detached = page.detach().await;
-    let report = report.map_err(|error| error.to_string())?;
+    let report = report.map_err(|error| Stopped {
+        needs_you: matches!(error, FillError::SignInNeeded { .. } | FillError::SignIn(_)),
+        reason: error.to_string(),
+    })?;
     detached.map_err(|error| error.to_string())?;
     Ok(Filled {
         report,
@@ -563,6 +782,123 @@ mod tests {
         let no = json!({ "kind": "result", "value": false });
         let gone = json!({ "kind": "error", "message": "No tab with id: 31" });
         assert!(!watch(vec![no, gone]).await.0);
+    }
+
+    /// Stands in for Chrome: every new tab gets the next id, every page fails to load,
+    /// and each tab the queue opens is counted until its debugger lets go.
+    fn chrome_that_fails_to_load(socket: &Path) -> std::thread::JoinHandle<(usize, Vec<Value>)> {
+        let mut chrome = UnixStream::connect(socket).unwrap();
+        let send = |chrome: &mut UnixStream, message: Value| {
+            let body = serde_json::to_vec(&message).unwrap();
+            chrome
+                .write_all(&u32::try_from(body.len()).unwrap().to_ne_bytes())
+                .unwrap();
+            chrome.write_all(&body).unwrap();
+        };
+        send(&mut chrome, json!({ "kind": "tabs", "tabs": [] }));
+        std::thread::spawn(move || {
+            chrome.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (mut open, mut most, mut next_tab, mut opened) = (0, 0, 40, Vec::new());
+            loop {
+                let mut length = [0u8; 4];
+                if chrome.read_exact(&mut length).is_err() {
+                    return (most, opened);
+                }
+                let mut body = vec![0u8; u32::from_ne_bytes(length) as usize];
+                chrome.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let value = match (request["method"].as_str(), request["command"].as_str()) {
+                    (Some("tabs.create"), _) => {
+                        next_tab += 1;
+                        if request["url"] == "about:blank" {
+                            open += 1;
+                            most = most.max(open);
+                        }
+                        opened.push(request.clone());
+                        json!({ "id": next_tab, "windowId": 1 })
+                    }
+                    (_, Some("Page.navigate")) => json!({ "errorText": "net::ERR_NAME_NOT_RESOLVED" }),
+                    (Some("debugger.detach"), _) => {
+                        open -= 1;
+                        Value::Null
+                    }
+                    _ => json!({}),
+                };
+                send(
+                    &mut chrome,
+                    json!({ "kind": "result", "id": request["id"], "value": value }),
+                );
+            }
+        })
+    }
+
+    #[gpui_kit::test]
+    fn approved_postings_fill_in_background_tabs_no_more_at_once_than_the_limit(cx: &mut gpui_kit::TestAppContext) {
+        cx.executor().allow_parking();
+        let scratch = tempfile::tempdir().unwrap();
+        let socket = scratch.path().join("bridge.sock");
+        let answers = scratch.path().join("answers.json");
+        std::fs::write(&answers, r#"{ "name": "Ada Example", "email": "ada@example.com", "phone": "+1 555 0100", "resume": "/tmp/ada.pdf" }"#).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let bridge = Bridge::new();
+        runtime.spawn(bridge.clone().serve(bridge::bind(&socket).unwrap()));
+        let chrome = chrome_that_fails_to_load(&socket);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bridge.connections().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the stand-in Chrome connects");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            use gpui_kit::AppContext as _;
+            cx.new(|cx| Browser::new(bridge.clone(), background, Err("none".into()), Some(answers), None, cx))
+        });
+        let ashby = |id: u8| format!("https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb94{id:02}");
+        let elsewhere = "https://careers.example.com/jobs/7";
+        browser.update(cx, |browser, cx| {
+            browser.set_parallel(2, cx);
+            for id in 1..=4 {
+                browser.enqueue(format!("Engineer {id} at Example Co"), ashby(id), cx);
+            }
+            browser.enqueue("Engineer 7 at Example Co".into(), elsewhere.into(), cx);
+        });
+
+        let ended = || {
+            browser.read_with(cx, |browser, _| {
+                browser
+                    .queue()
+                    .runs()
+                    .iter()
+                    .map(|run| run.step.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let steps = loop {
+            cx.run_until_parked();
+            let steps = ended();
+            if steps.iter().all(|step| !step.is_running() && *step != Step::Queued) {
+                break steps;
+            }
+            assert!(std::time::Instant::now() < deadline, "the queue drains: {steps:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let failed = Step::Failed("the page did not load: net::ERR_NAME_NOT_RESOLVED".into());
+        assert_eq!(steps[..4], [failed.clone(), failed.clone(), failed.clone(), failed]);
+        assert_eq!(
+            steps[4],
+            Step::NeedsYou("Maverick cannot fill Company site forms yet. The posting is open in a tab for you.".into())
+        );
+        drop(runtime);
+        let (most, opened) = chrome.join().unwrap();
+        assert_eq!(most, 2, "two forms at most were open at once");
+        assert_eq!(opened.len(), 5);
+        assert!(opened.iter().all(|request| request["active"] == false), "{opened:?}");
+        assert_eq!(opened[4]["url"], elsewhere);
     }
 
     #[test]

@@ -300,6 +300,80 @@ async fn a_background_tab_takes_typing_clicks_and_a_file_as_real_input() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn several_background_tabs_are_driven_at_the_same_time() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>Start</title>");
+    let form = serve(FORM).await;
+    let tabs = wait_for(&mut states, "the start tab listed", |tabs| {
+        titled(tabs, "Start").is_some()
+    })
+    .await;
+    let connection = tabs[0].connection;
+
+    let mut runs = Vec::new();
+    for number in 0..4 {
+        let (bridge, form) = (bridge.clone(), form.clone());
+        runs.push(tokio::spawn(async move {
+            let blank = Command::OpenTab {
+                url: "about:blank".into(),
+                active: false,
+            };
+            let opened = bridge.request(connection, &blank).await.unwrap();
+            let tab = Tab {
+                connection,
+                tab: maverick_core::bridge::BrowserTab {
+                    id: opened["id"].as_i64().unwrap() as i32,
+                    window_id: opened["windowId"].as_i64().unwrap() as i32,
+                    title: String::new(),
+                    url: String::new(),
+                    active: false,
+                },
+            };
+            let page = Page::attach(bridge, &tab).await.unwrap();
+            page.navigate(&format!("{form}?tab={number}")).await.unwrap();
+            let name = format!("Ada number {number}");
+            for _ in 0..5 {
+                page.fill(&Locator::css("#name"), &name).await.unwrap();
+                page.fill(&Locator::css("#why"), &format!("Tab {number}"))
+                    .await
+                    .unwrap();
+                page.click(&Locator::css("#send")).await.unwrap();
+            }
+            let read = page
+                .evaluate(
+                    r#"({
+                        name: document.getElementById("name").value,
+                        why: document.getElementById("why").value,
+                        at: location.search,
+                        seen: [...new Set(window.seen)],
+                    })"#,
+                )
+                .await
+                .unwrap();
+            page.detach().await.unwrap();
+            (number, read)
+        }));
+    }
+    for run in runs {
+        let (number, read) = run.await.unwrap();
+        assert_eq!(
+            read,
+            json!({
+                "name": format!("Ada number {number}"),
+                "why": format!("Tab {number}"),
+                "at": format!("?tab={number}"),
+                "seen": ["name input true", "why input true", "send click true"],
+            })
+        );
+    }
+}
+
 /// Fills a live Ashby form with made-up answers and prints what happened to each field.
 /// It uploads a blank PDF and never submits. Set `MAVERICK_E2E_ASHBY` to a posting's address.
 #[tokio::test(flavor = "multi_thread")]

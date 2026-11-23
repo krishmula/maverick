@@ -8,6 +8,7 @@ mod jobs;
 mod main_view;
 mod mav;
 mod models;
+mod queue;
 mod report;
 mod schedule;
 mod setup;
