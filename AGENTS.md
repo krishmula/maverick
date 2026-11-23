@@ -12,3 +12,11 @@ _Avoid_: Google account (when the user-named profile is meant)
 **Block**:
 Time set aside on the calendar to work on something, which Mav proposes and the user confirms.
 _Avoid_: event (for a block Mav adds)
+
+**Jobs tab**:
+The view where the user approves or skips postings, sees who to reach at each posting's company, and sees the applications sent. Approving a posting queues its form to be filled in a batch.
+_Avoid_: approvals, decision board, jobs list
+
+**Posts tab**:
+The view for hiring posts found on LinkedIn and the notes drafted to their posters.
+_Avoid_: outreach tab

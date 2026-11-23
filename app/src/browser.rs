@@ -34,8 +34,6 @@ pub enum Fill {
 /// What a fill run is about, so a view can tell whether the run belongs to the row it shows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Subject {
-    /// A posting from the jobs list, by its address.
-    Posting(String),
     Tab(ConnectionId, i32),
 }
 
@@ -229,26 +227,10 @@ impl Browser {
         (self.subject.as_ref() == Some(subject) && self.fill != Fill::Idle).then_some(&self.fill)
     }
 
-    /// Brings the tab with the last filled form forward, so the user can review it and submit.
-    pub fn review(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.filled_tab.clone() {
-            self.activate(&tab, cx);
-        }
-    }
-
     /// Fills the application form in a tab with the standard answers. It never submits the form.
     pub fn fill_form(&mut self, tab: &Tab, cx: &mut Context<Self>) {
         let subject = Subject::Tab(tab.connection, tab.tab.id);
         self.start_fill(tab.tab.title.clone(), subject, Target::Tab(tab.clone()), cx);
-    }
-
-    /// Opens a posting's application form in a new tab and fills it. It never submits the form.
-    pub fn apply(&mut self, title: String, address: String, cx: &mut Context<Self>) {
-        let target = Target::Posting {
-            address: address.clone(),
-            active: true,
-        };
-        self.start_fill(title, Subject::Posting(address), target, cx);
     }
 
     fn start_fill(&mut self, title: String, subject: Subject, target: Target, cx: &mut Context<Self>) {

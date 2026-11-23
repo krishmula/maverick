@@ -8,10 +8,9 @@ use gpui_kit::{
     App, BorderStyle, Bounds, Font, FontWeight, Hsla, IntoElement, PathBuilder, Pixels, Point, SharedString,
     Styled as _, TextAlign, TextRun, Window, canvas, fill, font, outline, point, px, size,
 };
-use maverick_core::apply;
-use maverick_core::jobs::{Posting, Stage, posting_address};
+use maverick_core::jobs::{Posting, Stage};
 
-use crate::jobs::Job;
+use crate::board::address_of;
 use crate::ui::{MONO, Palette, Signal};
 
 /// What a posting is to the funnel, which decides how its cell is drawn.
@@ -21,7 +20,7 @@ pub enum Kind {
     Passed,
     /// Scored and still in play, but not something Maverick can fill.
     Scored(u8),
-    /// On the jobs list.
+    /// Waiting on a decision on the Jobs tab.
     Open,
     Applied,
 }
@@ -33,26 +32,23 @@ pub struct Cell {
     pub address: Option<String>,
 }
 
-/// One cell for each posting, oldest first. `jobs` are the postings on the jobs list.
-pub fn cells(postings: &[Posting], jobs: &[Job]) -> Vec<Cell> {
+/// One cell for each posting, oldest first. `open` are the addresses of the postings waiting on a decision.
+pub fn cells(postings: &[Posting], open: &[&str]) -> Vec<Cell> {
     let mut oldest_first: Vec<&Posting> = postings.iter().collect();
     oldest_first.sort_by_key(|posting| posting.found_at);
     // Two postings can share an address. Only the first one stands for the job.
-    let mut unplaced: Vec<&str> = jobs.iter().map(|job| job.address.as_str()).collect();
+    let mut unplaced: Vec<&str> = open.to_vec();
     oldest_first
         .into_iter()
         .map(|posting| {
             let in_play = matches!(posting.stage, Stage::Found | Stage::Review);
-            let address = apply::posting_address(&posting_address(&posting.link));
-            let listed = address
-                .as_deref()
-                .filter(|_| in_play)
-                .and_then(|address| unplaced.iter().position(|open| *open == address));
+            let address = address_of(posting);
+            let listed = unplaced.iter().position(|open| *open == address).filter(|_| in_play);
             if let Some(ix) = listed {
                 unplaced.swap_remove(ix);
                 return Cell {
                     kind: Kind::Open,
-                    address,
+                    address: Some(address),
                 };
             }
             let kind = match (&posting.stage, posting.score) {
@@ -497,15 +493,7 @@ mod tests {
                 None,
             ),
         ];
-        let jobs = [Job {
-            company: "Example Co".into(),
-            title: "Backend Engineer".into(),
-            score: Some(91),
-            address: ashby.into(),
-            ..Job::default()
-        }];
-
-        let mut band = Band::new(cells(&postings, &jobs));
+        let mut band = Band::new(cells(&postings, &[ashby]));
         let kinds = |band: &Band| band.cells.iter().map(|cell| cell.kind).collect::<Vec<_>>();
         assert_eq!(
             kinds(&band),

@@ -6,14 +6,13 @@ use std::time::Duration;
 use jiff::Timestamp;
 use maverick_core::answers::Answers;
 use maverick_core::funnel;
-use maverick_core::jobs::{Decision, Posting};
+use maverick_core::jobs::Decision;
 use maverick_core::score::Profile;
 use maverick_core::store::Store;
 use tokio::runtime::Handle;
 
 use crate::band::{self, Cell};
 use crate::board::BoardData;
-use crate::jobs::{self, Job};
 
 /// The wait after launch before the first pass, so starting the app stays quick.
 pub const FIRST_PASS: Duration = Duration::from_secs(60);
@@ -38,14 +37,12 @@ pub struct Refreshed {
 /// What the window lists, read from the local database.
 #[derive(Default)]
 pub struct Lists {
-    pub jobs: Vec<Job>,
     /// One band cell for every posting.
     pub cells: Vec<Cell>,
     pub board: BoardData,
 }
 
 /// The lists from the local database. A missing or unreadable database gives empty lists.
-/// A posting the user skipped on the board is not on the jobs list.
 pub fn stored_lists(database: Option<&Path>) -> Lists {
     let store = database
         .filter(|path| path.is_file())
@@ -56,15 +53,15 @@ pub fn stored_lists(database: Option<&Path>) -> Lists {
     let postings = store.postings().unwrap_or_default();
     let applications = store.applications().unwrap_or_default();
     let decisions = store.decisions().unwrap_or_default();
-    let not_skipped: Vec<Posting> = postings
-        .iter()
-        .filter(|posting| decisions.get(&posting.link) != Some(&Decision::Skipped))
-        .cloned()
-        .collect();
-    let jobs = jobs::open_jobs(&not_skipped, &applications);
-    let cells = band::cells(&postings, &jobs);
     let board = BoardData::new(&postings, applications, &decisions);
-    Lists { jobs, cells, board }
+    let open: Vec<&str> = board
+        .entries
+        .iter()
+        .filter(|entry| entry.decision != Some(Decision::Skipped))
+        .map(|entry| entry.address.as_str())
+        .collect();
+    let cells = band::cells(&postings, &open);
+    Lists { cells, board }
 }
 
 impl Funnel {
@@ -109,12 +106,12 @@ fn failed(status: String) -> Refreshed {
 
 #[cfg(test)]
 mod tests {
-    use maverick_core::jobs::Stage;
+    use maverick_core::jobs::{Posting, Stage};
 
     use super::*;
 
     #[test]
-    fn a_posting_skipped_on_the_board_leaves_the_jobs_list_and_stays_on_the_board() {
+    fn a_posting_skipped_on_the_board_stays_on_the_board_and_its_band_cell_is_not_open() {
         let scratch = tempfile::tempdir().unwrap();
         let database = scratch.path().join("maverick.db");
         let posting = |id: u8| Posting {
@@ -139,9 +136,8 @@ mod tests {
         drop(store);
 
         let lists = stored_lists(Some(&database));
-        let jobs: Vec<&str> = lists.jobs.iter().map(|job| job.title.as_str()).collect();
-        assert_eq!(jobs, ["Engineer 1"]);
-        assert_eq!(lists.cells.len(), 2);
+        let kinds: Vec<_> = lists.cells.iter().map(|cell| cell.kind).collect();
+        assert_eq!(kinds, [band::Kind::Open, band::Kind::Scored(70)]);
         let board: Vec<_> = lists
             .board
             .entries

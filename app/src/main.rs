@@ -4,7 +4,6 @@ mod browser;
 mod cli;
 mod connections;
 mod icon;
-mod jobs;
 mod main_view;
 mod mav;
 mod models;
