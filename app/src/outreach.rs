@@ -512,11 +512,10 @@ impl OutreachView {
             ui::serif("No drafts yet. The sweep drafts notes for hiring posts, up to 10 a day.")
                 .text_color(palette.muted)
         });
-        let ink = palette.ink;
         let run_now = ui::button(
             "run-outreach",
             "Check and sweep now",
-            ui::quiet_face("check and sweep now", palette).hover(move |face| face.text_color(ink)),
+            ui::quiet_face("check and sweep now", palette),
         )
         .on_click(cx.listener(|this, _, window, cx| this.run_now(true, window, cx)));
         v_flex()
