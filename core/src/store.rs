@@ -142,6 +142,13 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (about, profile_url)
     ) STRICT;
 ",
+    "
+    CREATE TABLE linkedin_company_pages (
+        company TEXT PRIMARY KEY,
+        slug TEXT NOT NULL,
+        found_at TEXT NOT NULL
+    ) STRICT;
+",
 ];
 
 pub struct Store {

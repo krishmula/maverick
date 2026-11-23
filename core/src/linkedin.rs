@@ -248,6 +248,37 @@ pub fn people_address(slug: &str) -> String {
     format!("{SITE}/company/{slug}/people/")
 }
 
+/// The LinkedIn company pages a web page links to, as slugs, the most linked first. A posting page
+/// or a company's own website often links the company's page, whose slug need not match its name.
+pub fn company_pages_in(html: &str) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (at, _) in html.match_indices("linkedin.com/company/") {
+        let rest = &html[at + "linkedin.com/company/".len()..];
+        let slug: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '%'))
+            .collect::<String>()
+            .to_lowercase();
+        if slug.is_empty() || slug == "linkedin" {
+            continue;
+        }
+        match counts.iter_mut().find(|(seen, _)| *seen == slug) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((slug, 1)),
+        }
+    }
+    // Stable, so a tie keeps the slug the page links first.
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts.into_iter().map(|(slug, _)| slug).collect()
+}
+
+/// The company's own website as an Ashby posting names it.
+pub fn company_website_in(html: &str) -> Option<String> {
+    let (_, rest) = html.split_once("\"publicWebsite\":\"")?;
+    let (website, _) = rest.split_once('"')?;
+    website.starts_with("http").then(|| website.to_owned())
+}
+
 /// A guess at a company's page address from its name: lower case, words joined by hyphens.
 pub fn company_slug(company: &str) -> String {
     company_key(company).replace(' ', "-")
@@ -284,8 +315,9 @@ fn page_title(page: &Html) -> Option<String> {
 
 /// Reads the cards on a company's People page. The page's classes are hashed, so cards are found
 /// by role: each list item with a profile link is a person, whose texts are the name, the degree
-/// (`· 2nd`), the headline and then lines such as a mutual connection. The "Alumni who work here"
-/// list after the main one is left out, and so are members shown as "LinkedIn Member".
+/// (`· 2nd`), the headline and then lines such as a mutual connection, and the name is the text of
+/// the profile link. The "Alumni who work here" list after the main one is left out, and so are
+/// members shown as "LinkedIn Member" and company cards that link a person in another line.
 ///
 /// `company` is the name in the title, `Example Co: People | LinkedIn`. Any other title, such as a
 /// missing company's page, gives `None`.
@@ -305,12 +337,17 @@ pub fn people_page(html: &str) -> PeoplePage {
         if heading.contains("Alumni") {
             continue;
         }
-        let Some(link) = element.select(&selector("a[href*=\"/in/\"]")).next() else {
+        let strings = strings_of(element);
+        let Some(name) = strings.first().cloned() else { continue };
+        // The name is the text of the person's link. A company card in "People also viewed" links
+        // a person only from a line such as "1 person in your network works here".
+        let Some(link) = element
+            .select(&selector("a[href*=\"/in/\"]"))
+            .find(|link| strings_of(*link).first() == Some(&name))
+        else {
             continue;
         };
         let profile_url = link.attr("href").map(profile_address);
-        let strings = strings_of(element);
-        let Some(name) = strings.first().cloned() else { continue };
         if name == "LinkedIn Member" || people.iter().any(|seen| seen.profile_url == profile_url) {
             continue;
         }
@@ -942,6 +979,11 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
  </div>
  <div role="listitem" class="cfsk3" componentkey="auto-component-4"><span>People highlights</span></div>
 </div>
+<h2 class="cfsq1">People also viewed</h2>
+<div class="cfsa1">
+ <div role="listitem" class="cfsk3"><a href="https://www.linkedin.com/company/other-co/"><span>Other Co</span></a><p>Software Development</p><p>297 followers</p>
+  <p><span><a href="https://www.linkedin.com/in/fay-friend/">1 person in your network works here</a></span></p><button>Follow</button></div>
+</div>
 <h2 class="cfsq1">Alumni who work here</h2>
 <div class="cfsa1">
  <div role="listitem" class="cfsk3"><a href="https://www.linkedin.com/in/di-alum/"><span>Di Alum</span></a><span>· 2nd</span><div>Engineer</div><button>Connect</button></div>
@@ -976,6 +1018,20 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
         // A wrong guess at the address lands on a page that is not a company's People page.
         let missing = "<html><head><title>(2) Page not found | LinkedIn</title></head><body></body></html>";
         assert_eq!(people_page(missing).company, None);
+    }
+
+    #[test]
+    fn a_page_names_the_company_page_it_links_most() {
+        let footer = r#"<a href="https://www.linkedin.com/company/linkedin/">us</a>
+            <a href="https://twitter.com/x">x</a>
+            <a href="https://www.linkedin.com/company/example-co-ai/">LinkedIn</a>
+            <a href="https://linkedin.com/company/Example-Co-AI?trk=footer">LinkedIn</a>
+            <a href="https://www.linkedin.com/company/partner-co/">partner</a>"#;
+        assert_eq!(company_pages_in(footer), ["example-co-ai", "partner-co"]);
+        assert!(company_pages_in("<p>no links</p>").is_empty());
+        let ashby = r#"{"organization":{"name":"Example Co","publicWebsite":"https://example.com/","x":1}}"#;
+        assert_eq!(company_website_in(ashby).as_deref(), Some("https://example.com/"));
+        assert_eq!(company_website_in(r#"{"publicWebsite":""}"#), None);
     }
 
     /// Made up, shaped like the real search page on 2026-11-23: each post a list item keyed

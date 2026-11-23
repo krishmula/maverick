@@ -636,7 +636,7 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::linkedin::{Reader, people_page, posts_page, read_connections};
     use maverick_core::outreach;
 
-    const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] | sweep | drafts \
+    const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
                          | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
                          | page <LinkedIn address> <out.html> | read <people|posts> <saved.html>";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
@@ -656,15 +656,20 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
         ["check", rest @ ..] => {
-            let use_chrome = match rest {
-                [] => true,
-                ["--no-chrome"] => false,
-                _ => return Err(USAGE.into()),
-            };
+            let mut use_chrome = true;
+            let mut only = Vec::new();
+            let mut rest = rest.iter();
+            while let Some(word) = rest.next() {
+                match *word {
+                    "--no-chrome" => use_chrome = false,
+                    "--posting" => only.push(rest.next().ok_or(USAGE)?.to_string()),
+                    _ => return Err(USAGE.into()),
+                }
+            }
             let postings = open_store()?.postings()?;
             let run = runtime()?.block_on(async {
                 let bridge = if use_chrome { Some(chrome().await?) } else { None };
-                outreach::check_postings(&database, bridge).await
+                outreach::check_postings(&database, bridge, &only).await
             })?;
             for check in &run.checked {
                 let posting = postings.iter().find(|posting| posting.link == check.posting_link);

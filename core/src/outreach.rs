@@ -216,6 +216,22 @@ impl Store {
         Ok(())
     }
 
+    /// The LinkedIn page address found for each company, by its reduced name.
+    pub fn company_pages(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let mut select = self.db.prepare("SELECT company, slug FROM linkedin_company_pages")?;
+        select.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
+    }
+
+    /// Remembers the company's LinkedIn page, once a People page there showed the right company.
+    pub fn save_company_page(&self, company: &str, slug: &str, at: Timestamp) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO linkedin_company_pages (company, slug, found_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (company) DO UPDATE SET slug = excluded.slug, found_at = excluded.found_at",
+            params![company_key(company), slug, at.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Every check, newest first.
     pub fn checks(&self) -> Result<Vec<Check>, StoreError> {
         let mut select = self.db.prepare(
@@ -464,9 +480,10 @@ pub enum Lookup {
     Deferred(String),
 }
 
-/// One or two people from a company's People page: the person named, or else people whose title
-/// names the team or function, and failing those, engineers and recruiters. LinkedIn ignores a
-/// search on that page, so the picking happens here, from the people it lists.
+/// One or two people from a company's People page: the person named, or else engineers whose title
+/// names the team, then other engineers, then recruiters. A title with no engineering or
+/// recruiting word is never picked, whatever team it names. LinkedIn ignores a search on that page,
+/// so the picking happens here, from the people it lists.
 pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
     if let Some(wanted) = named.people.first() {
         let wanted = wanted.name.to_lowercase();
@@ -477,44 +494,57 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
             .cloned()
             .collect();
     }
-    const ENGINEERS: &[&str] = &[
+    const ENGINEERS: &[&str] = &["software", "engineer", "engineering", "sde", "swe", "developer"];
+    const RECRUITERS: &[&str] = &["recruit", "recruiter", "recruiting", "talent"];
+    /// Words too common in titles to say which team someone is on.
+    const WEAK: &[&str] = &[
+        "enterprise",
         "software",
         "engineer",
         "engineering",
-        "sde",
-        "swe",
-        "developer",
-        "recruit",
+        "senior",
+        "staff",
+        "lead",
+        "early",
+        "native",
+        "technical",
+        "general",
+        "product",
+        "data",
+        "platform",
+        "systems",
     ];
-    let wanted = meaningful_words(query);
-    // Each word of a title must start with the word sought, so "swe" does not match "Sweden".
-    let fits = |person: &Person, words: &[&str]| {
+    let team: Vec<String> = meaningful_words(query)
+        .into_iter()
+        .filter(|word| !WEAK.contains(&word.as_str()))
+        .collect();
+    // A title word fits a sought word when it is that word or, for words over three letters, starts
+    // with it, so "recruit" fits "recruiting" and "swe" does not fit "Sweden".
+    let has = |person: &Person, sought: &[&str]| {
         person
             .title
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .any(|word| {
-                words
+                sought
                     .iter()
                     .any(|sought| word == *sought || (sought.len() > 3 && word.starts_with(sought)))
             })
     };
-    let team: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    let mut chosen: Vec<Person> = people
+    let team: Vec<&str> = team.iter().map(String::as_str).collect();
+    let rank = |person: &Person| match (has(person, ENGINEERS), has(person, &team)) {
+        (true, true) => Some(0),
+        (true, false) => Some(1),
+        (false, _) if has(person, RECRUITERS) => Some(2),
+        (false, _) => None,
+    };
+    let mut ranked: Vec<(u8, &Person)> = people
         .iter()
-        .filter(|person| fits(person, &team))
-        .take(2)
-        .cloned()
+        .filter_map(|person| rank(person).map(|rank| (rank, person)))
         .collect();
-    for person in people.iter().filter(|person| fits(person, ENGINEERS)) {
-        if chosen.len() == 2 {
-            break;
-        }
-        if !chosen.contains(person) {
-            chosen.push(person.clone());
-        }
-    }
-    chosen
+    // Stable, so people of one rank keep the page's order.
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().take(2).map(|(_, person)| person.clone()).collect()
 }
 
 /// The verdict, from the three sources in the order the user set: the posting, the connections, the People page.
@@ -529,6 +559,7 @@ pub fn settle(named: &Named, linked: Vec<Person>, lookup: Option<Lookup>) -> (Ve
     if !named.people.is_empty() {
         let people = match lookup {
             Some(Lookup::Found(found)) if !found.is_empty() => found,
+            // Without a profile link no draft can be offered, so the note says why.
             _ => named
                 .people
                 .iter()
@@ -540,6 +571,12 @@ pub fn settle(named: &Named, linked: Vec<Person>, lookup: Option<Lookup>) -> (Ve
                     degree: None,
                 })
                 .collect(),
+        };
+        let note = if people.iter().any(|person| person.profile_url.is_none()) {
+            let missing = format!("no LinkedIn profile link found for {}", people[0].name);
+            Some(note.map_or(missing.clone(), |note| format!("{note}; {missing}")))
+        } else {
+            note
         };
         return (Verdict::HiringManager, people, note);
     }
@@ -626,18 +663,33 @@ impl CheckRun {
 
 /// Runs the outreach check for every posting that needs one. With no `bridge`, or once the
 /// lookup cap is spent, People-page lookups are deferred to a later run.
-pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Result<CheckRun, String> {
+///
+/// `only` checks just the postings with those links, whatever their earlier verdicts.
+pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: &[String]) -> Result<CheckRun, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
-    let (due, deferred, connections) = {
+    let (due, deferred, connections, mut pages) = {
         let store = Store::open(database).map_err(said)?;
         let checks = store.checks().map_err(said)?;
-        let due = to_check(&store.postings().map_err(said)?, &checks);
+        let postings = store.postings().map_err(said)?;
+        let due = if only.is_empty() {
+            to_check(&postings, &checks)
+        } else {
+            postings
+                .into_iter()
+                .filter(|posting| only.contains(&posting.link))
+                .collect()
+        };
         let deferred: HashSet<String> = checks
             .into_iter()
             .filter(|check| check.verdict == Verdict::Deferred)
             .map(|check| check.posting_link)
             .collect();
-        (due, deferred, store.connections().map_err(said)?)
+        (
+            due,
+            deferred,
+            store.connections().map_err(said)?,
+            store.company_pages().map_err(said)?,
+        )
     };
     let mut run = CheckRun::default();
     let mut reader: Option<Reader> = None;
@@ -645,7 +697,7 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Res
     for posting in due {
         // A deferred posting only waits for a People lookup, so without one left reading it again is wasted.
         let can_look_up = matches!(lookups, Some((_, left)) if left > 0);
-        if deferred.contains(&posting.link) && !can_look_up {
+        if only.is_empty() && deferred.contains(&posting.link) && !can_look_up {
             continue;
         }
         let (named, mut note) = match named_in(&posting).await {
@@ -660,8 +712,25 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Res
                 Some((bridge, left)) => {
                     *left -= 1;
                     let query = people_query(&named);
-                    match look_up(&mut reader, bridge, &posting.company).await {
-                        Ok(Lookup::Found(people)) => Lookup::Found(picked(&query, &named, &people)),
+                    let key = company_key(&posting.company);
+                    let slug = match pages.get(&key) {
+                        Some(slug) => slug.clone(),
+                        None => found_page(&posting)
+                            .await
+                            .unwrap_or_else(|| company_slug(&posting.company)),
+                    };
+                    match look_up(&mut reader, bridge, &posting.company, &slug).await {
+                        Ok(Lookup::Found(people)) => {
+                            if pages.get(&key) != Some(&slug) {
+                                Store::open(database)
+                                    .and_then(|store| {
+                                        store.save_company_page(&posting.company, &slug, Timestamp::now())
+                                    })
+                                    .map_err(said)?;
+                                pages.insert(key, slug);
+                            }
+                            Lookup::Found(picked(&query, &named, &people))
+                        }
                         Ok(other) => other,
                         Err(stop) => {
                             if !matches!(stop, Stop::CapReached) {
@@ -702,14 +771,29 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Res
     Ok(run)
 }
 
-/// Loads the company's People page, opening the reader on the first lookup of the run.
-async fn look_up(reader: &mut Option<Reader>, bridge: &Arc<Bridge>, company: &str) -> Result<Lookup, Stop> {
+/// Finds the company's LinkedIn page in the posting's page, or else in the company website that
+/// page names, without loading LinkedIn. `None` when neither links one.
+async fn found_page(posting: &Posting) -> Option<String> {
+    let address = posting
+        .address
+        .clone()
+        .unwrap_or_else(|| posting_address(&posting.link));
+    let (_, page) = description::get(&address).await.ok()?;
+    if let Some(slug) = linkedin::company_pages_in(&page).into_iter().next() {
+        return Some(slug);
+    }
+    let website = linkedin::company_website_in(&page)?;
+    let (_, site) = description::get(&website).await.ok()?;
+    linkedin::company_pages_in(&site).into_iter().next()
+}
+
+/// Loads the company's People page at `slug`, opening the reader on the first lookup of the run.
+async fn look_up(reader: &mut Option<Reader>, bridge: &Arc<Bridge>, company: &str, slug: &str) -> Result<Lookup, Stop> {
     if reader.is_none() {
         *reader = Some(Reader::open(bridge.clone(), LOOKUP_CAP).await?);
     }
     let reader = reader.as_mut().expect("the reader was just opened");
-    let slug = company_slug(company);
-    let html = reader.load(&people_address(&slug), false).await?;
+    let html = reader.load(&people_address(slug), false).await?;
     let page = people_page(&html);
     match page.company {
         Some(name) if same_company(&name, company) => Ok(Lookup::Found(page.people)),
@@ -1302,10 +1386,11 @@ mod tests {
             }],
             ..named
         };
-        let (verdict, people, _) = settle(&manager, Vec::new(), None);
+        let (verdict, people, note) = settle(&manager, Vec::new(), Some(Lookup::Found(Vec::new())));
         assert_eq!(verdict, Verdict::HiringManager);
         assert_eq!(people[0].title, "Engineering Manager");
         assert_eq!(people[0].profile_url, None);
+        assert_eq!(note.as_deref(), Some("no LinkedIn profile link found for Cy Lead"));
         assert_eq!(people_query(&manager), "Cy Lead");
     }
 
@@ -1313,35 +1398,36 @@ mod tests {
     fn a_people_search_keeps_titles_that_fit_or_the_person_named() {
         let results = [
             person("Ada", "Account Executive"),
-            person("Bo", "Software Engineer, Storage"),
+            person("Bo", "Software Engineer, Search"),
             person("Cy", "Storage Platform Lead"),
             person("Di", "Recruiting Partner"),
+            person("Ed", "Senior Engineer, Storage"),
         ];
         let named = Named {
             team: Some("Storage".into()),
             ..Named::default()
         };
-        let names: Vec<String> = picked("Storage", &named, &results)
-            .into_iter()
-            .map(|person| person.name)
-            .collect();
-        assert_eq!(names, ["Bo", "Cy"]);
-        // No title names the team, so engineers and recruiters stand in; "swe" is not "Sweden".
+        let names = |query: &str, named: &Named, people: &[Person]| -> Vec<String> {
+            picked(query, named, people)
+                .into_iter()
+                .map(|person| person.name)
+                .collect()
+        };
+        // An engineer on the team first, then another engineer; Cy names the team but is no engineer.
+        assert_eq!(names("Storage", &named, &results), ["Ed", "Bo"]);
+        // A weak team word picks no one by itself, and "swe" is not "Sweden".
         let others = [
-            person("Ed", "Sales Lead, Sweden"),
-            person("Fa", "Account Executive"),
-            person("Gi", "SWE II"),
+            person("Ed", "Senior Analyst, Enterprise Cybersecurity"),
+            person("Fa", "Sales Lead, Sweden"),
             person("Di", "Recruiting Partner"),
+            person("Gi", "SWE II"),
         ];
-        let inference = Named {
-            team: Some("Inference".into()),
+        let enterprise = Named {
+            team: Some("Enterprise AI".into()),
             ..Named::default()
         };
-        let names: Vec<String> = picked("Inference", &inference, &others)
-            .into_iter()
-            .map(|person| person.name)
-            .collect();
-        assert_eq!(names, ["Gi", "Di"]);
+        assert_eq!(names("Enterprise AI", &enterprise, &others), ["Gi", "Di"]);
+        assert!(names("Enterprise AI", &enterprise, &others[..2]).is_empty());
         let manager = Named {
             people: vec![NamedPerson {
                 name: "di".into(),
@@ -1459,6 +1545,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_company_page_found_once_is_kept_by_the_company_name() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
+        store
+            .save_company_page("Example Co, Inc.", "example-co-ai", at)
+            .unwrap();
+        store.save_company_page("Example Co", "example-co-labs", at).unwrap();
+        let pages = store.company_pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages.get(&company_key("Example Co")).map(String::as_str),
+            Some("example-co-labs")
+        );
+    }
+
     #[tokio::test]
     async fn a_deferred_posting_is_not_read_again_when_no_lookup_can_run() {
         let scratch = tempfile::tempdir().unwrap();
@@ -1472,7 +1575,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let run = check_postings(&database, None).await.unwrap();
+        let run = check_postings(&database, None, &[]).await.unwrap();
 
         assert_eq!(run.checked, []);
     }

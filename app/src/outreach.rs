@@ -343,7 +343,11 @@ impl OutreachView {
         self.run(
             doing,
             async move {
-                let mut lines = vec![outreach::check_postings(&database, bridge.clone()).await?.summary()];
+                let mut lines = vec![
+                    outreach::check_postings(&database, bridge.clone(), &[])
+                        .await?
+                        .summary(),
+                ];
                 if sweep {
                     let bridge = bridge.ok_or("Chrome is not connected, so the hiring-post sweep did not run.")?;
                     lines.push(outreach::sweep(&database, &profile?, bridge).await?.summary());
