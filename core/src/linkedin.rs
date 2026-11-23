@@ -242,9 +242,10 @@ pub struct PeoplePage {
     pub people: Vec<Person>,
 }
 
-/// The company's People page, searched for `keywords`. `slug` is the company's part of its page address.
-pub fn people_search_address(slug: &str, keywords: &str) -> String {
-    format!("{SITE}/company/{slug}/people/?keywords={}", encoded(keywords))
+/// The company's People page. LinkedIn ignores a `keywords` parameter on it, so Maverick loads the
+/// plain list and picks people from it. `slug` is the company's part of its page address.
+pub fn people_address(slug: &str) -> String {
+    format!("{SITE}/company/{slug}/people/")
 }
 
 /// A guess at a company's page address from its name: lower case, words joined by hyphens.
@@ -265,54 +266,70 @@ fn text_of(element: ElementRef<'_>) -> String {
     squeezed(&element.text().collect::<String>())
 }
 
-/// The text LinkedIn shows sighted users. It repeats names in hidden spans for screen readers.
-fn shown_text(element: ElementRef<'_>) -> String {
-    match element.select(&selector("[aria-hidden=\"true\"]")).next() {
-        Some(shown) => text_of(shown),
-        None => text_of(element),
-    }
+/// The separate pieces of text in an element, in page order.
+fn strings_of(element: ElementRef<'_>) -> Vec<String> {
+    element.text().map(squeezed).filter(|text| !text.is_empty()).collect()
 }
 
-/// Reads the cards on a company's People page. Members outside the user's network show as
-/// "LinkedIn Member" with no profile; they are left out.
+/// The page title less LinkedIn's suffix and the unread count it puts in front, such as `(3) `.
+fn page_title(page: &Html) -> Option<String> {
+    let title = page.select(&selector("title")).next().map(text_of)?;
+    let title = title.strip_suffix(" | LinkedIn").unwrap_or(&title);
+    let title = match title.strip_prefix('(').and_then(|rest| rest.split_once(") ")) {
+        Some((count, rest)) if count.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => title,
+    };
+    Some(title.to_owned())
+}
+
+/// Reads the cards on a company's People page. The page's classes are hashed, so cards are found
+/// by role: each list item with a profile link is a person, whose texts are the name, the degree
+/// (`· 2nd`), the headline and then lines such as a mutual connection. The "Alumni who work here"
+/// list after the main one is left out, and so are members shown as "LinkedIn Member".
+///
+/// `company` is the name in the title, `Example Co: People | LinkedIn`. Any other title, such as a
+/// missing company's page, gives `None`.
 pub fn people_page(html: &str) -> PeoplePage {
     let page = Html::parse_document(html);
-    let company = page.select(&selector("h1")).map(text_of).find(|name| !name.is_empty());
-    let mut people = Vec::new();
-    for card in page.select(&selector(
-        ".org-people-profile-card__profile-card-spacing, .org-people-profile-card",
-    )) {
-        let name = card
-            .select(&selector(".artdeco-entity-lockup__title"))
-            .next()
-            .map(shown_text)
-            .unwrap_or_default();
-        let profile_url = card
-            .select(&selector("a[href*=\"/in/\"]"))
-            .filter_map(|link| link.attr("href"))
-            .next()
-            .map(profile_address);
-        if name.is_empty() || name == "LinkedIn Member" || profile_url.is_none() {
+    let company = page_title(&page)
+        .and_then(|title| title.strip_suffix(": People").map(str::to_owned))
+        .filter(|name| !name.is_empty());
+    let mut people: Vec<Person> = Vec::new();
+    let mut heading = String::new();
+    // Headings and list items come in page order, so each card knows the list it sits under.
+    for element in page.select(&selector("h2, [role=\"listitem\"]")) {
+        if element.value().name() == "h2" {
+            heading = text_of(element);
             continue;
         }
-        let title = card
-            .select(&selector(".artdeco-entity-lockup__subtitle"))
-            .next()
-            .map(text_of)
-            .unwrap_or_default();
-        let degree = card
-            .select(&selector(".artdeco-entity-lockup__degree"))
-            .next()
-            .map(|degree| text_of(degree).trim_start_matches('·').trim().to_owned())
-            .filter(|degree| !degree.is_empty());
-        if !people.iter().any(|seen: &Person| seen.profile_url == profile_url) {
-            people.push(Person {
-                name,
-                title,
-                profile_url,
-                degree,
-            });
+        if heading.contains("Alumni") {
+            continue;
         }
+        let Some(link) = element.select(&selector("a[href*=\"/in/\"]")).next() else {
+            continue;
+        };
+        let profile_url = link.attr("href").map(profile_address);
+        let strings = strings_of(element);
+        let Some(name) = strings.first().cloned() else { continue };
+        if name == "LinkedIn Member" || people.iter().any(|seen| seen.profile_url == profile_url) {
+            continue;
+        }
+        let degree = strings
+            .iter()
+            .find_map(|text| text.strip_prefix('·'))
+            .map(|degree| degree.trim().to_owned());
+        let title = strings
+            .iter()
+            .skip(1)
+            .find(|text| !text.starts_with('·'))
+            .cloned()
+            .unwrap_or_default();
+        people.push(Person {
+            name,
+            title,
+            profile_url,
+            degree,
+        });
     }
     PeoplePage { company, people }
 }
@@ -320,31 +337,35 @@ pub fn people_page(html: &str) -> PeoplePage {
 /// A post from LinkedIn's content search.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Post {
-    /// LinkedIn's id for the post, such as `urn:li:activity:7390000000000000001`.
-    pub urn: String,
     pub poster: String,
     /// `None` when a company page, not a person, posted it.
     pub poster_url: Option<String>,
     pub headline: String,
-    /// `1st` for a connection, as the post shows it.
+    /// As the post shows it, such as `1st` or `3rd+`.
     pub degree: Option<String>,
     pub text: String,
-    /// False while LinkedIn still cuts the text short behind a "more" button.
+    /// False when LinkedIn cut the text short, ending it with `…`.
     pub complete: bool,
 }
 
 impl Post {
+    /// The search page carries no id for its posts, so the link is the poster's activity page. A
+    /// fingerprint of the text follows it, so the same post gives the same link on every sweep.
     pub fn link(&self) -> String {
-        post_address(&self.urn)
+        let page = match &self.poster_url {
+            Some(profile) => format!("{profile}recent-activity/all/"),
+            None => format!("{SITE}/feed/"),
+        };
+        // FNV-1a, which unlike the standard hasher stays the same across Rust releases.
+        let fingerprint = self.text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        format!("{page}#post-{fingerprint:016x}")
     }
 
     pub fn is_connection(&self) -> bool {
         self.degree.as_deref() == Some("1st")
     }
-}
-
-pub fn post_address(urn: &str) -> String {
-    format!("{SITE}/feed/update/{urn}/")
 }
 
 /// LinkedIn's content search for posts from the past day, newest first.
@@ -355,61 +376,66 @@ pub fn post_search_address(keywords: &str) -> String {
     )
 }
 
-/// Reads the posts on a content search page.
+/// Reads the posts on a content search page. Each post is a list item whose texts start with the
+/// poster's link (name, then degree), then the headline and the age. The post's text sits in its
+/// expandable text box.
 pub fn posts_page(html: &str) -> Vec<Post> {
     let page = Html::parse_document(html);
     let mut posts: Vec<Post> = Vec::new();
-    for update in page.select(&selector("[data-urn^=\"urn:li:\"]")) {
-        let Some(urn) = update.attr("data-urn") else { continue };
-        if posts.iter().any(|post| post.urn == urn) {
-            continue;
-        }
-        let actor = update.select(&selector(".update-components-actor")).next();
-        let find = |css: &str| actor.and_then(|actor| actor.select(&selector(css)).next());
-        let poster = find(".update-components-actor__title")
-            .map(shown_text)
-            .unwrap_or_default();
-        let poster_url = find("a[href*=\"/in/\"]")
-            .and_then(|link| link.attr("href"))
-            .map(profile_address);
-        let headline = find(".update-components-actor__description")
-            .map(shown_text)
-            .unwrap_or_default();
-        let degree = find(".update-components-actor__supplementary-actor-info")
-            .map(text_of)
-            .and_then(|info| {
-                ["1st", "2nd", "3rd"]
-                    .into_iter()
-                    .find(|degree| info.contains(degree))
-                    .map(str::to_owned)
-            });
-        let Some(body) = update.select(&selector(".update-components-text")).next() else {
+    for card in page.select(&selector("[role=\"listitem\"][componentkey^=\"update-card-focus\"]")) {
+        let Some(body) = card.select(&selector("[data-testid=\"expandable-text-box\"]")).next() else {
             continue;
         };
-        let cut_short = update
-            .select(&selector(".feed-shared-inline-show-more-text__see-more-less-toggle"))
-            .any(|toggle| {
-                let label = text_of(toggle).to_lowercase();
-                label.contains("more") && !label.contains("less")
-            });
-        posts.push(Post {
-            urn: urn.to_owned(),
+        let person = card
+            .select(&selector("a[href*=\"/in/\"]"))
+            .find(|link| !strings_of(*link).is_empty());
+        let poster_url = person.and_then(|link| link.attr("href")).map(profile_address);
+        let actor = person.map(strings_of).unwrap_or_default();
+        let poster = actor.first().cloned().unwrap_or_else(|| {
+            card.select(&selector("a[href*=\"/company/\"]"))
+                .map(text_of)
+                .find(|name| !name.is_empty())
+                .unwrap_or_default()
+        });
+        let degree = actor
+            .iter()
+            .find_map(|text| text.strip_prefix('•'))
+            .map(|degree| degree.trim().to_owned());
+        // The headline is the text right after the poster's link, unless the post's age comes first.
+        let strings = strings_of(card);
+        let headline = actor
+            .last()
+            .and_then(|last| strings.iter().position(|text| text == last))
+            .and_then(|at| strings.get(at + 1))
+            .filter(|text| !text.ends_with('•') && text.as_str() != "--")
+            .cloned()
+            .unwrap_or_default();
+        let text = lines_of(body);
+        let post = Post {
             poster,
             poster_url,
             headline,
             degree,
-            text: lines_of(body),
-            complete: !cut_short,
-        });
+            complete: !text.ends_with('…'),
+            text,
+        };
+        if !posts.iter().any(|seen| seen.link() == post.link()) {
+            posts.push(post);
+        }
     }
     posts
 }
 
-/// The text of an element, keeping its line breaks.
+/// The text of an element, keeping its line breaks and leaving out its buttons.
 fn lines_of(element: ElementRef<'_>) -> String {
     let mut text = String::new();
     for node in element.descendants() {
+        let in_button = node
+            .ancestors()
+            .take_while(|ancestor| ancestor.id() != element.id())
+            .any(|ancestor| matches!(ancestor.value(), Node::Element(tag) if tag.name() == "button"));
         match node.value() {
+            _ if in_button => {}
             Node::Text(part) => text.push_str(part),
             Node::Element(tag) if tag.name() == "br" => text.push('\n'),
             _ => {}
@@ -527,10 +553,13 @@ pub struct Reader {
     visits: Visits,
 }
 
-/// Opens every "more" button in the posts on the page, so the full text is in the page.
+/// Presses "more" on each post LinkedIn cut short, so its full text is in the page. Most posts
+/// carry their full text already; a cut-short one ends with `…`.
 const EXPAND_POSTS: &str = r#"(async () => {
-    for (const toggle of document.querySelectorAll(".feed-shared-inline-show-more-text__see-more-less-toggle")) {
-        if (/more/i.test(toggle.innerText) && !/less/i.test(toggle.innerText)) toggle.click();
+    for (const box of document.querySelectorAll('[data-testid="expandable-text-box"]')) {
+        const more = box.querySelector('[data-testid="expandable-text-button"]');
+        const text = box.textContent.replace(more?.textContent ?? "", "").trim();
+        if (more && text.endsWith("…")) more.click();
     }
     await new Promise((done) => setTimeout(done, 1500));
     return true;
@@ -673,32 +702,45 @@ impl Control {
     ];
 
     fn locator(self) -> Locator {
-        // The profile's top card is the first section of the page's main part.
+        // The profile's top card is the first profile card; other people's Connect and Message
+        // controls fill the side column, outside it. The card draws each control twice, once per
+        // layout, so only a control that takes up room on the screen counts.
         let in_card = |test: &str| {
             format!(
                 r#"(() => {{
-                    const card = document.querySelector("main section");
+                    const card = document.querySelector('[componentkey^="com.linkedin.sdui.profile.card"]')
+                        || document.querySelector("main section");
                     if (!card) return null;
                     return [...card.querySelectorAll("button, a")].find((control) => {{
+                        if (!control.getClientRects().length) return false;
                         const label = (control.getAttribute("aria-label") || "").trim();
                         const text = control.innerText.trim();
+                        const href = control.getAttribute("href") || "";
                         return {test};
                     }}) || null;
                 }})()"#
             )
         };
         let (name, script) = match self {
-            Control::Message => ("Message button", in_card(r#"/^Message\b/i.test(label) || text === "Message""#)),
+            Control::Message => (
+                "Message button",
+                in_card(r#"href.includes("/messaging/compose") || /^Message\b/i.test(label) || text === "Message""#),
+            ),
             Control::Connect => (
                 "Connect button",
                 in_card(r#"/^Invite .* to connect$/i.test(label) || text === "Connect""#),
             ),
-            Control::MoreActions => ("More button", in_card(r#"label === "More actions" || text === "More""#)),
+            Control::MoreActions => (
+                "More button",
+                in_card(r#"label === "More" || label === "More actions" || text === "More""#),
+            ),
             Control::ConnectInMenu => (
                 "Connect in the More menu",
-                r#"[...document.querySelectorAll(".artdeco-dropdown__content [role='button'], .artdeco-dropdown__content button")]
-                    .find((item) => /^Invite .* to connect$/i.test(item.getAttribute("aria-label") || "")
-                        || item.innerText.trim() === "Connect") || null"#
+                r#"[...document.querySelectorAll("[role='menu'], .artdeco-dropdown__content")]
+                    .flatMap((menu) => [...menu.querySelectorAll("[role='menuitem'], [role='button'], button, a")])
+                    .find((item) => item.getClientRects().length
+                        && (/^Invite .* to connect$/i.test(item.getAttribute("aria-label") || "")
+                            || item.innerText.trim() === "Connect")) || null"#
                     .to_owned(),
             ),
             Control::AddNote => (
@@ -712,10 +754,13 @@ impl Control {
     }
 }
 
-const NOTE_FIELD: &str =
-    "document.querySelector(\"[role='dialog'] textarea[name='message'], textarea#custom-message\")";
-const MESSAGE_FIELD: &str =
-    "[...document.querySelectorAll(\".msg-form__contenteditable[contenteditable='true']\")].pop() || null";
+const NOTE_FIELD: &str = "document.querySelector(\"[role='dialog'] textarea[name='message'], textarea#custom-message, \
+                          [role='dialog'] textarea\")";
+/// The message box, and never a comment box on the profile's posts.
+const MESSAGE_FIELD: &str = r#"[...document.querySelectorAll("[contenteditable='true']")]
+    .filter((box) => box.closest(".msg-form")
+        || /message/i.test(box.getAttribute("aria-label") || box.getAttribute("aria-placeholder") || ""))
+    .pop() || null"#;
 /// LinkedIn asks for the person's email before some connection requests. Maverick never invents one.
 const EMAIL_WALL: &str =
     "document.querySelector(\"[role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
@@ -870,36 +915,38 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
         );
     }
 
-    const PEOPLE: &str = r#"<html><body><main>
-<h1 class="org-top-card-summary__title" title="Example Co">
-  Example Co
-</h1>
-<ul>
- <li class="grid org-people-profile-card__profile-card-spacing">
-  <section class="artdeco-card">
-   <div class="artdeco-entity-lockup">
-    <div class="artdeco-entity-lockup__image"><a href="https://www.linkedin.com/in/ada-example-1a2b3c?miniProfileUrn=urn%3Ali%3Afs"><img alt="Ada Example"></a></div>
-    <div class="artdeco-entity-lockup__title"><a href="https://www.linkedin.com/in/ada-example-1a2b3c?miniProfileUrn=urn%3Ali%3Afs"><div class="lt-line-clamp">
-      Ada Example
-    </div></a></div>
-    <div class="artdeco-entity-lockup__badge"><span class="a11y-text">2nd degree connection</span><span class="artdeco-entity-lockup__degree" aria-hidden="true">· 2nd</span></div>
-    <div class="artdeco-entity-lockup__subtitle"><div class="lt-line-clamp">Software Engineer, Storage Infrastructure</div></div>
-   </div>
-  </section>
- </li>
- <li class="grid org-people-profile-card__profile-card-spacing">
-  <section class="artdeco-card"><div class="artdeco-entity-lockup">
-    <div class="artdeco-entity-lockup__title"><div class="lt-line-clamp">LinkedIn Member</div></div>
-    <div class="artdeco-entity-lockup__subtitle"><div>Engineer</div></div>
-  </div></section>
- </li>
- <li class="grid org-people-profile-card__profile-card-spacing">
-  <section class="artdeco-card"><div class="artdeco-entity-lockup">
-    <div class="artdeco-entity-lockup__title"><a href="/in/bo-sample/"><div>Bo Sample</div></a></div>
-    <div class="artdeco-entity-lockup__subtitle"><div>Engineering Manager, Storage</div></div>
-  </div></section>
- </li>
-</ul></main></body></html>"#;
+    /// Made up, shaped like the real page on 2026-11-23: hashed classes, cards as list items,
+    /// the company only in the title and an h2, and an alumni list after the main one.
+    const PEOPLE: &str = r#"<html><head><title>Example Co: People | LinkedIn</title></head><body><main>
+<h2 class="cfsq1">Example Co</h2>
+<h2 class="cfsq1">1,204 associated members</h2>
+<h3 class="cfsz9">How you are connected</h3>
+<div class="cfsa1 cfsb2">
+ <div role="listitem" class="cfsk3" componentkey="auto-component-1">
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/?miniProfileUrn=x" class="cfsp0"><img alt="Ada Example’s profile picture" class="cfsi1"></a>
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsn2"><span class="cfsn3">Ada Example</span></a>
+  <span aria-hidden="true" class="cfsd4">· 2nd</span>
+  <div class="cfsh5"><a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsh6">Software Engineer, Storage Infrastructure</a></div>
+  <p class="cfsm7">Bo Sample is a mutual connection</p>
+  <button class="cfsb8" aria-label="Invite Ada Example to connect"><span>Connect</span></button>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-2">
+  <a href="https://www.linkedin.com/in/cy-person/" class="cfsn2"><span>Cy Person</span></a>
+  <span aria-hidden="true" class="cfsd4">· 3rd</span>
+  <div class="cfsh5">Head of Marketing</div>
+  <p class="cfsm7">Based on your profile</p>
+  <button class="cfsb8"><span>Follow</span></button>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-3">
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsn2"><span>Ada Example</span></a>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-4"><span>People highlights</span></div>
+</div>
+<h2 class="cfsq1">Alumni who work here</h2>
+<div class="cfsa1">
+ <div role="listitem" class="cfsk3"><a href="https://www.linkedin.com/in/di-alum/"><span>Di Alum</span></a><span>· 2nd</span><div>Engineer</div><button>Connect</button></div>
+</div>
+</main></body></html>"#;
 
     #[test]
     fn a_people_page_gives_named_cards_with_title_profile_and_degree() {
@@ -915,52 +962,63 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
                     degree: Some("2nd".into()),
                 },
                 Person {
-                    name: "Bo Sample".into(),
-                    title: "Engineering Manager, Storage".into(),
-                    profile_url: Some("https://www.linkedin.com/in/bo-sample/".into()),
-                    degree: None,
+                    name: "Cy Person".into(),
+                    title: "Head of Marketing".into(),
+                    profile_url: Some("https://www.linkedin.com/in/cy-person/".into()),
+                    degree: Some("3rd".into()),
                 },
             ]
         );
         assert_eq!(
-            people_search_address("example-co", "storage & infra"),
-            "https://www.linkedin.com/company/example-co/people/?keywords=storage%20%26%20infra"
+            people_address("example-co"),
+            "https://www.linkedin.com/company/example-co/people/"
         );
+        // A wrong guess at the address lands on a page that is not a company's People page.
+        let missing = "<html><head><title>(2) Page not found | LinkedIn</title></head><body></body></html>";
+        assert_eq!(people_page(missing).company, None);
     }
 
-    const POSTS: &str = r#"<html><body><div class="search-results-container"><ul role="list">
-<li><div data-urn="urn:li:activity:7390000000000000001" class="feed-shared-update-v2">
-  <div class="update-components-actor">
-    <a class="update-components-actor__meta-link" href="https://www.linkedin.com/in/sam-poster?miniProfileUrn=x">
-      <span class="update-components-actor__title"><span dir="ltr"><span aria-hidden="true"><!---->Sam Poster<!----></span><span class="visually-hidden">Sam Poster</span></span>
-      <span class="update-components-actor__supplementary-actor-info"> • 2nd</span></span>
-      <span class="update-components-actor__description"><span aria-hidden="true">Engineering Manager at Example Co</span><span class="visually-hidden">Engineering Manager at Example Co</span></span>
-    </a>
-  </div>
-  <div class="feed-shared-inline-show-more-text">
-    <div class="update-components-text"><span class="break-words"><span dir="ltr">We're hiring new grad backend engineers!<br>Team: Storage.   Location: Austin, TX<br><br>Apply below.</span></span></div>
-    <button class="feed-shared-inline-show-more-text__see-more-less-toggle">…less</button>
-  </div>
-</div></li>
-<li><div data-urn="urn:li:activity:7390000000000000002" class="feed-shared-update-v2">
-  <div class="update-components-actor">
-    <a href="https://www.linkedin.com/company/jobs-digest/"><span class="update-components-actor__title"><span aria-hidden="true">Jobs Digest</span></span>
-    <span class="update-components-actor__description"><span aria-hidden="true">12,000 followers</span></span></a>
-  </div>
-  <div class="update-components-text"><span>Top 50 companies hiring this week</span></div>
-  <button class="feed-shared-inline-show-more-text__see-more-less-toggle">…more</button>
-</div></li>
-<li><div data-urn="urn:li:activity:7390000000000000001" class="feed-shared-update-v2"></div></li>
-</ul></div></body></html>"#;
+    /// Made up, shaped like the real search page on 2026-11-23: each post a list item keyed
+    /// `update-card-focus…`, no post id in the card, the text in an expandable box.
+    const POSTS: &str = r#"<html><head><title>Search | LinkedIn</title></head><body><main>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusAbCdEf0123FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/sam-poster/?miniProfileUrn=x" aria-label="Sam Poster Verified Premium 2nd"><img alt=""></a>
+  <a href="https://www.linkedin.com/in/sam-poster/"><span class="cfsa2">Sam Poster</span><span class="cfsa3">• 2nd</span></a>
+  <p class="cfsa4">Engineering Manager at Example Co</p>
+  <p class="cfsa5">2h •</p>
+  <button class="cfsf6">Follow</button>
+  <div class="cfsb7"><span data-testid="expandable-text-box" class="cfsb8">We're hiring new grad backend engineers!<br>Team: Storage.   Location: Austin, TX<br><br>Apply below.<button data-testid="expandable-text-button" aria-hidden="true">… more</button></span></div>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusZz99FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/company/jobs-digest/"><span>Jobs Digest</span></a>
+  <p class="cfsa5">21h •</p>
+  <span data-testid="expandable-text-box">Top 50 companies hiring this week, and the first ten are…<button data-testid="expandable-text-button">… more</button></span>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusQq11FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/sam-poster/"><span>Sam Poster</span><span>• 2nd</span></a>
+  <p>Engineering Manager at Example Co</p>
+  <p>2h •</p>
+  <span data-testid="expandable-text-box">We're hiring new grad backend engineers!<br>Team: Storage.   Location: Austin, TX<br><br>Apply below.<button data-testid="expandable-text-button">… more</button></span>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusRr22FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/eve-new/"><span>Eve New</span><span>• 3rd+</span></a>
+  <p>--</p>
+  <p>7h •</p>
+  <span data-testid="expandable-text-box">Hiring a platform engineer.<button data-testid="expandable-text-button">… more</button></span>
+</div>
+</main></body></html>"#;
 
     #[test]
     fn a_search_page_gives_each_post_once_with_its_author_and_full_text() {
         let posts = posts_page(POSTS);
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         assert_eq!(
             posts[0],
             Post {
-                urn: "urn:li:activity:7390000000000000001".into(),
                 poster: "Sam Poster".into(),
                 poster_url: Some("https://www.linkedin.com/in/sam-poster/".into()),
                 headline: "Engineering Manager at Example Co".into(),
@@ -970,13 +1028,28 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
                 complete: true,
             }
         );
-        assert_eq!(
-            posts[0].link(),
-            "https://www.linkedin.com/feed/update/urn:li:activity:7390000000000000001/"
-        );
         assert!(!posts[0].is_connection());
-        assert_eq!(posts[1].poster_url, None);
-        assert!(!posts[1].complete);
+        assert_eq!(
+            (
+                posts[1].poster.as_str(),
+                posts[1].poster_url.as_deref(),
+                posts[1].complete
+            ),
+            ("Jobs Digest", None, false)
+        );
+        assert_eq!(
+            (posts[2].headline.as_str(), posts[2].degree.as_deref()),
+            ("", Some("3rd+"))
+        );
+        // The same post gives the same link on every page; another post by the same poster does not.
+        let link = posts[0].link();
+        assert!(link.starts_with("https://www.linkedin.com/in/sam-poster/recent-activity/all/#post-"));
+        assert_eq!(link, posts_page(POSTS)[0].link());
+        let other = Post {
+            text: "We're hiring interns too.".into(),
+            ..posts[0].clone()
+        };
+        assert_ne!(other.link(), link);
     }
 
     #[test]

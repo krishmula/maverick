@@ -628,14 +628,17 @@ async fn chrome() -> Result<std::sync::Arc<maverick_core::bridge::Bridge>, Strin
 }
 
 /// `maverick linkedin <connections|check|sweep|drafts|type|status>`: outreach on LinkedIn.
+/// `page` and `read` are for fixing the parsers when LinkedIn changes its pages: `page` saves one
+/// page as Maverick's tab sees it, and `read` shows what Maverick reads in a saved page.
 /// Nothing here sends a message or a connection request.
 pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::jobs::Outreach;
-    use maverick_core::linkedin::read_connections;
+    use maverick_core::linkedin::{Reader, people_page, posts_page, read_connections};
     use maverick_core::outreach;
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] | sweep | drafts \
-                         | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied>";
+                         | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html>";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
@@ -683,6 +686,51 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let run = runtime()?.block_on(async { outreach::sweep(&database, &profile, chrome().await?).await })?;
             println!("{}", run.summary());
             println!("See the drafts with: maverick linkedin drafts");
+        }
+        ["page", address, out] => {
+            if !address.starts_with("https://www.linkedin.com/") {
+                return Err(format!("{address} is not a LinkedIn address").into());
+            }
+            // One page, in a background tab, with nothing clicked.
+            let html = runtime()?.block_on(async {
+                let mut reader = Reader::open(chrome().await?, 1)
+                    .await
+                    .map_err(|stop| stop.to_string())?;
+                let html = reader.load(address, false).await.map_err(|stop| stop.to_string());
+                reader.close().await;
+                html
+            })?;
+            fs::write(out, html)?;
+            println!("Saved {address} to {out}.");
+        }
+        ["read", "people", file] => {
+            let page = people_page(&fs::read_to_string(file)?);
+            println!(
+                "company: {}",
+                page.company.as_deref().unwrap_or("none; not a People page")
+            );
+            for person in &page.people {
+                let degree = person.degree.as_deref().unwrap_or("-");
+                println!("  {} | {degree} | {}", person.name, person.title);
+            }
+            println!("{} people", page.people.len());
+        }
+        ["read", "posts", file] => {
+            let posts = posts_page(&fs::read_to_string(file)?);
+            for post in &posts {
+                let shown: String = post.text.chars().take(80).collect();
+                println!(
+                    "  {} | {} | {} | {} chars{}\n      {}\n      {}",
+                    post.poster,
+                    post.degree.as_deref().unwrap_or("-"),
+                    post.headline,
+                    post.text.chars().count(),
+                    if post.complete { "" } else { ", cut short" },
+                    post.link(),
+                    shown.replace('\n', " ")
+                );
+            }
+            println!("{} posts", posts.len());
         }
         ["drafts"] => {
             for draft in open_store()?.drafts()? {

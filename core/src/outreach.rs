@@ -20,7 +20,7 @@ use crate::description::{self, Fetched};
 use crate::jobs::{HiringPost, Outreach, Posting, Stage, posting_address, stored_enum};
 use crate::linkedin::{
     self, Connection, NOTE_LIMIT, Person, Post, PosterCheck, Reader, Slot, Stop, company_key, company_slug,
-    people_page, people_search_address, post_search_address, posts_page, same_company,
+    people_address, people_page, post_search_address, posts_page, same_company,
 };
 use crate::providers::{self, Job};
 use crate::score::{self, APPLY_READY, Decision, Profile, Reading};
@@ -444,7 +444,7 @@ fn meaningful_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// What to search the company's People page for: a named person, or else the team or the function.
+/// Who to pick from the company's People page: a named person, or else the team or the function.
 pub fn people_query(named: &Named) -> String {
     match (named.people.first(), &named.team) {
         (Some(person), _) => person.name.clone(),
@@ -464,7 +464,9 @@ pub enum Lookup {
     Deferred(String),
 }
 
-/// One or two people from a People search whose title fits the query, or who are the person named.
+/// One or two people from a company's People page: the person named, or else people whose title
+/// names the team or function, and failing those, engineers and recruiters. LinkedIn ignores a
+/// search on that page, so the picking happens here, from the people it lists.
 pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
     if let Some(wanted) = named.people.first() {
         let wanted = wanted.name.to_lowercase();
@@ -475,17 +477,44 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
             .cloned()
             .collect();
     }
-    let mut words = meaningful_words(query);
-    words.extend(["engineer", "engineering", "recruit"].map(str::to_owned));
-    people
+    const ENGINEERS: &[&str] = &[
+        "software",
+        "engineer",
+        "engineering",
+        "sde",
+        "swe",
+        "developer",
+        "recruit",
+    ];
+    let wanted = meaningful_words(query);
+    // Each word of a title must start with the word sought, so "swe" does not match "Sweden".
+    let fits = |person: &Person, words: &[&str]| {
+        person
+            .title
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| {
+                words
+                    .iter()
+                    .any(|sought| word == *sought || (sought.len() > 3 && word.starts_with(sought)))
+            })
+    };
+    let team: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let mut chosen: Vec<Person> = people
         .iter()
-        .filter(|person| {
-            let title = person.title.to_lowercase();
-            words.iter().any(|word| title.contains(word.as_str()))
-        })
+        .filter(|person| fits(person, &team))
         .take(2)
         .cloned()
-        .collect()
+        .collect();
+    for person in people.iter().filter(|person| fits(person, ENGINEERS)) {
+        if chosen.len() == 2 {
+            break;
+        }
+        if !chosen.contains(person) {
+            chosen.push(person.clone());
+        }
+    }
+    chosen
 }
 
 /// The verdict, from the three sources in the order the user set: the posting, the connections, the People page.
@@ -631,7 +660,7 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Res
                 Some((bridge, left)) => {
                     *left -= 1;
                     let query = people_query(&named);
-                    match look_up(&mut reader, bridge, &posting.company, &query).await {
+                    match look_up(&mut reader, bridge, &posting.company).await {
                         Ok(Lookup::Found(people)) => Lookup::Found(picked(&query, &named, &people)),
                         Ok(other) => other,
                         Err(stop) => {
@@ -673,19 +702,14 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Res
     Ok(run)
 }
 
-/// Searches the company's People page, opening the reader on the first lookup of the run.
-async fn look_up(
-    reader: &mut Option<Reader>,
-    bridge: &Arc<Bridge>,
-    company: &str,
-    query: &str,
-) -> Result<Lookup, Stop> {
+/// Loads the company's People page, opening the reader on the first lookup of the run.
+async fn look_up(reader: &mut Option<Reader>, bridge: &Arc<Bridge>, company: &str) -> Result<Lookup, Stop> {
     if reader.is_none() {
         *reader = Some(Reader::open(bridge.clone(), LOOKUP_CAP).await?);
     }
     let reader = reader.as_mut().expect("the reader was just opened");
     let slug = company_slug(company);
-    let html = reader.load(&people_search_address(&slug, query), false).await?;
+    let html = reader.load(&people_address(&slug), false).await?;
     let page = people_page(&html);
     match page.company {
         Some(name) if same_company(&name, company) => Ok(Lookup::Found(page.people)),
@@ -946,7 +970,7 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
         match reader.load(&post_search_address(search), true).await {
             Ok(html) => {
                 for post in posts_page(&html) {
-                    if !posts.iter().any(|seen| seen.urn == post.urn) {
+                    if !posts.iter().any(|seen| seen.link() == post.link()) {
                         posts.push(post);
                     }
                 }
@@ -1302,6 +1326,22 @@ mod tests {
             .map(|person| person.name)
             .collect();
         assert_eq!(names, ["Bo", "Cy"]);
+        // No title names the team, so engineers and recruiters stand in; "swe" is not "Sweden".
+        let others = [
+            person("Ed", "Sales Lead, Sweden"),
+            person("Fa", "Account Executive"),
+            person("Gi", "SWE II"),
+            person("Di", "Recruiting Partner"),
+        ];
+        let inference = Named {
+            team: Some("Inference".into()),
+            ..Named::default()
+        };
+        let names: Vec<String> = picked("Inference", &inference, &others)
+            .into_iter()
+            .map(|person| person.name)
+            .collect();
+        assert_eq!(names, ["Gi", "Di"]);
         let manager = Named {
             people: vec![NamedPerson {
                 name: "di".into(),
