@@ -495,7 +495,7 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
             .collect();
     }
     const ENGINEERS: &[&str] = &["software", "engineer", "engineering", "sde", "swe", "developer"];
-    const RECRUITERS: &[&str] = &["recruit", "recruiter", "recruiting", "talent"];
+    const RECRUITERS: &[&str] = &["recruiter", "recruiting", "recruitment", "talent"];
     /// Words too common in titles to say which team someone is on.
     const WEAK: &[&str] = &[
         "enterprise",
@@ -518,22 +518,24 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
         .into_iter()
         .filter(|word| !WEAK.contains(&word.as_str()))
         .collect();
-    // A title word fits a sought word when it is that word or, for words over three letters, starts
-    // with it, so "recruit" fits "recruiting" and "swe" does not fit "Sweden".
-    // Only the headline's first part says the job; later parts list degrees and skills.
-    let has = |person: &Person, sought: &[&str]| {
+    // A role word fits only as itself or its plural, so "Engineered" is not "engineer" and "swe" is
+    // not "Sweden". A team word over three letters also fits a word it starts, so "infra" fits
+    // "infrastructure". Only the headline's first part says the job; later parts list degrees and skills.
+    let has = |person: &Person, sought: &[&str], prefix: bool| {
         let job = person.title.split('|').next().unwrap_or_default();
         job.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|word| {
-            sought
-                .iter()
-                .any(|sought| word == *sought || (sought.len() > 3 && word.starts_with(sought)))
+            sought.iter().any(|sought| {
+                word == *sought
+                    || word.strip_suffix('s') == Some(sought)
+                    || (prefix && sought.len() > 3 && word.starts_with(sought))
+            })
         })
     };
     let team: Vec<&str> = team.iter().map(String::as_str).collect();
-    let rank = |person: &Person| match (has(person, ENGINEERS), has(person, &team)) {
+    let rank = |person: &Person| match (has(person, ENGINEERS, false), has(person, &team, true)) {
         (true, true) => Some(0),
         (true, false) => Some(1),
-        (false, _) if has(person, RECRUITERS) => Some(2),
+        (false, _) if has(person, RECRUITERS, false) => Some(2),
         (false, _) => None,
     };
     let mut ranked: Vec<(u8, &Person)> = people
@@ -1421,11 +1423,12 @@ mod tests {
         };
         // An engineer on the team first, then another engineer; Cy names the team but is no engineer.
         assert_eq!(names("Storage", &named, &results), ["Ed", "Bo"]);
-        // A weak team word picks no one by itself, and "swe" is not "Sweden".
+        // A weak team word picks no one by itself, "swe" is not "Sweden" and "Engineered" is no engineer.
         let others = [
             person("Ed", "Senior Analyst, Enterprise Cybersecurity"),
             person("Ha", "Supply Chain Analyst at Example Co | MS Systems Engineering"),
             person("Fa", "Sales Lead, Sweden"),
+            person("Jo", "Ads, Engineered | Marketing at Example Co"),
             person("Di", "Recruiting Partner"),
             person("Gi", "SWE II"),
         ];
@@ -1434,7 +1437,7 @@ mod tests {
             ..Named::default()
         };
         assert_eq!(names("Enterprise AI", &enterprise, &others), ["Gi", "Di"]);
-        assert!(names("Enterprise AI", &enterprise, &others[..3]).is_empty());
+        assert!(names("Enterprise AI", &enterprise, &others[..4]).is_empty());
         let manager = Named {
             people: vec![NamedPerson {
                 name: "di".into(),
