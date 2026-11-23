@@ -3,6 +3,7 @@
 //! Approving a draft types it into LinkedIn in the user's Chrome and stops. The user clicks Send.
 //! While the app is open, checks run every hour and the hiring-post sweep every two hours.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +80,15 @@ pub struct DraftRow {
 
 /// Reads the checks and drafts from the store, with the postings and posts they are about.
 /// The slot a draft is in, as its card labels it.
+/// A slot as a sentence names it.
+fn slot_name(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Note => "connection note",
+        Slot::Message => "message",
+        Slot::InMail => "InMail",
+    }
+}
+
 pub fn slot_label(draft: &Draft) -> String {
     match draft.slot {
         Slot::Note => format!("connection note · {} chars", draft.text.chars().count()),
@@ -126,6 +136,38 @@ pub fn rows(store: &Store) -> (Vec<CheckRow>, Vec<DraftRow>) {
     (checks, drafts)
 }
 
+/// A row that can have work of its own: a posting's check on the left, or a draft on the right.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    Posting(String),
+    Draft(i64),
+}
+
+/// What a row's own work is doing or did, shown on that row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowState {
+    /// Running, such as "drafting…". The row's button is disabled meanwhile.
+    Working(String),
+    Done(String),
+    Failed(String),
+}
+
+/// What a row's work leaves behind: what to say, and a draft to outline.
+#[derive(Debug)]
+pub struct Finished {
+    pub said: String,
+    pub draft: Option<i64>,
+}
+
+impl Finished {
+    fn said(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            draft: None,
+        }
+    }
+}
+
 pub struct OutreachView {
     browser: Entity<Browser>,
     background: Handle,
@@ -137,10 +179,16 @@ pub struct OutreachView {
     /// The draft open in the editor.
     editing: Option<i64>,
     editor: Entity<TextareaState>,
-    /// What runs now, such as "typing the draft in Chrome".
+    /// The check-and-sweep run going now, if any.
     working: Option<String>,
-    /// What the last action or run left to say, and whether it worked.
+    /// What the last check-and-sweep run left to say, and whether it worked.
     said: Option<(Signal, String)>,
+    /// Each row's own work. Rows work independently, so a click on one never waits on another.
+    row_states: HashMap<RowKey, RowState>,
+    /// The draft a row's work just made or changed, outlined so the user sees where it went.
+    outlined: Option<i64>,
+    /// Chrome has one active tab, so drafts are typed one at a time; the rest wait their turn.
+    typing: Arc<tokio::sync::Mutex<()>>,
     _schedule: Option<Task<()>>,
 }
 
@@ -166,6 +214,9 @@ impl OutreachView {
             editor,
             working: None,
             said: None,
+            row_states: HashMap::new(),
+            outlined: None,
+            typing: Arc::new(tokio::sync::Mutex::new(())),
             _schedule: None,
         };
         view.reload();
@@ -204,7 +255,9 @@ impl OutreachView {
         Ok(Profile::from(&Answers::load(file)?))
     }
 
-    /// Runs `work` on the background runtime, then reloads and shows what it said.
+    /// Runs a check-and-sweep on the background runtime, then reloads and shows what it said at the
+    /// top of the drafts. Only one runs at a time; its button is hidden meanwhile, and the schedule
+    /// skips a turn while one runs.
     fn run(
         &mut self,
         doing: impl Into<String>,
@@ -236,6 +289,54 @@ impl OutreachView {
         .detach();
     }
 
+    /// What `key`'s row is doing or did.
+    #[cfg(test)]
+    pub fn row_state(&self, key: &RowKey) -> Option<&RowState> {
+        self.row_states.get(key)
+    }
+
+    fn row_failed(&mut self, key: RowKey, why: impl Into<String>, cx: &mut Context<Self>) {
+        self.row_states.insert(key, RowState::Failed(why.into()));
+        cx.notify();
+    }
+
+    /// Runs one row's work on the background runtime. The row shows `doing` at once and then what
+    /// came of it. Rows run side by side; only the same row cannot start twice.
+    pub fn run_row(
+        &mut self,
+        key: RowKey,
+        doing: impl Into<String>,
+        work: impl Future<Output = Result<Finished, String>> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.row_states.get(&key), Some(RowState::Working(_))) {
+            return;
+        }
+        self.row_states.insert(key.clone(), RowState::Working(doing.into()));
+        cx.notify();
+        let done = self.background.spawn(work);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = done.await.unwrap_or_else(|stopped| Err(stopped.to_string()));
+            this.update(cx, |this, cx| {
+                let state = match outcome {
+                    Ok(finished) => {
+                        if finished.draft.is_some() {
+                            this.outlined = finished.draft;
+                        }
+                        RowState::Done(finished.said)
+                    }
+                    Err(why) => RowState::Failed(why),
+                };
+                this.row_states.insert(key, state);
+                this.reload();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn database_or_fail(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
         if self.database.is_none() {
             self.said = Some((Signal::Failed, "This system has no application data directory.".into()));
@@ -244,21 +345,81 @@ impl OutreachView {
         self.database.clone()
     }
 
+    /// A disabled button face for a row whose work is running, in the model's color.
+    fn pending(id: String, doing: &str, palette: &Palette) -> impl IntoElement + use<> {
+        div()
+            .id(SharedString::from(id))
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(doing.to_owned())
+            .child(ui::boxed(doing, palette.signal(Signal::Model)))
+    }
+
+    /// The line under a row that says what its work came to.
+    fn row_said(&self, key: &RowKey, id: String, palette: &Palette) -> Option<impl IntoElement + use<>> {
+        let (signal, text) = match self.row_states.get(key)? {
+            RowState::Working(_) => return None,
+            RowState::Done(text) => (Signal::Done, text.clone()),
+            RowState::Failed(text) => (Signal::Failed, text.clone()),
+        };
+        Some(
+            h_flex()
+                .id(SharedString::from(id))
+                .test_support()
+                .role(gpui_kit::Role::Label)
+                .aria_label(text.clone())
+                .items_start()
+                .gap(px(8.))
+                .child(ui::square(palette.signal(signal)).mt(px(5.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(12.))
+                        .text_color(palette.signal(signal))
+                        .child(SharedString::from(text)),
+                ),
+        )
+    }
+
+    fn database_for(&mut self, key: &RowKey, cx: &mut Context<Self>) -> Option<PathBuf> {
+        if self.database.is_none() {
+            self.row_failed(key.clone(), "This system has no application data directory.", cx);
+        }
+        self.database.clone()
+    }
+
+    /// The user's profile from answers.json, or `None` after saying on the row why it could not be read.
+    fn profile_for(&mut self, key: &RowKey, cx: &mut Context<Self>) -> Option<Profile> {
+        match self.profile() {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                self.row_failed(key.clone(), format!("Could not read your answers: {error}"), cx);
+                None
+            }
+        }
+    }
+
     /// Types an approved draft in the user's Chrome. It stops before Send.
     fn approve(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(database) = self.database_or_fail(cx) else {
+        let key = RowKey::Draft(id);
+        let Some(database) = self.database_for(&key, cx) else {
             return;
         };
         let Some(bridge) = self.bridge(cx) else {
-            self.said = Some((Signal::Failed, "Chrome is not connected, so nothing was typed.".into()));
-            cx.notify();
+            self.row_failed(key, "Chrome is not connected, so nothing was typed.", cx);
             return;
         };
-        self.run(
-            "typing the draft in chrome",
+        let typing = self.typing.clone();
+        self.run_row(
+            key,
+            "typing in chrome…",
             async move {
+                // Another draft may be typing; this one waits for the tab to be free.
+                let _turn = typing.lock().await;
                 outreach::type_approved(&database, bridge, id).await?;
-                Ok("Typed in Chrome. Read it there and click Send yourself, then mark it sent.".to_owned())
+                Ok(Finished::said(
+                    "Typed in Chrome. Read it there and click Send yourself, then mark it sent.",
+                ))
             },
             window,
             cx,
@@ -266,13 +427,35 @@ impl OutreachView {
     }
 
     fn set_status(&mut self, id: i64, status: Outreach, cx: &mut Context<Self>) {
-        let Some(database) = self.database_or_fail(cx) else {
+        let key = RowKey::Draft(id);
+        let Some(database) = self.database_for(&key, cx) else {
             return;
         };
         let saved = Store::open(&database).and_then(|mut store| store.set_draft_status(id, status, Timestamp::now()));
-        if let Err(error) = saved {
-            self.said = Some((Signal::Failed, error.to_string()));
+        match saved {
+            Ok(()) => {
+                self.row_states.remove(&key);
+            }
+            Err(error) => self.row_failed(key, error.to_string(), cx),
         }
+        self.reload();
+        cx.notify();
+    }
+
+    /// Puts a skipped or typed draft back to waiting for approval. Nothing else changes.
+    fn reset(&mut self, id: i64, cx: &mut Context<Self>) {
+        let key = RowKey::Draft(id);
+        let Some(database) = self.database_for(&key, cx) else {
+            return;
+        };
+        let reset = Store::open(&database)
+            .map_err(|error| error.to_string())
+            .and_then(|store| store.reset_draft(id, Timestamp::now()));
+        let state = match reset {
+            Ok(()) => RowState::Done("Back to waiting for your approval.".into()),
+            Err(why) => RowState::Failed(why),
+        };
+        self.row_states.insert(key, state);
         self.reload();
         cx.notify();
     }
@@ -288,49 +471,54 @@ impl OutreachView {
     }
 
     fn save_edit(&mut self, cx: &mut Context<Self>) {
-        let (Some(id), Some(database)) = (self.editing, self.database.clone()) else {
+        let Some(id) = self.editing else {
+            return;
+        };
+        let key = RowKey::Draft(id);
+        let Some(database) = self.database_for(&key, cx) else {
             return;
         };
         let Some(row) = self.drafts.iter().find(|row| row.draft.id == id) else {
             return;
         };
         let text = self.editor.read(cx).value().to_string();
-        match outreach::check_draft(&text, row.draft.slot) {
+        let state = match outreach::check_draft(&text, row.draft.slot) {
             Ok(text) => {
-                let saved = Store::open(&database).and_then(|store| store.set_draft_text(id, &text, Timestamp::now()));
-                self.said = Some(match saved {
-                    Ok(()) => (Signal::Done, "Draft saved.".into()),
-                    Err(error) => (Signal::Failed, error.to_string()),
-                });
                 self.editing = None;
+                match Store::open(&database).and_then(|store| store.set_draft_text(id, &text, Timestamp::now())) {
+                    Ok(()) => RowState::Done("Draft saved.".into()),
+                    Err(error) => RowState::Failed(error.to_string()),
+                }
             }
-            Err(why) => self.said = Some((Signal::Failed, format!("Not saved: {why}."))),
-        }
+            Err(why) => RowState::Failed(format!("Not saved: {why}.")),
+        };
+        self.row_states.insert(key, state);
         self.reload();
         cx.notify();
     }
 
+    /// Drafts a note for a posting's check. The row shows "drafting…", then where the draft went.
     fn draft_for(&mut self, posting_link: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(database) = self.database_or_fail(cx) else {
+        let key = RowKey::Posting(posting_link.clone());
+        let Some(database) = self.database_for(&key, cx) else {
             return;
         };
-        let profile = match self.profile() {
-            Ok(profile) => profile,
-            Err(error) => {
-                self.said = Some((Signal::Failed, error));
-                cx.notify();
-                return;
-            }
+        let Some(profile) = self.profile_for(&key, cx) else {
+            return;
         };
-        self.run(
-            "drafting a note",
+        self.run_row(
+            key,
+            "drafting…",
             async move {
                 let draft = outreach::draft_for_check(&database, &profile, &posting_link).await?;
-                Ok(format!(
-                    "Drafted a {} to {}. Read it before you approve.",
-                    draft.slot.as_str(),
-                    draft.person
-                ))
+                Ok(Finished {
+                    said: format!(
+                        "Drafted a {} to {}. It is first under Drafts, outlined.",
+                        slot_name(draft.slot),
+                        draft.person
+                    ),
+                    draft: Some(draft.id),
+                })
             },
             window,
             cx,
@@ -339,27 +527,26 @@ impl OutreachView {
 
     /// Rewrites a waiting draft as an InMail, or an InMail back as a connection note.
     fn switch_form(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(database) = self.database_or_fail(cx) else {
+        let key = RowKey::Draft(id);
+        let Some(database) = self.database_for(&key, cx) else {
             return;
         };
-        let profile = match self.profile() {
-            Ok(profile) => profile,
-            Err(error) => {
-                self.said = Some((Signal::Failed, error));
-                cx.notify();
-                return;
-            }
+        let Some(profile) = self.profile_for(&key, cx) else {
+            return;
         };
-        self.run(
-            "rewriting the draft",
+        self.run_row(
+            key,
+            "rewriting…",
             async move {
                 let draft = outreach::redraft(&database, &profile, id).await?;
-                Ok(match draft.slot {
-                    Slot::InMail => format!(
-                        "Rewrote the draft to {} as an InMail. Read it before you approve; sending it uses a credit.",
-                        draft.person
-                    ),
-                    _ => format!("Rewrote the draft to {} as a connection note.", draft.person),
+                Ok(Finished {
+                    said: match draft.slot {
+                        Slot::InMail => {
+                            "Rewritten as an InMail. Read it before you approve; sending it uses a credit.".into()
+                        }
+                        _ => "Rewritten as a connection note.".into(),
+                    },
+                    draft: Some(draft.id),
                 })
             },
             window,
@@ -484,14 +671,22 @@ impl OutreachView {
             .any(|draft| draft.draft.about == About::Posting(row.check.posting_link.clone()));
         let can_draft = !has_draft && row.check.people.iter().any(|person| person.profile_url.is_some());
         let link = row.check.posting_link.clone();
-        let draft_button = can_draft.then(|| {
-            ui::button(
-                SharedString::from(format!("draft-{link}")),
-                format!("Draft a note for {}", row.company),
-                ui::quiet_face("draft note", palette),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| this.draft_for(link.clone(), window, cx)))
-        });
+        let key = RowKey::Posting(link.clone());
+        let draft_button: Option<AnyElement> = match self.row_states.get(&key) {
+            Some(RowState::Working(doing)) => {
+                Some(Self::pending(format!("draft-{link}"), doing, palette).into_any_element())
+            }
+            _ => can_draft.then(|| {
+                ui::button(
+                    SharedString::from(format!("draft-{link}")),
+                    format!("Draft a note for {}", row.company),
+                    ui::quiet_face("draft note", palette),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.draft_for(link.clone(), window, cx)))
+                .into_any_element()
+            }),
+        };
+        let said = self.row_said(&key, format!("said-{}", row.check.posting_link), palette);
         v_flex()
             .id(SharedString::from(format!("check-{}", row.check.posting_link)))
             .test_support()
@@ -541,6 +736,7 @@ impl OutreachView {
                     .child(SharedString::from(note.clone()))
             }))
             .children(draft_button.map(|button| h_flex().child(button)))
+            .children(said)
     }
 
     fn drafts_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -648,8 +844,22 @@ impl OutreachView {
                 ui::quiet_face(text, palette),
             )
         };
-        let busy = self.working.is_some();
+        let key = RowKey::Draft(id);
+        let running = match self.row_states.get(&key) {
+            Some(RowState::Working(doing)) => Some(doing.clone()),
+            _ => None,
+        };
+        let busy = running.is_some();
+        let reset = || {
+            quiet(
+                "reset",
+                format!("Put the draft to {} back to waiting for approval", draft.person),
+                "reset",
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.reset(id, cx)))
+        };
         match draft.status {
+            _ if busy => {}
             Outreach::Drafted if !editing => {
                 actions = actions
                     .children((!busy).then(|| {
@@ -696,8 +906,10 @@ impl OutreachView {
                             "type again",
                         )
                         .on_click(cx.listener(move |this, _, window, cx| this.approve(id, window, cx)))
-                    }));
+                    }))
+                    .child(reset());
             }
+            Outreach::Skipped => actions = actions.child(reset()),
             Outreach::Sent => {
                 actions = actions.child(
                     quiet("replied", format!("Mark that {} replied", draft.person), "mark replied")
@@ -706,6 +918,11 @@ impl OutreachView {
             }
             _ => {}
         }
+        if let Some(doing) = &running {
+            actions = actions.child(Self::pending(format!("pending-{id}"), doing, palette));
+        }
+        let said = self.row_said(&key, format!("said-draft-{id}"), palette);
+        let outlined = self.outlined == Some(id);
         if let About::Post(link) = &draft.about {
             let link = link.clone();
             actions = actions.child(
@@ -722,7 +939,11 @@ impl OutreachView {
             .gap(px(7.))
             .p(px(12.))
             .border_1()
-            .border_color(palette.line)
+            .border_color(if outlined {
+                palette.signal(Signal::Model)
+            } else {
+                palette.line
+            })
             .bg(palette.background)
             .children(
                 (draft.status == Outreach::Drafted)
@@ -759,6 +980,7 @@ impl OutreachView {
             .child(body)
             .children(credit)
             .child(actions)
+            .children(said)
     }
 }
 
@@ -870,6 +1092,212 @@ mod tests {
         draft.slot = Slot::InMail;
         draft.subject = Some("The backend role on Storage".into());
         assert_eq!(slot_label(&draft), "inmail · subject: The backend role on Storage");
+    }
+
+    /// A view over the seeded database, with work running on a real runtime so rows can finish.
+    fn opened(
+        cx: &mut TestAppContext,
+        database: &std::path::Path,
+        runtime: &tokio::runtime::Runtime,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<OutreachView>) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let background = runtime.handle().clone();
+        let database = database.to_owned();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| Browser::new(Bridge::new(), background, Ok("/x".into()), None, Some(database), cx))
+        });
+        cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| OutreachView::new(browser, None, window, cx))
+            })
+            .unwrap()
+        })
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Waits until `key`'s row has stopped working.
+    fn settled(cx: &mut TestAppContext, view: &Entity<OutreachView>, key: &RowKey) -> RowState {
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            let state = view.read_with(cx, |view, _| view.row_state(key).cloned());
+            match state {
+                Some(RowState::Working(_)) | None => std::thread::sleep(Duration::from_millis(2)),
+                Some(state) => return state,
+            }
+        }
+        panic!("the row's work did not finish");
+    }
+
+    #[gpui_kit::test]
+    fn a_row_click_is_never_dropped_and_each_row_shows_its_own_work(cx: &mut TestAppContext) {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let id = seeded(&database);
+        // Sample Inc now has an engineer with a profile and no draft yet, so its row offers one.
+        Store::open(&database)
+            .unwrap()
+            .save_check(&Check {
+                posting_link: "https://simplify.jobs/p/2".into(),
+                verdict: Verdict::TeamMember,
+                team: None,
+                people: vec![Person {
+                    name: "Cy Person".into(),
+                    title: "Software Engineer".into(),
+                    profile_url: Some("https://www.linkedin.com/in/cy-person/".into()),
+                    degree: Some("2nd".into()),
+                }],
+                note: None,
+                checked_at: "2026-11-23T17:00:00Z".parse().unwrap(),
+            })
+            .unwrap();
+        let runtime = runtime();
+        let (window, view) = opened(cx, &database, &runtime);
+        let posting = RowKey::Posting("https://simplify.jobs/p/2".into());
+        let draft = RowKey::Draft(id);
+
+        // A scheduled check is running. A click on a row still does something, and says so on the row:
+        // here the answers file is missing, which used to fail at the top of the other column.
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, _| view.working = Some("checking postings".into()));
+            window.render_frame(cx);
+            window.click("draft-https://simplify.jobs/p/2", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("said-https://simplify.jobs/p/2")
+                    .label()
+                    .unwrap()
+                    .starts_with("Could not read your answers")
+            );
+        })
+        .unwrap();
+
+        // Two rows work at once. Each shows its own disabled "…ing" button right away.
+        let (finish_posting, posting_done) = tokio::sync::oneshot::channel::<Result<Finished, String>>();
+        let (finish_draft, draft_done) = tokio::sync::oneshot::channel::<Result<Finished, String>>();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.run_row(
+                    posting.clone(),
+                    "drafting…",
+                    async move { posting_done.await.unwrap() },
+                    window,
+                    cx,
+                );
+                view.run_row(
+                    draft.clone(),
+                    "typing in chrome…",
+                    async move { draft_done.await.unwrap() },
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("draft-https://simplify.jobs/p/2").label(),
+                Some("drafting…")
+            );
+            assert_eq!(
+                window.find(SharedString::from(format!("pending-{id}"))).label(),
+                Some("typing in chrome…")
+            );
+            assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_none());
+        })
+        .unwrap();
+        finish_draft
+            .send(Err("the profile has no Message button".into()))
+            .unwrap();
+        assert_eq!(
+            settled(cx, &view, &draft),
+            RowState::Failed("the profile has no Message button".into())
+        );
+        // The other row is still drafting; the failure did not touch it.
+        assert!(matches!(
+            view.read_with(cx, |view, _| view.row_state(&posting).cloned()),
+            Some(RowState::Working(_))
+        ));
+        finish_posting
+            .send(Ok(Finished {
+                said: "Drafted a connection note to Cy Person. It is first under Drafts, outlined.".into(),
+                draft: Some(id),
+            }))
+            .unwrap();
+        settled(cx, &view, &posting);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("said-https://simplify.jobs/p/2").label(),
+                Some("Drafted a connection note to Cy Person. It is first under Drafts, outlined.")
+            );
+            assert_eq!(
+                window.find(SharedString::from(format!("said-draft-{id}"))).label(),
+                Some("the profile has no Message button")
+            );
+            assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_some());
+            assert_eq!(view.read(cx).outlined, Some(id));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_skipped_or_typed_draft_resets_to_waiting_and_nothing_else_moves(cx: &mut TestAppContext) {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let id = seeded(&database);
+        let runtime = runtime();
+        let (window, view) = opened(cx, &database, &runtime);
+        let checks = || Store::open(&database).unwrap().checks().unwrap();
+        let before = checks();
+        let at: Timestamp = "2026-11-23T18:00:00Z".parse().unwrap();
+        for status in [Outreach::Skipped, Outreach::Typed] {
+            Store::open(&database)
+                .unwrap()
+                .set_draft_status(id, status, at)
+                .unwrap();
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, _| view.reload());
+                window.render_frame(cx);
+                window.click(SharedString::from(format!("reset-{id}")), cx);
+                window.render_frame(cx);
+                assert_eq!(
+                    window.find(SharedString::from(format!("draft-{id}"))).label(),
+                    Some("Bo Sample · Backend Engineer at Example Co · drafted")
+                );
+                assert_eq!(
+                    window.find(SharedString::from(format!("said-draft-{id}"))).label(),
+                    Some("Back to waiting for your approval.")
+                );
+                assert!(window.try_find(SharedString::from(format!("approve-{id}"))).is_some());
+                assert_eq!(view.read(cx).waiting(), 1);
+            })
+            .unwrap();
+            let draft = Store::open(&database).unwrap().draft(id).unwrap().unwrap();
+            assert_eq!((draft.status, draft.slot), (Outreach::Drafted, Slot::Note));
+            assert_eq!(draft.text, "Hi Bo, I applied to the backend role on Storage.");
+        }
+        assert_eq!(checks(), before);
+        // A sent draft offers no reset.
+        Store::open(&database)
+            .unwrap()
+            .set_draft_status(id, Outreach::Sent, at)
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, _| view.reload());
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from(format!("reset-{id}"))).is_none());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

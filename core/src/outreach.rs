@@ -381,6 +381,36 @@ impl Store {
         write.commit()
     }
 
+    /// Puts a skipped draft, or one typed but not sent, back to waiting for approval, with its text and
+    /// slot as they were. Only the draft changes: the posting's check and the hiring post stay as they
+    /// are, and the draft keeps the day it was made, so it does not count against the daily cap again.
+    pub fn reset_draft(&self, id: i64, at: Timestamp) -> Result<(), String> {
+        let said = |error: rusqlite::Error| format!("the database failed: {error}");
+        let status: Option<String> = self
+            .db
+            .query_row("SELECT status FROM outreach_drafts WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(said)?;
+        let status = status
+            .and_then(|status| Outreach::parse(&status))
+            .ok_or("the draft is no longer in the database")?;
+        if !matches!(status, Outreach::Skipped | Outreach::Typed) {
+            return Err(format!(
+                "only a skipped or typed draft can be reset; this one is {}",
+                status.as_str().replace('_', " ")
+            ));
+        }
+        self.db
+            .execute(
+                "UPDATE outreach_drafts SET status = 'drafted', updated_at = ?2 WHERE id = ?1",
+                params![id, at.to_string()],
+            )
+            .map_err(said)?;
+        Ok(())
+    }
+
     /// Puts a draft in another form, such as a note rewritten as an InMail.
     pub fn set_draft_form(&self, id: i64, slot: Slot, written: &Written, at: Timestamp) -> Result<(), StoreError> {
         self.db.execute(
@@ -1773,6 +1803,29 @@ mod tests {
         assert_eq!(saved.text, "Hi Sam, thanks for posting.");
         assert_eq!(saved.status, Outreach::Typed);
         assert_eq!(store.hiring_posts().unwrap()[0].outreach, Outreach::Typed);
+
+        // Reset touches the draft only: the hiring post stays typed, and the day's count stays one.
+        let today = drafted_today(&store.drafts().unwrap(), at);
+        store.reset_draft(id, at).unwrap();
+        let saved = store.draft(id).unwrap().unwrap();
+        assert_eq!(
+            (saved.status, saved.text.as_str(), saved.slot),
+            (Outreach::Drafted, "Hi Sam, thanks for posting.", Slot::Note)
+        );
+        assert_eq!(store.hiring_posts().unwrap()[0].outreach, Outreach::Typed);
+        assert_eq!(drafted_today(&store.drafts().unwrap(), at), today);
+        assert!(
+            store
+                .reset_draft(id, at)
+                .unwrap_err()
+                .contains("only a skipped or typed draft")
+        );
+        store.set_draft_status(id, Outreach::Skipped, at).unwrap();
+        store.reset_draft(id, at).unwrap();
+        assert_eq!(store.draft(id).unwrap().unwrap().status, Outreach::Drafted);
+        store.set_draft_status(id, Outreach::Sent, at).unwrap();
+        assert!(store.reset_draft(id, at).is_err());
+        assert!(store.reset_draft(999, at).unwrap_err().contains("no longer"));
 
         let inmail = Written {
             subject: Some("The backend role on Storage".into()),

@@ -820,7 +820,12 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         ["status", id, status] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;
             let status = Outreach::parse(&status.replace('-', "_")).ok_or(USAGE)?;
-            Store::open(&database)?.set_draft_status(id, status, jiff::Timestamp::now())?;
+            if status == Outreach::Drafted {
+                // Back to waiting for approval, as the Reset button does: only the draft changes.
+                Store::open(&database)?.reset_draft(id, jiff::Timestamp::now())?;
+            } else {
+                Store::open(&database)?.set_draft_status(id, status, jiff::Timestamp::now())?;
+            }
             println!("Draft #{id} is now {}.", status.as_str().replace('_', " "));
         }
         _ => return Err(USAGE.into()),
