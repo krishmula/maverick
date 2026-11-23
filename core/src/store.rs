@@ -1,11 +1,15 @@
 //! The local database of the job funnel. One `Store` holds the only connection that writes.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
+
+use jiff::Timestamp;
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, Row, params};
 
-use crate::jobs::{Application, ApplicationStatus, Outreach, Posting, Sponsorship, Stage};
+use crate::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
 use crate::tracker::Tracker;
 
 pub use rusqlite::Error as StoreError;
@@ -74,6 +78,14 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX chat_lines_by_chat ON chat_lines (chat_id, id);
 ",
+    // Decisions live apart from the postings, so a sheet sync that rewrites a posting keeps them.
+    "
+    CREATE TABLE decisions (
+        link TEXT PRIMARY KEY,
+        decision TEXT NOT NULL CHECK (decision IN ('approved', 'skipped')),
+        decided_at TEXT NOT NULL
+    ) STRICT;
+",
 ];
 
 pub struct Store {
@@ -93,6 +105,8 @@ impl Store {
     /// Opens the database at `path`, creating it or bringing its schema up to date first.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let mut db = Connection::open(path)?;
+        // The app and a funnel pass each open the store. A short wait lets one finish its write.
+        db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "foreign_keys", true)?;
         let applied: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -266,6 +280,27 @@ impl Store {
             ],
         )?;
         write.commit()
+    }
+
+    /// Records the user's decision on the posting at `link`. `None` takes the decision back.
+    pub fn decide(&mut self, link: &str, decision: Option<Decision>) -> Result<(), StoreError> {
+        match decision {
+            Some(decision) => self.db.execute(
+                "INSERT INTO decisions (link, decision, decided_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (link) DO UPDATE SET decision = excluded.decision, decided_at = excluded.decided_at",
+                params![link, decision.as_str(), Timestamp::now().to_string()],
+            )?,
+            None => self.db.execute("DELETE FROM decisions WHERE link = ?1", [link])?,
+        };
+        Ok(())
+    }
+
+    /// The user's decisions, by posting link.
+    pub fn decisions(&self) -> Result<HashMap<String, Decision>, StoreError> {
+        let mut select = self.db.prepare("SELECT link, decision FROM decisions")?;
+        select
+            .query_map([], |row| Ok((row.get(0)?, stored(row, 1, Decision::parse)?)))?
+            .collect()
     }
 
     /// Every posting, oldest first.

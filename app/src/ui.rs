@@ -9,7 +9,7 @@ use std::cell::Cell;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla,
@@ -173,6 +173,28 @@ pub fn score(score: Option<u8>, size: f32) -> Div {
         .child(SharedString::from(
             score.map_or("--".to_owned(), |score| score.to_string()),
         ))
+}
+
+/// Labelled values, one per line. A value that is empty is left out.
+pub fn facts(facts: &[(&str, String)], palette: &Palette) -> Div {
+    v_flex().gap(px(7.)).children(
+        facts
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(label, value)| {
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(caps(label).w(px(72.)).pt(px(1.)).text_color(palette.faint))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(palette.muted)
+                            .child(SharedString::from(value.clone())),
+                    )
+            }),
+    )
 }
 
 /// Something to click. `name` is what a screen reader and the tests call it.

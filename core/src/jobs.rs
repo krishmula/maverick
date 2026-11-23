@@ -53,6 +53,14 @@ stored_enum! {
 }
 
 stored_enum! {
+    /// What the user decided about a posting on the decision board. The sheet never holds it.
+    Decision {
+        Approved => "approved",
+        Skipped => "skipped",
+    }
+}
+
+stored_enum! {
     ApplicationStatus {
         Pending => "pending",
         Rejected => "rejected",

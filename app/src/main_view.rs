@@ -16,7 +16,8 @@ use maverick_core::bridge::{BrowserState, Tab};
 
 use gpui_kit::TestSupportExt as _;
 
-use crate::band::{Band, Cell, Mark};
+use crate::band::{Band, Mark};
+use crate::board::Board;
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::connections::Connections;
 use crate::connections::OpenSetup;
@@ -25,7 +26,7 @@ use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
 use crate::pane_widths::Pane;
 use crate::report;
-use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Refreshed};
+use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Lists, Refreshed};
 use crate::setup::{Finished, Setup};
 use crate::tabs::{TabList, host_of};
 use crate::ui::{self, Palette, Signal};
@@ -44,6 +45,8 @@ const TRACKED: usize = 6;
 enum Showing {
     Tabs,
     Jobs,
+    /// The decision board.
+    Approvals,
     /// What is due in TickTick.
     Mav,
     /// The Google profiles, TickTick, the model and Chrome.
@@ -59,6 +62,7 @@ pub struct MainView {
     icon_file: Option<PathBuf>,
     jobs: Entity<ListState<JobList>>,
     tabs: Entity<ListState<TabList>>,
+    board: Entity<Board>,
     mav: Entity<Mav>,
     connections: Entity<Connections>,
     setup: Entity<Setup>,
@@ -75,16 +79,19 @@ pub struct MainView {
 impl MainView {
     pub fn new(
         browser: Entity<Browser>,
-        jobs: Vec<Job>,
-        cells: Vec<Cell>,
+        lists: Lists,
         icon_file: Option<PathBuf>,
         first_run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let Lists { jobs, cells, board } = lists;
         // A first start opens the guide, so a new user sets up a model before anything needs one.
         let showing = if first_run {
             Showing::Setup
+        } else if board.entries.iter().any(|entry| entry.decision.is_none()) {
+            // Postings that wait on a decision come first: approving one is what starts an application.
+            Showing::Approvals
         } else if jobs.is_empty() {
             Showing::Tabs
         } else {
@@ -94,6 +101,7 @@ impl MainView {
         let tabs = cx.new(|cx| ListState::new(TabList::new(browser.clone()), window, cx).searchable(true));
         let background = browser.read(cx).background();
         let database = browser.read(cx).database();
+        let board = cx.new(|cx| Board::new(board, database.clone(), background.clone(), window, cx));
         let mav = cx.new(|cx| Mav::new(background, database, window, cx));
         let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
         let setup = cx.new(|cx| Setup::new(connections.clone(), cx));
@@ -104,8 +112,9 @@ impl MainView {
             cx.subscribe_in(&connections, window, |this, _, _: &OpenSetup, window, cx| {
                 this.show(Showing::Setup, window, cx);
             }),
-            // The bar counts what is due.
+            // The bar counts what is due and what waits on a decision.
             cx.observe(&mav, |_, _, cx| cx.notify()),
+            cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe_in(&browser, window, |this, browser, window, cx| {
                 this.show_current_tabs(window, cx);
                 // A job leaves the list once its application went through.
@@ -179,6 +188,7 @@ impl MainView {
             icon_file,
             jobs,
             tabs,
+            board,
             mav,
             connections,
             setup,
@@ -217,6 +227,7 @@ impl MainView {
         match showing {
             Showing::Tabs => self.tabs.update(cx, |tabs, cx| tabs.focus(window, cx)),
             Showing::Jobs => self.jobs.update(cx, |jobs, cx| jobs.focus(window, cx)),
+            Showing::Approvals => self.board.update(cx, |board, cx| board.focus(window, cx)),
             Showing::Mav => self.mav.update(cx, |mav, cx| {
                 mav.load(cx);
                 mav.focus(window, cx);
@@ -327,6 +338,17 @@ impl MainView {
                                 Showing::Jobs,
                                 cx,
                             ))
+                            .child({
+                                let pending = self.board.read(cx).pending(cx);
+                                tab(
+                                    "show-approvals",
+                                    format!("Approvals · {pending}"),
+                                    "approvals",
+                                    Some(pending),
+                                    Showing::Approvals,
+                                    cx,
+                                )
+                            })
                             .child(tab("show-tabs", "Tabs".to_owned(), "tabs", tabs, Showing::Tabs, cx))
                             .child({
                                 let pressing = self.mav.read(cx).pressing();
@@ -386,8 +408,9 @@ impl MainView {
     /// Shows the lists and the status a funnel pass left.
     fn refresh(&mut self, refreshed: Refreshed, window: &mut Window, cx: &mut Context<Self>) {
         self.funnel_status = Some(refreshed.status);
-        if let Some((jobs, cells)) = refreshed.lists {
+        if let Some(Lists { jobs, cells, board }) = refreshed.lists {
             self.band.replace(cells);
+            self.board.update(cx, |shown, cx| shown.replace(board, window, cx));
             self.jobs.update(cx, |list, cx| {
                 list.delegate_mut().replace(jobs);
                 let shown = list.delegate().shown();
@@ -564,7 +587,7 @@ impl MainView {
                 Some(tab) => self.tab_pane(&tab, palette, cx),
                 None => v_flex(),
             },
-            Showing::Mav | Showing::Connections | Showing::Setup => v_flex(),
+            Showing::Approvals | Showing::Mav | Showing::Connections | Showing::Setup => v_flex(),
         }
     }
 
@@ -694,29 +717,7 @@ impl MainView {
                 "fill-report",
                 said(Signal::Failed, "Maverick could not fill this form", reason),
             )],
-            Some(Fill::Idle) | None => vec![scroll(
-                "facts",
-                v_flex()
-                    .gap(px(7.))
-                    .children(
-                        facts
-                            .iter()
-                            .filter(|(_, value)| !value.is_empty())
-                            .map(|(label, value)| {
-                                h_flex()
-                                    .items_start()
-                                    .gap_3()
-                                    .child(ui::caps(label).w(px(72.)).pt(px(1.)).text_color(palette.faint))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_color(palette.muted)
-                                            .child(SharedString::from(value.clone())),
-                                    )
-                            }),
-                    ),
-            )],
+            Some(Fill::Idle) | None => vec![scroll("facts", ui::facts(facts, palette))],
         }
     }
 
@@ -842,7 +843,7 @@ fn keep_a_row_selected<D: gpui_kit::component::list::ListDelegate>(
 }
 
 /// The head of the detail pane: where the row is from, its name, and its score when it has one.
-fn header(tag: &str, title: &str, score: Option<Option<u8>>, palette: &Palette) -> Div {
+pub(crate) fn header(tag: &str, title: &str, score: Option<Option<u8>>, palette: &Palette) -> Div {
     h_flex()
         .flex_none()
         .items_end()
@@ -918,7 +919,9 @@ impl Render for MainView {
             .children(self.notices(&palette, cx))
             // The band tracks jobs, so the Mav view leaves it out.
             .children(matches!(self.showing, Showing::Jobs | Showing::Tabs).then(|| self.band(&palette, cx)))
-            .child(if self.showing == Showing::Mav {
+            .child(if self.showing == Showing::Approvals {
+                div().flex_1().min_h_0().child(self.board.clone()).into_any_element()
+            } else if self.showing == Showing::Mav {
                 div().flex_1().min_h_0().child(self.mav.clone()).into_any_element()
             } else if self.showing == Showing::Connections {
                 div()
@@ -938,11 +941,13 @@ impl Render for MainView {
                             Showing::Tabs => List::new(&self.tabs)
                                 .search_placeholder("search tabs")
                                 .into_any_element(),
-                            Showing::Jobs | Showing::Mav | Showing::Connections | Showing::Setup => {
-                                List::new(&self.jobs)
-                                    .search_placeholder("search jobs")
-                                    .into_any_element()
-                            }
+                            Showing::Jobs
+                            | Showing::Approvals
+                            | Showing::Mav
+                            | Showing::Connections
+                            | Showing::Setup => List::new(&self.jobs)
+                                .search_placeholder("search jobs")
+                                .into_any_element(),
                         }),
                     )
                     .child(ui::pane_divider(
@@ -1091,7 +1096,13 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| MainView::new(browser, jobs, Vec::new(), icon_file, false, window, cx))
+                cx.new(|cx| {
+                    let lists = crate::schedule::Lists {
+                        jobs,
+                        ..Default::default()
+                    };
+                    MainView::new(browser, lists, icon_file, false, window, cx)
+                })
             })
             .expect("the test window opens")
         });
@@ -1236,7 +1247,10 @@ mod tests {
 
         let pass = |status: &str, lists: Option<Vec<Job>>| crate::schedule::Refreshed {
             status: status.into(),
-            lists: lists.map(|jobs| (jobs, Vec::new())),
+            lists: lists.map(|jobs| crate::schedule::Lists {
+                jobs,
+                ..Default::default()
+            }),
         };
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| {
@@ -1400,7 +1414,12 @@ mod tests {
             window.render_frame(cx);
             // With a job to show, the window opens on the jobs list and its detail pane.
             assert_eq!(window.find("show-jobs").label(), Some("Jobs · 1"));
+            assert_eq!(window.find("show-approvals").label(), Some("Approvals · 0"));
             assert_eq!(window.find("act-on-job").label(), Some("Open and fill"));
+            window.click("show-approvals", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("board-pending").label(), Some("Pending · 0"));
+            assert!(window.try_find("act-on-job").is_none());
             window.click("show-tabs", cx);
             window.render_frame(cx);
             assert!(window.try_find(job_row_id(0)).is_none());
