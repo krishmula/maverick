@@ -368,12 +368,15 @@ impl OutreachView {
                 .test_support()
                 .role(gpui_kit::Role::Label)
                 .aria_label(text.clone())
+                .w_full()
+                .min_w_0()
                 .items_start()
                 .gap(px(8.))
                 .child(ui::square(palette.signal(signal)).mt(px(5.)))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .text_size(px(12.))
                         .text_color(palette.signal(signal))
                         .child(SharedString::from(text)),
