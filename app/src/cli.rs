@@ -638,7 +638,8 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
                          | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
-                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html>";
+                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html> \
+                         | dump-tab <out.html> [script]";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
@@ -736,6 +737,31 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 );
             }
             println!("{} posts", posts.len());
+        }
+        // Saves the open LinkedIn profile tab as it is now, dialogs included, or what `script` gives
+        // there. It reads only, so a stuck typing step can be fixed from the real page.
+        ["dump-tab", out, rest @ ..] => {
+            let html = runtime()?.block_on(async {
+                let bridge = chrome().await?;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let tab = match bridge.state() {
+                    maverick_core::bridge::BrowserState::Connected { tabs } => tabs
+                        .into_iter()
+                        .find(|tab| tab.tab.url.contains("linkedin.com/in/") && tab.tab.active),
+                    _ => None,
+                }
+                .ok_or("no active LinkedIn profile tab")?;
+                let page = maverick_core::page::Page::attach(bridge, &tab).await.map_err(|e| e.to_string())?;
+                let script = r#"(() => { const out = [document.documentElement.outerHTML];
+                    for (const el of document.querySelectorAll('*')) if (el.shadowRoot) out.push('<!--SHADOW ' + el.tagName + '-->' + el.shadowRoot.innerHTML);
+                    for (const f of document.querySelectorAll('iframe')) { try { out.push('<!--IFRAME-->' + f.contentDocument.documentElement.outerHTML); } catch (e) { out.push('<!--IFRAME blocked ' + f.src + '-->'); } }
+                    return out.join('\n'); })()"#;
+                let script = rest.first().copied().unwrap_or(script);
+                let html = page.evaluate(script).await.map_err(|e| e.to_string());
+                let _ = page.detach().await;
+                html.map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            })?;
+            fs::write(out, html)?;
         }
         ["drafts"] => {
             for draft in open_store()?.drafts()? {

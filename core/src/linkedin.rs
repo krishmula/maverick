@@ -782,25 +782,31 @@ impl Control {
             ),
             Control::AddNote => (
                 "Add a note button",
-                r#"[...document.querySelectorAll("[role='dialog'] button")]
-                    .find((button) => (button.getAttribute("aria-label") || button.innerText).trim() === "Add a note") || null"#
-                    .to_owned(),
+                format!(
+                    r#"[...document.querySelectorAll("{OPEN_DIALOG}")]
+                        .flatMap((dialog) => [...dialog.querySelectorAll("button, a, [role='button']")])
+                        .find((control) => control.getClientRects().length
+                            && (control.getAttribute("aria-label") || control.innerText).trim() === "Add a note") || null"#
+                ),
             ),
         };
         Locator::script(name, script)
     }
 }
 
-const NOTE_FIELD: &str = "document.querySelector(\"[role='dialog'] textarea[name='message'], textarea#custom-message, \
-                          [role='dialog'] textarea\")";
+/// LinkedIn's dialogs are native `<dialog open>` elements now; older pages used `role="dialog"`.
+/// Hidden video-player dialogs carry `aria-hidden`, so they never count.
+const OPEN_DIALOG: &str = "dialog[open], [role='dialog']:not([aria-hidden='true'])";
+const NOTE_FIELD: &str = "document.querySelector(\"dialog[open] textarea, [role='dialog'] textarea[name='message'], \
+                          textarea#custom-message, dialog[open] [contenteditable='true']\")";
 /// The message box, and never a comment box on the profile's posts.
 const MESSAGE_FIELD: &str = r#"[...document.querySelectorAll("[contenteditable='true']")]
     .filter((box) => box.closest(".msg-form")
         || /message/i.test(box.getAttribute("aria-label") || box.getAttribute("aria-placeholder") || ""))
     .pop() || null"#;
 /// LinkedIn asks for the person's email before some connection requests. Maverick never invents one.
-const EMAIL_WALL: &str =
-    "document.querySelector(\"[role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
+const EMAIL_WALL: &str = "document.querySelector(\"dialog[open] input[type='email'], dialog[open] input[name='email'], \
+     [role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
 
 const STEP_WAIT: Duration = Duration::from_secs(10);
 
