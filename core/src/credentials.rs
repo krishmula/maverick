@@ -328,10 +328,17 @@ mod tests {
     /// deleted when the test ends, however it ends.
     struct TestItem(String);
 
+    /// A service name no other test or run uses. The clock alone repeats, since it moves in microseconds.
+    fn unused_service() -> String {
+        static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
+        format!("dev.maverick.test-{}-{nanos}-{number}", std::process::id())
+    }
+
     impl TestItem {
         fn store(account: &str, password: &str) -> Self {
-            let nanos = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
-            let item = Self(format!("dev.maverick.test-{}-{nanos}", std::process::id()));
+            let item = Self(unused_service());
             let added = Process::new(SECURITY)
                 .args(["add-generic-password", "-s", &item.0, "-a", account, "-w", password])
                 .status()
@@ -354,8 +361,7 @@ mod tests {
     /// Stores, reads, replaces and deletes made-up items in the real login Keychain.
     #[tokio::test]
     async fn a_service_holds_one_secret_per_account() {
-        let nanos = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
-        let service = format!("dev.maverick.test-{}-{nanos}", std::process::id());
+        let service = unused_service();
         let made_up = |text: &str| Password::new(text);
         store(&service, "ada@example.com", &made_up("1//first-token_A"))
             .await
