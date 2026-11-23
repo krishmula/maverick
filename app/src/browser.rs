@@ -194,6 +194,16 @@ impl Browser {
         self.database.clone()
     }
 
+    /// The link to Chrome, for work that drives a tab itself.
+    pub fn bridge(&self) -> Arc<Bridge> {
+        self.bridge.clone()
+    }
+
+    /// The user's standard answers file.
+    pub fn answers_file(&self) -> Option<PathBuf> {
+        self.answers_file.clone()
+    }
+
     /// The tokio runtime that runs work off the main thread.
     pub fn background(&self) -> Handle {
         self.background.clone()

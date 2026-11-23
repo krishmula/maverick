@@ -24,6 +24,7 @@ use crate::connections::OpenSetup;
 use crate::icon::AppIcon;
 use crate::jobs::{Job, JobList, system_name};
 use crate::mav::Mav;
+use crate::outreach::OutreachView;
 use crate::report;
 use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Lists, Refreshed};
 use crate::setup::{Finished, Setup};
@@ -48,6 +49,8 @@ enum Showing {
     Approvals,
     /// What is due in TickTick.
     Mav,
+    /// Who to reach out to, and the LinkedIn drafts waiting for the user.
+    Outreach,
     /// The Google profiles, TickTick, the model and Chrome.
     Connections,
     /// The first-run guide.
@@ -63,6 +66,7 @@ pub struct MainView {
     tabs: Entity<ListState<TabList>>,
     board: Entity<Board>,
     mav: Entity<Mav>,
+    outreach: Entity<OutreachView>,
     connections: Entity<Connections>,
     setup: Entity<Setup>,
     /// How many of the applications sent in this run Mav has offered a follow-up for.
@@ -103,6 +107,8 @@ impl MainView {
         let board = cx.new(|cx| Board::new(browser.clone(), board, database.clone(), window, cx));
         let mav = cx.new(|cx| Mav::new(background, database, window, cx));
         let connections = cx.new(|cx| Connections::new(browser.clone(), window, cx));
+        let answers = browser.read(cx).answers_file();
+        let outreach = cx.new(|cx| OutreachView::new(browser.clone(), answers, window, cx));
         let setup = cx.new(|cx| Setup::new(connections.clone(), cx));
         let _subscriptions = vec![
             cx.subscribe_in(&setup, window, |this, _, _: &Finished, window, cx| {
@@ -114,6 +120,7 @@ impl MainView {
             // The bar counts what is due and what waits on a decision.
             cx.observe(&mav, |_, _, cx| cx.notify()),
             cx.observe(&board, |_, _, cx| cx.notify()),
+            cx.observe(&outreach, |_, _, cx| cx.notify()),
             cx.observe_in(&browser, window, |this, browser, window, cx| {
                 this.show_current_tabs(window, cx);
                 // A job leaves the list once its application went through.
@@ -189,6 +196,7 @@ impl MainView {
             tabs,
             board,
             mav,
+            outreach,
             connections,
             setup,
             followed_up: 0,
@@ -230,6 +238,10 @@ impl MainView {
             Showing::Mav => self.mav.update(cx, |mav, cx| {
                 mav.load(cx);
                 mav.focus(window, cx);
+            }),
+            Showing::Outreach => self.outreach.update(cx, |outreach, cx| {
+                outreach.reload();
+                cx.notify();
             }),
             Showing::Connections => self.connections.update(cx, |connections, cx| {
                 connections.show_only(None, cx);
@@ -353,6 +365,13 @@ impl MainView {
                                 let pressing = self.mav.read(cx).pressing();
                                 let name = pressing.map_or("Mav".to_owned(), |due| format!("Mav · {due}"));
                                 tab("show-mav", name, "mav", pressing, Showing::Mav, cx)
+                            })
+                            .child({
+                                let waiting = self.outreach.read(cx).waiting();
+                                let count = (waiting > 0).then_some(waiting);
+                                let name =
+                                    count.map_or("Outreach".to_owned(), |waiting| format!("Outreach · {waiting}"));
+                                tab("show-outreach", name, "outreach", count, Showing::Outreach, cx)
                             }),
                     ),
             )
@@ -402,6 +421,12 @@ impl MainView {
                 cx.background_executor().timer(BETWEEN_PASSES).await;
             }
         }));
+    }
+
+    /// Starts the hourly outreach checks and the two-hourly hiring-post sweep.
+    pub fn run_outreach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.outreach
+            .update(cx, |outreach, cx| outreach.start_schedule(window, cx));
     }
 
     /// Shows the lists and the status a funnel pass left.
@@ -586,7 +611,7 @@ impl MainView {
                 Some(tab) => self.tab_pane(&tab, palette, cx),
                 None => v_flex(),
             },
-            Showing::Approvals | Showing::Mav | Showing::Connections | Showing::Setup => v_flex(),
+            Showing::Approvals | Showing::Mav | Showing::Outreach | Showing::Connections | Showing::Setup => v_flex(),
         }
     }
 
@@ -915,6 +940,8 @@ impl Render for MainView {
                 div().flex_1().min_h_0().child(self.board.clone()).into_any_element()
             } else if self.showing == Showing::Mav {
                 div().flex_1().min_h_0().child(self.mav.clone()).into_any_element()
+            } else if self.showing == Showing::Outreach {
+                div().flex_1().min_h_0().child(self.outreach.clone()).into_any_element()
             } else if self.showing == Showing::Connections {
                 div()
                     .flex_1()
@@ -942,6 +969,7 @@ impl Render for MainView {
                                 Showing::Jobs
                                 | Showing::Approvals
                                 | Showing::Mav
+                                | Showing::Outreach
                                 | Showing::Connections
                                 | Showing::Setup => List::new(&self.jobs)
                                     .search_placeholder("search jobs")

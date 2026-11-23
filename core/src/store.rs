@@ -86,6 +86,62 @@ const MIGRATIONS: &[&str] = &[
         decided_at TEXT NOT NULL
     ) STRICT;
 ",
+    "
+    CREATE TABLE hiring_posts_typed (
+        id INTEGER PRIMARY KEY,
+        post_link TEXT NOT NULL,
+        role TEXT NOT NULL,
+        found_at TEXT NOT NULL,
+        poster TEXT NOT NULL,
+        company TEXT NOT NULL,
+        score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
+        variant TEXT NOT NULL,
+        outreach TEXT NOT NULL
+            CHECK (outreach IN ('not_started', 'skipped', 'drafted', 'typed', 'sent', 'replied')),
+        notes TEXT,
+        UNIQUE (post_link, role)
+    ) STRICT;
+    INSERT INTO hiring_posts_typed SELECT * FROM hiring_posts;
+    DROP TABLE hiring_posts;
+    ALTER TABLE hiring_posts_typed RENAME TO hiring_posts;
+
+    CREATE TABLE linkedin_connections (
+        id INTEGER PRIMARY KEY,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        profile_url TEXT,
+        email TEXT,
+        company TEXT NOT NULL,
+        position TEXT NOT NULL,
+        connected_on TEXT
+    ) STRICT;
+
+    CREATE TABLE outreach_checks (
+        posting_link TEXT PRIMARY KEY,
+        verdict TEXT NOT NULL
+            CHECK (verdict IN ('connection', 'team_member', 'hiring_manager', 'deferred', 'cold')),
+        team TEXT,
+        people TEXT NOT NULL,
+        note TEXT,
+        checked_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE outreach_drafts (
+        id INTEGER PRIMARY KEY,
+        about_kind TEXT NOT NULL CHECK (about_kind IN ('posting', 'post')),
+        about TEXT NOT NULL,
+        person TEXT NOT NULL,
+        headline TEXT NOT NULL,
+        profile_url TEXT NOT NULL,
+        slot TEXT NOT NULL CHECK (slot IN ('note', 'message')),
+        text TEXT NOT NULL,
+        status TEXT NOT NULL
+            CHECK (status IN ('not_started', 'skipped', 'drafted', 'typed', 'sent', 'replied')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (about, profile_url)
+    ) STRICT;
+",
 ];
 
 pub struct Store {
@@ -391,7 +447,7 @@ impl Store {
 }
 
 /// Reads a text column that this file wrote, such as a state name or a time.
-fn stored<T>(row: &Row<'_>, column: usize, parse: impl Fn(&str) -> Option<T>) -> Result<T, StoreError> {
+pub(crate) fn stored<T>(row: &Row<'_>, column: usize, parse: impl Fn(&str) -> Option<T>) -> Result<T, StoreError> {
     let text: String = row.get(column)?;
     parse(&text).ok_or_else(|| {
         StoreError::FromSqlConversionFailure(
@@ -400,4 +456,53 @@ fn stored<T>(row: &Row<'_>, column: usize, parse: impl Fn(&str) -> Option<T>) ->
             format!("{text:?} is not a value this version of Maverick wrote").into(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fifth_migration_keeps_the_hiring_posts_and_lets_them_be_typed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("maverick.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..3] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", 3).unwrap();
+            db.execute(
+                "INSERT INTO hiring_posts (post_link, role, found_at, poster, company, score, variant, outreach, notes)
+                 VALUES ('https://example.test/post/1', 'Backend Engineer', '2026-11-20T17:00:00Z', 'Sam Poster',
+                     'Example Co', 81, 'Backend/Infra', 'replied', 'a note')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: u32 = store
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as u32);
+        let kept: (String, String, Option<String>) = store
+            .db
+            .query_row("SELECT post_link, outreach, notes FROM hiring_posts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            kept,
+            (
+                "https://example.test/post/1".to_owned(),
+                "replied".to_owned(),
+                Some("a note".to_owned())
+            )
+        );
+        store
+            .db
+            .execute("UPDATE hiring_posts SET outreach = 'typed'", [])
+            .unwrap();
+    }
 }
