@@ -456,6 +456,7 @@ fn a_repeated_import_changes_nothing_and_an_edited_row_updates_in_place() {
                 (Outreach::NotStarted, 1),
                 (Outreach::Skipped, 0),
                 (Outreach::Drafted, 0),
+                (Outreach::Typed, 0),
                 (Outreach::Sent, 0),
                 (Outreach::Replied, 1),
             ],
@@ -487,6 +488,7 @@ fn a_repeated_import_changes_nothing_and_an_edited_row_updates_in_place() {
             (Outreach::NotStarted, 0),
             (Outreach::Skipped, 0),
             (Outreach::Drafted, 1),
+            (Outreach::Typed, 0),
             (Outreach::Sent, 0),
             (Outreach::Replied, 1)
         ]

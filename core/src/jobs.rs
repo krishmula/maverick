@@ -32,6 +32,8 @@ macro_rules! stored_enum {
     };
 }
 
+pub(crate) use stored_enum;
+
 stored_enum! {
     /// Where a posting is in the funnel.
     Stage {
@@ -60,11 +62,13 @@ stored_enum! {
 }
 
 stored_enum! {
-    /// How far outreach to the author of a hiring post has gone.
+    /// How far outreach to one person has gone. `Typed` means the draft sits typed in LinkedIn
+    /// in the user's Chrome, waiting for the user to click Send.
     Outreach {
         NotStarted => "not_started",
         Skipped => "skipped",
         Drafted => "drafted",
+        Typed => "typed",
         Sent => "sent",
         Replied => "replied",
     }
