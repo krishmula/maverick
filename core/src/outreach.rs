@@ -520,16 +520,14 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
         .collect();
     // A title word fits a sought word when it is that word or, for words over three letters, starts
     // with it, so "recruit" fits "recruiting" and "swe" does not fit "Sweden".
+    // Only the headline's first part says the job; later parts list degrees and skills.
     let has = |person: &Person, sought: &[&str]| {
-        person
-            .title
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|word| {
-                sought
-                    .iter()
-                    .any(|sought| word == *sought || (sought.len() > 3 && word.starts_with(sought)))
-            })
+        let job = person.title.split('|').next().unwrap_or_default();
+        job.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|word| {
+            sought
+                .iter()
+                .any(|sought| word == *sought || (sought.len() > 3 && word.starts_with(sought)))
+        })
     };
     let team: Vec<&str> = team.iter().map(String::as_str).collect();
     let rank = |person: &Person| match (has(person, ENGINEERS), has(person, &team)) {
@@ -713,15 +711,17 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
                     *left -= 1;
                     let query = people_query(&named);
                     let key = company_key(&posting.company);
-                    let slug = match pages.get(&key) {
-                        Some(slug) => slug.clone(),
-                        None => found_page(&posting)
-                            .await
-                            .unwrap_or_else(|| company_slug(&posting.company)),
+                    // Only a slug some page links is kept: a guess can land on another company of the same name.
+                    let (slug, linked) = match pages.get(&key) {
+                        Some(slug) => (slug.clone(), false),
+                        None => match found_page(&posting).await {
+                            Some(slug) => (slug, true),
+                            None => (company_slug(&posting.company), false),
+                        },
                     };
                     match look_up(&mut reader, bridge, &posting.company, &slug).await {
                         Ok(Lookup::Found(people)) => {
-                            if pages.get(&key) != Some(&slug) {
+                            if linked {
                                 Store::open(database)
                                     .and_then(|store| {
                                         store.save_company_page(&posting.company, &slug, Timestamp::now())
@@ -771,19 +771,25 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
     Ok(run)
 }
 
-/// Finds the company's LinkedIn page in the posting's page, or else in the company website that
-/// page names, without loading LinkedIn. `None` when neither links one.
+/// Finds the company's LinkedIn page without loading LinkedIn: in the page that listed the posting
+/// (Simplify names the company's page), in the posting's own page, or in the company website a
+/// posting page names. `None` when none links one.
 async fn found_page(posting: &Posting) -> Option<String> {
-    let address = posting
-        .address
-        .clone()
-        .unwrap_or_else(|| posting_address(&posting.link));
-    let (_, page) = description::get(&address).await.ok()?;
-    if let Some(slug) = linkedin::company_pages_in(&page).into_iter().next() {
-        return Some(slug);
+    let mut pages = vec![posting_address(&posting.link)];
+    if let Some(address) = posting.address.clone().filter(|address| !pages.contains(address)) {
+        pages.push(address);
     }
-    let website = linkedin::company_website_in(&page)?;
-    let (_, site) = description::get(&website).await.ok()?;
+    let mut website = None;
+    for address in pages {
+        let Ok((_, page)) = description::get(&address).await else {
+            continue;
+        };
+        if let Some(slug) = linkedin::company_pages_in(&page).into_iter().next() {
+            return Some(slug);
+        }
+        website = website.or_else(|| linkedin::company_website_in(&page));
+    }
+    let (_, site) = description::get(&website?).await.ok()?;
     linkedin::company_pages_in(&site).into_iter().next()
 }
 
@@ -1418,6 +1424,7 @@ mod tests {
         // A weak team word picks no one by itself, and "swe" is not "Sweden".
         let others = [
             person("Ed", "Senior Analyst, Enterprise Cybersecurity"),
+            person("Ha", "Supply Chain Analyst at Example Co | MS Systems Engineering"),
             person("Fa", "Sales Lead, Sweden"),
             person("Di", "Recruiting Partner"),
             person("Gi", "SWE II"),
@@ -1427,7 +1434,7 @@ mod tests {
             ..Named::default()
         };
         assert_eq!(names("Enterprise AI", &enterprise, &others), ["Gi", "Di"]);
-        assert!(names("Enterprise AI", &enterprise, &others[..2]).is_empty());
+        assert!(names("Enterprise AI", &enterprise, &others[..3]).is_empty());
         let manager = Named {
             people: vec![NamedPerson {
                 name: "di".into(),
