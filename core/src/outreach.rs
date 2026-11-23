@@ -19,8 +19,8 @@ use crate::bridge::Bridge;
 use crate::description::{self, Fetched};
 use crate::jobs::{HiringPost, Outreach, Posting, Stage, posting_address, stored_enum};
 use crate::linkedin::{
-    self, Connection, NOTE_LIMIT, Person, Post, PosterCheck, Reader, Slot, Stop, company_key, company_slug,
-    people_address, people_page, post_search_address, posts_page, same_company,
+    self, Connection, INMAIL_BODY_LIMIT, INMAIL_SUBJECT_LIMIT, NOTE_LIMIT, Person, Post, PosterCheck, Reader, Slot,
+    Stop, company_key, company_slug, people_address, people_page, post_search_address, posts_page, same_company,
 };
 use crate::providers::{self, Job};
 use crate::score::{self, APPLY_READY, Decision, Profile, Reading};
@@ -140,6 +140,9 @@ pub struct Draft {
     pub headline: String,
     pub profile_url: String,
     pub slot: Slot,
+    /// The InMail subject; `None` for a note or a message.
+    pub subject: Option<String>,
+    /// The note, the message, or the InMail body.
     pub text: String,
     pub status: Outreach,
     pub created_at: Timestamp,
@@ -300,8 +303,8 @@ impl Store {
     pub fn add_draft(&self, draft: &Draft) -> Result<Option<i64>, StoreError> {
         let added = self.db.execute(
             "INSERT INTO outreach_drafts
-                 (about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 (about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at, subject)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (about, profile_url) DO NOTHING",
             params![
                 draft.about.kind(),
@@ -314,6 +317,7 @@ impl Store {
                 draft.status.as_str(),
                 draft.created_at.to_string(),
                 draft.updated_at.to_string(),
+                draft.subject,
             ],
         )?;
         Ok((added == 1).then(|| self.db.last_insert_rowid()))
@@ -322,7 +326,8 @@ impl Store {
     /// Every draft, newest first.
     pub fn drafts(&self) -> Result<Vec<Draft>, StoreError> {
         let mut select = self.db.prepare(
-            "SELECT id, about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at
+            "SELECT id, about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at,
+                 subject
              FROM outreach_drafts ORDER BY created_at DESC, id DESC",
         )?;
         select
@@ -339,6 +344,7 @@ impl Store {
                     headline: row.get(4)?,
                     profile_url: row.get(5)?,
                     slot: stored(row, 6, Slot::parse)?,
+                    subject: row.get(11)?,
                     text: row.get(7)?,
                     status: stored(row, 8, Outreach::parse)?,
                     created_at: stored(row, 9, |text| text.parse().ok())?,
@@ -373,6 +379,15 @@ impl Store {
             )?;
         }
         write.commit()
+    }
+
+    /// Puts a draft in another form, such as a note rewritten as an InMail.
+    pub fn set_draft_form(&self, id: i64, slot: Slot, written: &Written, at: Timestamp) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE outreach_drafts SET slot = ?2, subject = ?3, text = ?4, updated_at = ?5 WHERE id = ?1",
+            params![id, slot.as_str(), written.subject, written.text, at.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Replaces a draft's text with the user's edit.
@@ -926,12 +941,45 @@ pub fn check_draft(text: &str, slot: Slot) -> Result<String, String> {
         return Err("the draft has a placeholder in brackets, so a fact is missing".into());
     }
     let length = text.chars().count();
-    if slot == Slot::Note && length > NOTE_LIMIT {
-        return Err(format!(
+    match slot {
+        Slot::Note if length > NOTE_LIMIT => Err(format!(
             "the note has {length} characters; a connection note takes at most {NOTE_LIMIT}"
+        )),
+        Slot::InMail if length > INMAIL_BODY_LIMIT => Err(format!(
+            "the InMail has {length} characters; LinkedIn takes at most {INMAIL_BODY_LIMIT}"
+        )),
+        _ => Ok(text),
+    }
+}
+
+/// Makes an InMail subject safe to type: one line, no machine dashes, within the limit.
+pub fn check_subject(subject: &str) -> Result<String, String> {
+    let subject = check_draft(subject, Slot::Message)?.replace('\n', " ");
+    let length = subject.chars().count();
+    if length > INMAIL_SUBJECT_LIMIT {
+        return Err(format!(
+            "the subject has {length} characters; keep it to {INMAIL_SUBJECT_LIMIT}"
         ));
     }
-    Ok(text)
+    Ok(subject)
+}
+
+/// What the model wrote: the text, and a subject for an InMail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Written {
+    pub subject: Option<String>,
+    pub text: String,
+}
+
+/// Checks a whole draft for its slot. An InMail needs a subject; nothing else has one.
+pub fn check_written(subject: Option<&str>, text: &str, slot: Slot) -> Result<Written, String> {
+    let text = check_draft(text, slot)?;
+    let subject = match (slot, subject.map(str::trim).filter(|subject| !subject.is_empty())) {
+        (Slot::InMail, Some(subject)) => Some(check_subject(subject)?),
+        (Slot::InMail, None) => return Err("the InMail has no subject".into()),
+        _ => None,
+    };
+    Ok(Written { subject, text })
 }
 
 const DRAFT_INSTRUCTIONS: &str = "You draft one short LinkedIn message from the applicant to one person, \
@@ -942,17 +990,19 @@ the same titles, employers, dates and projects, with nothing inflated. \
 Never invent experience, skills, dates, numbers, links or email addresses, \
 and never describe work the resume does not list as built work. \
 Never use em dashes or en dashes; use commas, hyphens or separate sentences. \
-No placeholders, no bullet lists, no subject line. \
+No placeholders and no bullet lists. Put no subject line in the text: \
+an InMail's subject goes in subject, and anything else has subject null. \
 If the resume and the facts lack something the message needs, text is null and missing says what is missing.";
 
 fn draft_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "subject": { "type": ["string", "null"] },
             "text": { "type": ["string", "null"] },
             "missing": { "type": ["string", "null"] },
         },
-        "required": ["text", "missing"],
+        "required": ["subject", "text", "missing"],
         "additionalProperties": false,
     })
 }
@@ -965,9 +1015,9 @@ pub struct Ask<'a> {
     pub context: String,
 }
 
-/// Asks the model for a draft and checks it. A draft that fails the check is asked for once more.
-pub async fn write_draft(profile: &Profile, ask: &Ask<'_>) -> Result<String, String> {
-    let form = match ask.slot {
+/// What the model is told about the form of a draft in `slot`.
+pub fn form_of(slot: Slot) -> String {
+    match slot {
         Slot::Note => format!(
             "This is a connection request note: at most {} characters, two or three sentences, no attachment.",
             NOTE_LIMIT - 20
@@ -975,7 +1025,17 @@ pub async fn write_draft(profile: &Profile, ask: &Ask<'_>) -> Result<String, Str
         Slot::Message => "This is a direct message to a connection: 50 to 110 words. \
                           It may say the resume is attached."
             .to_owned(),
-    };
+        Slot::InMail => format!(
+            "This is a LinkedIn InMail to someone outside the applicant's network: a subject of at most \
+             {INMAIL_SUBJECT_LIMIT} characters that names the role, and a body of 80 to 150 words. \
+             It may say the resume is attached."
+        ),
+    }
+}
+
+/// Asks the model for a draft and checks it. A draft that fails the check is asked for once more.
+pub async fn write_draft(profile: &Profile, ask: &Ask<'_>) -> Result<Written, String> {
+    let form = form_of(ask.slot);
     let mut request = profile_text(profile);
     let _ = write!(
         request,
@@ -994,8 +1054,8 @@ pub async fn write_draft(profile: &Profile, ask: &Ask<'_>) -> Result<String, Str
             (_, Some(missing)) => return Err(format!("missing to draft: {missing}")),
             _ => return Err("the model wrote no draft".into()),
         };
-        match check_draft(&text, ask.slot) {
-            Ok(text) => return Ok(text),
+        match check_written(reply["subject"].as_str(), &text, ask.slot) {
+            Ok(written) => return Ok(written),
             Err(why) => problem = Some(why),
         }
     }
@@ -1142,7 +1202,7 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
                 ),
             };
             match write_draft(profile, &ask).await {
-                Ok(text) => {
+                Ok(written) => {
                     drafted += 1;
                     run.drafted += 1;
                     kept.outreach = Outreach::Drafted;
@@ -1158,7 +1218,8 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
                         headline: post.headline.clone(),
                         profile_url: post.poster_url.clone().expect("posts without an author were left out"),
                         slot,
-                        text,
+                        subject: written.subject,
+                        text: written.text,
                         status: Outreach::Drafted,
                         created_at: now,
                         updated_at: now,
@@ -1234,7 +1295,7 @@ pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &
             posting.title, posting.company, person.name, person.title
         ),
     };
-    let text = write_draft(profile, &ask).await?;
+    let written = write_draft(profile, &ask).await?;
     let now = Timestamp::now();
     let mut draft = Draft {
         id: 0,
@@ -1243,7 +1304,8 @@ pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &
         headline: person.title.clone(),
         profile_url: person.profile_url.clone().expect("the person was picked for a profile"),
         slot,
-        text,
+        subject: written.subject,
+        text: written.text,
         status: Outreach::Drafted,
         created_at: now,
         updated_at: now,
@@ -1256,6 +1318,67 @@ pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &
     Ok(draft)
 }
 
+/// Rewrites a waiting draft to someone outside the network in the other form: a note becomes an
+/// InMail and back. The model keeps to the earlier draft's facts and the resume.
+pub async fn redraft(database: &Path, profile: &Profile, id: i64) -> Result<Draft, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let store = Store::open(database).map_err(said)?;
+    let mut draft = store
+        .draft(id)
+        .map_err(said)?
+        .ok_or("the draft is no longer in the database")?;
+    if draft.status != Outreach::Drafted {
+        return Err("only a draft still waiting for approval can change its form".into());
+    }
+    let slot = draft
+        .slot
+        .switched()
+        .ok_or("a message to a connection has no other form")?;
+    let about = match &draft.about {
+        About::Posting(link) => store
+            .postings()
+            .map_err(said)?
+            .into_iter()
+            .find(|posting| &posting.link == link)
+            .map(|posting| format!("the {} role at {}", posting.title, posting.company)),
+        About::Post(link) => store
+            .hiring_posts()
+            .map_err(said)?
+            .into_iter()
+            .find(|post| &post.post_link == link)
+            .map(|post| {
+                format!(
+                    "the {} role at {}, which {} posted about",
+                    post.role, post.company, draft.person
+                )
+            }),
+    }
+    .ok_or("what the draft is about is no longer in the database")?;
+    let ask = Ask {
+        slot,
+        person: &draft.person,
+        headline: &draft.headline,
+        context: redraft_context(&about, &draft),
+    };
+    let written = write_draft(profile, &ask).await?;
+    let now = Timestamp::now();
+    store.set_draft_form(id, slot, &written, now).map_err(said)?;
+    draft.slot = slot;
+    draft.subject = written.subject;
+    draft.text = written.text;
+    draft.updated_at = now;
+    Ok(draft)
+}
+
+/// What the model reads when it rewrites `draft` in another form.
+pub fn redraft_context(about: &str, draft: &Draft) -> String {
+    format!(
+        "The applicant is reaching out about {about}. An earlier draft in another form said:\n{}\n\
+         Keep to its facts and add none the resume and the facts do not hold.",
+        draft.text
+    )
+}
+
 /// Types an approved draft into LinkedIn in the user's Chrome and marks it typed. The user clicks Send.
 pub async fn type_approved(database: &Path, bridge: Arc<Bridge>, id: i64) -> Result<(), String> {
     let said = |error: StoreError| format!("the database failed: {error}");
@@ -1263,8 +1386,15 @@ pub async fn type_approved(database: &Path, bridge: Arc<Bridge>, id: i64) -> Res
         .and_then(|store| store.draft(id))
         .map_err(said)?
         .ok_or("the draft is no longer in the database")?;
-    let text = check_draft(&draft.text, draft.slot)?;
-    linkedin::type_draft(bridge, &draft.profile_url, draft.slot, &text).await?;
+    let written = check_written(draft.subject.as_deref(), &draft.text, draft.slot)?;
+    linkedin::type_draft(
+        bridge,
+        &draft.profile_url,
+        draft.slot,
+        written.subject.as_deref(),
+        &written.text,
+    )
+    .await?;
     Store::open(database)
         .and_then(|mut store| store.set_draft_status(id, Outreach::Typed, Timestamp::now()))
         .map_err(said)
@@ -1535,6 +1665,7 @@ mod tests {
             headline: String::new(),
             profile_url: "https://www.linkedin.com/in/sam/".into(),
             slot: Slot::Note,
+            subject: None,
             text: "Hi".into(),
             status: Outreach::Drafted,
             created_at: at.parse().unwrap(),
@@ -1628,6 +1759,7 @@ mod tests {
             headline: "Engineering Manager at Example Co".into(),
             profile_url: "https://www.linkedin.com/in/sam-poster/".into(),
             slot: Slot::Note,
+            subject: None,
             text: "Hi Sam, I saw your post.".into(),
             status: Outreach::Drafted,
             created_at: at,
@@ -1641,5 +1773,70 @@ mod tests {
         assert_eq!(saved.text, "Hi Sam, thanks for posting.");
         assert_eq!(saved.status, Outreach::Typed);
         assert_eq!(store.hiring_posts().unwrap()[0].outreach, Outreach::Typed);
+
+        let inmail = Written {
+            subject: Some("The backend role on Storage".into()),
+            text: "Hi Sam, I am applying to the backend role.".into(),
+        };
+        store.set_draft_form(id, Slot::InMail, &inmail, at).unwrap();
+        let saved = store.draft(id).unwrap().unwrap();
+        assert_eq!(saved.slot, Slot::InMail);
+        assert_eq!(saved.subject.as_deref(), Some("The backend role on Storage"));
+        assert_eq!(saved.text, inmail.text);
+    }
+
+    #[test]
+    fn an_inmail_needs_a_short_subject_and_a_body_linkedin_takes() {
+        let body = "word ".repeat(120);
+        let written = check_written(Some("  Backend role \u{2014} Storage "), &body, Slot::InMail).unwrap();
+        assert_eq!(written.subject.as_deref(), Some("Backend role - Storage"));
+        assert_eq!(written.text, body.trim());
+        // A body over the note limit is fine in an InMail, but not past LinkedIn's own limit.
+        assert!(check_draft(&"a".repeat(INMAIL_BODY_LIMIT), Slot::InMail).is_ok());
+        assert!(
+            check_draft(&"a".repeat(INMAIL_BODY_LIMIT + 1), Slot::InMail)
+                .unwrap_err()
+                .contains("at most 1900")
+        );
+        assert!(
+            check_written(None, "Hi Sam.", Slot::InMail)
+                .unwrap_err()
+                .contains("no subject")
+        );
+        assert!(check_written(Some("  "), "Hi Sam.", Slot::InMail).is_err());
+        let long = "s".repeat(INMAIL_SUBJECT_LIMIT + 1);
+        assert!(
+            check_written(Some(&long), "Hi Sam.", Slot::InMail)
+                .unwrap_err()
+                .contains("subject")
+        );
+        assert!(check_written(Some("[Role] at Example Co"), "Hi Sam.", Slot::InMail).is_err());
+        // Only an InMail keeps a subject.
+        assert_eq!(check_written(Some("Hi"), "Hi Sam.", Slot::Note).unwrap().subject, None);
+    }
+
+    #[test]
+    fn a_redraft_asks_for_the_other_form_and_keeps_the_earlier_facts() {
+        assert!(form_of(Slot::InMail).contains("subject of at most 200 characters"));
+        assert!(form_of(Slot::InMail).contains("80 to 150 words"));
+        assert!(form_of(Slot::Note).contains("at most 280 characters"));
+        let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
+        let draft = Draft {
+            id: 1,
+            about: About::Posting("https://example.test/p/1".into()),
+            person: "Bo Sample".into(),
+            headline: "Engineer".into(),
+            profile_url: "https://www.linkedin.com/in/bo-sample/".into(),
+            slot: Slot::Note,
+            subject: None,
+            text: "Hi Bo, I applied to the backend role.".into(),
+            status: Outreach::Drafted,
+            created_at: at,
+            updated_at: at,
+        };
+        let context = redraft_context("the Backend Engineer role at Example Co", &draft);
+        assert!(context.contains("Backend Engineer role at Example Co"));
+        assert!(context.contains("Hi Bo, I applied to the backend role."));
+        assert_eq!(draft.slot.switched(), Some(Slot::InMail));
     }
 }

@@ -78,6 +78,15 @@ pub struct DraftRow {
 }
 
 /// Reads the checks and drafts from the store, with the postings and posts they are about.
+/// The slot a draft is in, as its card labels it.
+pub fn slot_label(draft: &Draft) -> String {
+    match draft.slot {
+        Slot::Note => format!("connection note · {} chars", draft.text.chars().count()),
+        Slot::Message => "message".to_owned(),
+        Slot::InMail => format!("inmail · subject: {}", draft.subject.as_deref().unwrap_or("none")),
+    }
+}
+
 pub fn rows(store: &Store) -> (Vec<CheckRow>, Vec<DraftRow>) {
     let postings: Vec<Posting> = store.postings().unwrap_or_default();
     let posts: Vec<HiringPost> = store.hiring_posts().unwrap_or_default();
@@ -328,6 +337,36 @@ impl OutreachView {
         );
     }
 
+    /// Rewrites a waiting draft as an InMail, or an InMail back as a connection note.
+    fn switch_form(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(database) = self.database_or_fail(cx) else {
+            return;
+        };
+        let profile = match self.profile() {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.said = Some((Signal::Failed, error));
+                cx.notify();
+                return;
+            }
+        };
+        self.run(
+            "rewriting the draft",
+            async move {
+                let draft = outreach::redraft(&database, &profile, id).await?;
+                Ok(match draft.slot {
+                    Slot::InMail => format!(
+                        "Rewrote the draft to {} as an InMail. Read it before you approve; sending it uses a credit.",
+                        draft.person
+                    ),
+                    _ => format!("Rewrote the draft to {} as a connection note.", draft.person),
+                })
+            },
+            window,
+            cx,
+        );
+    }
+
     /// One outreach run: checks every posting that needs one, then, when `sweep`, the hiring posts.
     fn run_now(&mut self, sweep: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(database) = self.database_or_fail(cx) else {
@@ -567,10 +606,7 @@ impl OutreachView {
             Outreach::Replied => (Signal::Done, "replied"),
             Outreach::Skipped | Outreach::NotStarted => (Signal::Failed, "skipped"),
         };
-        let slot = match draft.slot {
-            Slot::Note => format!("connection note · {} chars", draft.text.chars().count()),
-            Slot::Message => "message".to_owned(),
-        };
+        let slot = slot_label(draft);
         let editing = self.editing == Some(id);
         let body: AnyElement = if editing {
             v_flex()
@@ -599,6 +635,11 @@ impl OutreachView {
                 .text_color(palette.ink)
                 .into_any_element()
         };
+        let credit = (draft.slot == Slot::InMail && draft.status == Outreach::Drafted).then(|| {
+            div().text_size(px(11.)).text_color(palette.muted).child(
+                "Sending an InMail uses one of your InMail credits. Maverick only fills the box; you click Send.",
+            )
+        });
         let mut actions = h_flex().gap(px(8.)).flex_wrap();
         let quiet = |key: &str, name: String, text: &str| {
             ui::button(
@@ -626,7 +667,21 @@ impl OutreachView {
                     .child(
                         quiet("skip", format!("Skip the draft to {}", draft.person), "skip")
                             .on_click(cx.listener(move |this, _, _, cx| this.set_status(id, Outreach::Skipped, cx))),
-                    );
+                    )
+                    .children(draft.slot.switched().filter(|_| !busy).map(|other| {
+                        let (name, text) = match other {
+                            Slot::InMail => (
+                                format!("Rewrite the draft to {} as an InMail", draft.person),
+                                "use InMail",
+                            ),
+                            _ => (
+                                format!("Rewrite the draft to {} as a connection note", draft.person),
+                                "use note",
+                            ),
+                        };
+                        quiet("switch", name, text)
+                            .on_click(cx.listener(move |this, _, window, cx| this.switch_form(id, window, cx)))
+                    }));
             }
             Outreach::Typed => {
                 actions = actions
@@ -702,6 +757,7 @@ impl OutreachView {
                     .child(ui::score(row.score, 22.).text_color(palette.muted)),
             )
             .child(body)
+            .children(credit)
             .child(actions)
     }
 }
@@ -784,6 +840,7 @@ mod tests {
                 headline: "Storage Engineer".into(),
                 profile_url: "https://www.linkedin.com/in/bo-sample/".into(),
                 slot: Slot::Note,
+                subject: None,
                 text: "Hi Bo, I applied to the backend role on Storage.".into(),
                 status: Outreach::Drafted,
                 created_at: at,
@@ -791,6 +848,28 @@ mod tests {
             })
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn each_draft_card_names_its_slot_and_an_inmail_its_subject() {
+        let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
+        let mut draft = Draft {
+            id: 1,
+            about: About::Posting("https://simplify.jobs/p/1".into()),
+            person: "Bo Sample".into(),
+            headline: "Storage Engineer".into(),
+            profile_url: "https://www.linkedin.com/in/bo-sample/".into(),
+            slot: Slot::Note,
+            subject: None,
+            text: "Hi Bo.".into(),
+            status: Outreach::Drafted,
+            created_at: at,
+            updated_at: at,
+        };
+        assert_eq!(slot_label(&draft), "connection note · 6 chars");
+        draft.slot = Slot::InMail;
+        draft.subject = Some("The backend role on Storage".into());
+        assert_eq!(slot_label(&draft), "inmail · subject: The backend role on Storage");
     }
 
     #[gpui_kit::test]

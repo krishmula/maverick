@@ -149,6 +149,30 @@ const MIGRATIONS: &[&str] = &[
         found_at TEXT NOT NULL
     ) STRICT;
 ",
+    "
+    CREATE TABLE outreach_drafts_inmail (
+        id INTEGER PRIMARY KEY,
+        about_kind TEXT NOT NULL CHECK (about_kind IN ('posting', 'post')),
+        about TEXT NOT NULL,
+        person TEXT NOT NULL,
+        headline TEXT NOT NULL,
+        profile_url TEXT NOT NULL,
+        slot TEXT NOT NULL CHECK (slot IN ('note', 'message', 'inmail')),
+        text TEXT NOT NULL,
+        status TEXT NOT NULL
+            CHECK (status IN ('not_started', 'skipped', 'drafted', 'typed', 'sent', 'replied')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        subject TEXT,
+        UNIQUE (about, profile_url)
+    ) STRICT;
+    INSERT INTO outreach_drafts_inmail
+        (id, about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at)
+        SELECT id, about_kind, about, person, headline, profile_url, slot, text, status, created_at, updated_at
+        FROM outreach_drafts;
+    DROP TABLE outreach_drafts;
+    ALTER TABLE outreach_drafts_inmail RENAME TO outreach_drafts;
+",
 ];
 
 pub struct Store {
@@ -511,5 +535,47 @@ mod tests {
             .db
             .execute("UPDATE hiring_posts SET outreach = 'typed'", [])
             .unwrap();
+    }
+
+    #[test]
+    fn drafts_made_before_inmail_survive_and_an_inmail_can_be_stored() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("maverick.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..6] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", 6).unwrap();
+            db.execute(
+                "INSERT INTO outreach_drafts (about_kind, about, person, headline, profile_url, slot, text, status,
+                     created_at, updated_at)
+                 VALUES ('posting', 'https://example.test/p/1', 'Bo Sample', 'Engineer', 'https://www.linkedin.com/in/bo/',
+                     'note', 'Hi Bo.', 'typed', '2026-11-20T17:00:00Z', '2026-11-21T17:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let kept: (i64, String, String, Option<String>) = store
+            .db
+            .query_row("SELECT id, slot, status, subject FROM outreach_drafts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(kept, (1, "note".to_owned(), "typed".to_owned(), None));
+        store
+            .db
+            .execute(
+                "UPDATE outreach_drafts SET slot = 'inmail', subject = 'About the role'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .db
+                .execute("UPDATE outreach_drafts SET slot = 'letter'", [])
+                .is_err()
+        );
     }
 }

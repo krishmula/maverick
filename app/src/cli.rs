@@ -637,7 +637,7 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::outreach;
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
-                         | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
                          | page <LinkedIn address> <out.html> | read <people|posts> <saved.html> \
                          | dump-tab <out.html> [script]";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
@@ -774,8 +774,22 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     draft.profile_url,
                     draft.about.link()
                 );
+                if let Some(subject) = &draft.subject {
+                    println!("    subject: {subject}");
+                }
                 println!("    {}", draft.text.replace('\n', "\n    "));
             }
+        }
+        ["redraft", id] => {
+            let id: i64 = id.parse().map_err(|_| USAGE)?;
+            let profile = profile()?;
+            let draft = runtime()?.block_on(outreach::redraft(&database, &profile, id))?;
+            println!("#{} is now a {}.", draft.id, draft.slot.as_str());
+            if let Some(subject) = &draft.subject {
+                println!("    subject: {subject}");
+                println!("    Sending an InMail uses one of your InMail credits.");
+            }
+            println!("    {}", draft.text.replace('\n', "\n    "));
         }
         ["type", id] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;

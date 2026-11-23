@@ -686,6 +686,8 @@ pub enum Slot {
     Note,
     /// A direct message, which only a connection can receive.
     Message,
+    /// A Premium InMail to someone outside the network: a subject and a body. Sending one uses a credit.
+    InMail,
 }
 
 impl Slot {
@@ -693,6 +695,7 @@ impl Slot {
         match self {
             Self::Note => "note",
             Self::Message => "message",
+            Self::InMail => "inmail",
         }
     }
 
@@ -700,7 +703,18 @@ impl Slot {
         match text {
             "note" => Some(Self::Note),
             "message" => Some(Self::Message),
+            "inmail" => Some(Self::InMail),
             _ => None,
+        }
+    }
+
+    /// The other way to reach someone outside the network: a note becomes an InMail and back.
+    /// A connection gets a message, which has no other form.
+    pub fn switched(self) -> Option<Self> {
+        match self {
+            Self::Note => Some(Self::InMail),
+            Self::InMail => Some(Self::Note),
+            Self::Message => None,
         }
     }
 
@@ -716,6 +730,10 @@ impl Slot {
 
 /// The longest connection note LinkedIn takes.
 pub const NOTE_LIMIT: usize = 300;
+/// The longest InMail subject Maverick writes; LinkedIn takes a little more.
+pub const INMAIL_SUBJECT_LIMIT: usize = 200;
+/// The longest InMail body LinkedIn takes.
+pub const INMAIL_BODY_LIMIT: usize = 1900;
 
 /// The only things the typing flow ever clicks. There is no Send here, on purpose:
 /// the user reads the typed draft and clicks Send in Chrome.
@@ -804,6 +822,32 @@ const MESSAGE_FIELD: &str = r#"[...document.querySelectorAll("[contenteditable='
     .filter((box) => box.closest(".msg-form")
         || /message/i.test(box.getAttribute("aria-label") || box.getAttribute("aria-placeholder") || ""))
     .pop() || null"#;
+/// The windows an InMail compose may open in: a native dialog, the messaging overlay, or a box
+/// LinkedIn marks as a compose. Not verified on a real page yet.
+const COMPOSE_WINDOWS: &str = "dialog[open], [role='dialog']:not([aria-hidden='true']), \
+                               .msg-overlay-conversation-bubble, [data-testid*='compose' i], [class*='compose' i]";
+
+/// The InMail subject field and the body field beside it, as a script that gives one of them.
+fn inmail_field(which: &str) -> String {
+    format!(
+        r#"(() => {{
+            const shown = (element) => element.getClientRects().length > 0;
+            const isSubject = (field) => field.matches("input")
+                && /subject/i.test([field.placeholder, field.getAttribute("aria-label"), field.name].join(" "));
+            // The innermost visible window that holds a subject field.
+            const window = [...document.querySelectorAll("{COMPOSE_WINDOWS}")]
+                .filter(shown)
+                .reverse()
+                .find((candidate) => [...candidate.querySelectorAll("input")].some((field) => shown(field) && isSubject(field)));
+            if (!window) return null;
+            const subject = [...window.querySelectorAll("input")].find((field) => shown(field) && isSubject(field));
+            if ("{which}" === "subject") return subject;
+            return [...window.querySelectorAll("[contenteditable='true'], textarea")]
+                .find((field) => shown(field) && field !== subject) || null;
+        }})()"#
+    )
+}
+
 /// LinkedIn asks for the person's email before some connection requests. Maverick never invents one.
 const EMAIL_WALL: &str = "document.querySelector(\"dialog[open] input[type='email'], dialog[open] input[name='email'], \
      [role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
@@ -812,7 +856,13 @@ const STEP_WAIT: Duration = Duration::from_secs(10);
 
 /// Opens the person's profile in the user's Chrome, opens the message or connection dialog,
 /// and types the approved draft. It stops there: the user reviews it and clicks Send.
-pub async fn type_draft(bridge: Arc<Bridge>, profile_url: &str, slot: Slot, text: &str) -> Result<(), String> {
+pub async fn type_draft(
+    bridge: Arc<Bridge>,
+    profile_url: &str,
+    slot: Slot,
+    subject: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
     if !profile_url.starts_with(&format!("{SITE}/in/")) {
         return Err(format!("{profile_url} is not a LinkedIn profile"));
     }
@@ -828,13 +878,13 @@ pub async fn type_draft(bridge: Arc<Bridge>, profile_url: &str, slot: Slot, text
     let opened = bridge.request(connection, &blank).await.map_err(said)?;
     let tab = opened_tab(connection, &opened, true).map_err(|stop| stop.to_string())?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
-    let typed = type_in(&page, profile_url, slot, text).await;
+    let typed = type_in(&page, profile_url, slot, subject, text).await;
     // The debugging bar goes away; the dialog and the typed draft stay for the user.
     let _ = page.detach().await;
     typed
 }
 
-async fn type_in(page: &Page, profile_url: &str, slot: Slot, text: &str) -> Result<(), String> {
+async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&str>, text: &str) -> Result<(), String> {
     let said = |error: PageError| error.to_string();
     page.navigate(profile_url).await.map_err(said)?;
     let landed = page.evaluate("location.href").await.map_err(said)?;
@@ -877,6 +927,37 @@ async fn type_in(page: &Page, profile_url: &str, slot: Slot, text: &str) -> Resu
             let add_note = add_note.map_err(|_| "the connection dialog has no Add a note button".to_owned())?;
             page.click(&add_note.locator()).await.map_err(said)?;
             Locator::script("note box", NOTE_FIELD)
+        }
+        Slot::InMail => {
+            let subject = subject.ok_or("the InMail has no subject")?;
+            // Each step names itself, so a failure says which part of the page to look at with `dump-tab`.
+            let step = |number: u8, part: &'static str| {
+                move |error: PageError| {
+                    format!(
+                        "InMail step {number} of 4, {part}: {error}. Nothing was sent. \
+                         Save the tab with `maverick linkedin dump-tab <out.html>` so the step can be fixed"
+                    )
+                }
+            };
+            page.wait_for(&Control::Message.locator(), STEP_WAIT)
+                .await
+                .map_err(step(1, "the top card's Message button"))?;
+            page.click(&Control::Message.locator())
+                .await
+                .map_err(step(1, "the top card's Message button"))?;
+            let subject_field = Locator::script("InMail subject field", inmail_field("subject"));
+            page.wait_for(&subject_field, STEP_WAIT)
+                .await
+                .map_err(step(2, "the InMail window with a subject field"))?;
+            page.fill(&subject_field, subject)
+                .await
+                .map_err(step(3, "the InMail subject field"))?;
+            let body = Locator::script("InMail body field", inmail_field("body"));
+            page.wait_for(&body, STEP_WAIT)
+                .await
+                .map_err(step(4, "the InMail body field"))?;
+            page.fill(&body, text).await.map_err(step(4, "the InMail body field"))?;
+            return Ok(());
         }
     };
     page.wait_for(&field, STEP_WAIT).await.map_err(said)?;
@@ -1154,8 +1235,19 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
             assert!(!script.contains("send"), "{control:?} could reach a Send button");
             assert!(!script.contains("submit"), "{control:?} could reach a submit button");
         }
+        for which in ["subject", "body"] {
+            let script = inmail_field(which).to_lowercase();
+            assert!(!script.contains("send") && !script.contains("submit") && !script.contains("click"));
+        }
         assert_eq!(Slot::for_degree(Some("1st")), Slot::Message);
         assert_eq!(Slot::for_degree(Some("2nd")), Slot::Note);
         assert_eq!(Slot::for_degree(None), Slot::Note);
+        for slot in [Slot::Note, Slot::Message, Slot::InMail] {
+            assert_eq!(Slot::parse(slot.as_str()), Some(slot));
+        }
+        assert_eq!(Slot::parse("InMail"), None);
+        assert_eq!(Slot::Note.switched(), Some(Slot::InMail));
+        assert_eq!(Slot::InMail.switched(), Some(Slot::Note));
+        assert_eq!(Slot::Message.switched(), None);
     }
 }
