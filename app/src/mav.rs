@@ -5,7 +5,7 @@
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Div, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    AppContext as _, Context, Div, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 use jiff::ZonedDateTime;
@@ -17,9 +17,11 @@ use maverick_core::ticktick::{self, Board, Change, Entry, NewTask, Priority, Pro
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
+use crate::pane_widths::Pane;
 use crate::ui::{self, Palette, Signal};
 
-const RAIL_WIDTH: f32 = 380.0;
+const HISTORY_WIDTH: Pixels = px(210.);
+const RAIL_WIDTH: Pixels = px(380.);
 
 /// How the side panel looks, kept between runs in `mav-view.json`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -618,17 +620,45 @@ fn ready(seen: Seen) -> Loaded {
 }
 
 impl Render for Mav {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::of(cx);
+        let available = window.viewport_size().width - ui::DIVIDER_WIDTH * 2.;
+        let history_max = (available * 0.28).clamp(px(150.), px(360.));
+        let rail_max = (available * 0.42).clamp(px(260.), px(700.));
+        let history_width = Pane::ChatHistory
+            .width(cx)
+            .unwrap_or(HISTORY_WIDTH)
+            .clamp(px(150.), history_max);
+        let rail_width = Pane::MavRail.width(cx).unwrap_or(RAIL_WIDTH).clamp(px(260.), rail_max);
         h_flex()
             .size_full()
             .items_start()
-            .child(self.history(&palette, cx))
+            .child(self.history(history_width, &palette, cx))
+            .child(ui::pane_divider(
+                Pane::ChatHistory,
+                history_width,
+                px(150.)..=history_max,
+                false,
+                &palette,
+                cx,
+            ))
             .child(self.chat(&palette, cx))
             .child(if self.view.collapsed {
                 self.strip(&palette, cx).into_any_element()
             } else {
-                self.rail(&palette, cx).into_any_element()
+                h_flex()
+                    .h_full()
+                    .flex_none()
+                    .child(ui::pane_divider(
+                        Pane::MavRail,
+                        rail_width,
+                        px(260.)..=rail_max,
+                        true,
+                        &palette,
+                        cx,
+                    ))
+                    .child(self.rail(rail_width, &palette, cx))
+                    .into_any_element()
             })
     }
 }
@@ -676,7 +706,7 @@ fn past_card(
 
 impl Mav {
     /// The list of saved chats, with a way to start a new one.
-    fn history(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn history(&self, width: Pixels, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.chats.iter().map(|chat| {
             let open = self.chat == Some(chat.id);
             let (id, gone) = (chat.id, chat.id);
@@ -714,14 +744,12 @@ impl Mav {
         v_flex()
             .id("chat-history")
             .flex_none()
-            .w(px(210.))
+            .w(width)
             .h_full()
             .overflow_y_scroll()
             .px(px(12.))
             .py(px(16.))
             .gap(px(2.))
-            .border_r_1()
-            .border_color(palette.line)
             .child(
                 h_flex()
                     .justify_between()
@@ -761,28 +789,21 @@ impl Mav {
                 self.thinking
                     .then(|| ui::caps("mav is thinking").text_color(palette.signal(Signal::Model))),
             );
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .border_r_1()
-            .border_color(palette.line)
-            .child(thread)
-            .child(
-                h_flex()
-                    .flex_none()
-                    .gap(px(12.))
-                    .px(px(16.))
-                    .py(px(12.))
-                    .border_t_1()
-                    .border_color(palette.line)
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.input).id("mav-input").aria_label("Message to Mav")),
-                    )
-                    .child(ui::caps("enter sends").text_color(palette.faint)),
-            )
+        v_flex().flex_1().min_w_0().h_full().child(thread).child(
+            h_flex()
+                .flex_none()
+                .gap(px(12.))
+                .px(px(16.))
+                .py(px(12.))
+                .border_t_1()
+                .border_color(palette.line)
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&self.input).id("mav-input").aria_label("Message to Mav")),
+                )
+                .child(ui::caps("enter sends").text_color(palette.faint)),
+        )
     }
 
     fn item(&self, index: usize, item: &Item, palette: &Palette, cx: &mut Context<Self>) -> Div {
@@ -893,6 +914,8 @@ impl Mav {
         v_flex()
             .flex_none()
             .w(px(44.))
+            .border_l_1()
+            .border_color(palette.line)
             .h_full()
             .items_center()
             .py(px(16.))
@@ -908,7 +931,7 @@ impl Mav {
             .child(ui::caps(pressing).text_color(palette.signal(Signal::Failed)))
     }
 
-    fn rail(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn rail(&self, width: Pixels, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let status = match &self.loaded {
             Loaded::Not | Loaded::Loading => "reading".to_owned(),
             Loaded::Failed(_) => "could not read".to_owned(),
@@ -926,7 +949,7 @@ impl Mav {
         v_flex()
             .id("mav-rail")
             .flex_none()
-            .w(px(RAIL_WIDTH))
+            .w(width)
             .h_full()
             .overflow_y_scroll()
             .px(px(16.))
@@ -1310,13 +1333,14 @@ fn heading(id: &'static str, text: String, color: gpui_kit::Hsla) -> impl IntoEl
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{AppContext as _, TestAppContext, WindowOptions};
+    use gpui_kit::{AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
     use jiff::civil::date;
     use maverick_core::calendar::{Event, Source, Span};
     use maverick_core::mav::{Action, Context as Seen, Reply};
     use maverick_core::ticktick::{Agenda, Due, Entry, NewTask, Priority};
 
     use super::{Card, Item, Loaded, Mav, ready};
+    use crate::pane_widths::{Pane, PaneWidths};
 
     fn at(day: i8, hour: i8) -> jiff::ZonedDateTime {
         date(2026, 11, day)
@@ -1347,6 +1371,89 @@ mod tests {
             },
             list: "Inbox".into(),
         }
+    }
+
+    #[gpui_kit::test]
+    fn mav_dividers_resize_independently_and_restore_saved_widths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pane-widths.json");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(PaneWidths::load(Some(file.clone())));
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let background = runtime.handle().clone();
+        let (window, mav) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1080.), px(720.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Mav::new(background, None, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            mav.update(cx, |mav, cx| {
+                mav.view.collapsed = false;
+                cx.notify();
+            });
+            window.render_frame(cx);
+
+            let history = window.find("resize-chat-history").bounds().center();
+            let rail = window.find("resize-mav-rail").bounds().center();
+            window.drag(history, history + point(px(40.), px(0.)), cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("resize-chat-history").bounds().center().x,
+                history.x + px(40.)
+            );
+            assert_eq!(window.find("resize-mav-rail").bounds().center().x, rail.x);
+
+            window.drag(rail, rail - point(px(45.), px(0.)), cx);
+            window.render_frame(cx);
+            let resized_rail = window.find("resize-mav-rail").bounds().center();
+            assert_eq!(resized_rail.x, rail.x - px(45.));
+            assert_eq!(
+                window.find("resize-chat-history").bounds().center().x,
+                history.x + px(40.)
+            );
+
+            // Reload from disk as the app does at startup.
+            cx.set_global(PaneWidths::load(Some(file.clone())));
+            window.render_frame(cx);
+            assert_eq!(window.find("resize-mav-rail").bounds().center(), resized_rail);
+            assert_eq!(
+                window.find("resize-chat-history").bounds().center().x,
+                history.x + px(40.)
+            );
+
+            for collapsed in [true, false] {
+                mav.update(cx, |mav, cx| {
+                    mav.view.collapsed = collapsed;
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                assert_eq!(window.try_find("resize-mav-rail").is_none(), collapsed);
+            }
+            assert_eq!(window.find("resize-mav-rail").bounds().center(), resized_rail);
+
+            window.double_click("resize-mav-rail", cx);
+            window.double_click("resize-chat-history", cx);
+            cx.set_global(PaneWidths::load(Some(file.clone())));
+            window.render_frame(cx);
+            assert_eq!(window.find("resize-mav-rail").bounds().center(), rail);
+            assert_eq!(window.find("resize-chat-history").bounds().center(), history);
+
+            window.drag(history, history - point(px(130.), px(0.)), cx);
+            cx.set_global(PaneWidths::load(Some(file)));
+            assert_eq!(Pane::ChatHistory.width(cx), Some(px(150.)));
+            assert_eq!(Pane::MavRail.width(cx), None);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

@@ -4,6 +4,7 @@
 //! and scores are dot-matrix. Corners are square.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::list::ListItem;
@@ -11,9 +12,12 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
+    App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
 };
+
+use crate::pane_widths::{Pane, PaneWidths};
 
 /// Labels, counts, navigation and anything that lines up in columns.
 pub const MONO: &str = "Geist Mono";
@@ -291,6 +295,82 @@ pub fn brackets(color: Hsla) -> [Div; 4] {
         mark().bottom_0().left_0().border_b_1().border_l_1(),
         mark().bottom_0().right_0().border_b_1().border_r_1(),
     ]
+}
+
+pub const DIVIDER_WIDTH: Pixels = px(8.);
+
+struct PaneDrag {
+    pane: Pane,
+    start: Cell<Pixels>,
+    width: Pixels,
+}
+
+struct EmptyDragPreview;
+
+impl gpui_kit::Render for EmptyDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// A divider's leading pane grows to the right, and its trailing pane grows to the left.
+pub fn pane_divider<T: 'static>(
+    pane: Pane,
+    width: Pixels,
+    limits: std::ops::RangeInclusive<Pixels>,
+    trailing: bool,
+    palette: &Palette,
+    cx: &mut Context<T>,
+) -> impl IntoElement {
+    let id = pane.divider_id();
+    let drag = PaneDrag {
+        pane,
+        start: Cell::new(px(0.)),
+        width,
+    };
+    let direction = if trailing { -1. } else { 1. };
+    let line = palette.line;
+    let ink = palette.muted;
+    div()
+        .id(id)
+        .test_support()
+        .flex_none()
+        .w(DIVIDER_WIDTH)
+        .h_full()
+        .flex()
+        .justify_center()
+        .cursor_col_resize()
+        .group(id)
+        .child(
+            div()
+                .w(px(1.))
+                .h_full()
+                .bg(line)
+                .group_hover(id, move |style| style.bg(ink)),
+        )
+        .on_drag(drag, |drag, offset, window, cx| {
+            // GPUI gives the pointer's offset from the divider when the drag starts.
+            let center = window.mouse_position().x - offset.x + DIVIDER_WIDTH / 2.;
+            drag.start.set(center);
+            cx.new(|_| EmptyDragPreview)
+        })
+        .on_drag_move(cx.listener(move |_, event: &DragMoveEvent<PaneDrag>, _, cx| {
+            let drag = event.drag(cx);
+            if drag.pane == pane {
+                let width = drag.width + (event.event.position.x - drag.start.get()) * direction;
+                pane.set_width(Some(width.clamp(*limits.start(), *limits.end())), cx);
+                cx.notify();
+            }
+        }))
+        .on_mouse_up(MouseButton::Left, |_, _, cx| PaneWidths::save(cx))
+        .on_mouse_up_out(MouseButton::Left, |_, _, cx| PaneWidths::save(cx))
+        .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+            if event.click_count() == 2 {
+                pane.set_width(None, cx);
+                PaneWidths::save(cx);
+                cx.notify();
+            }
+        }))
 }
 
 #[cfg(test)]
