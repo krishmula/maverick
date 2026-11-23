@@ -743,14 +743,34 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         ["dump-tab", out, rest @ ..] => {
             let html = runtime()?.block_on(async {
                 let bridge = chrome().await?;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let tab = match bridge.state() {
-                    maverick_core::bridge::BrowserState::Connected { tabs } => tabs
-                        .into_iter()
-                        .find(|tab| tab.tab.url.contains("linkedin.com/in/") && tab.tab.active),
+                let profile_tab = || match bridge.state() {
+                    maverick_core::bridge::BrowserState::Connected { tabs } => {
+                        let mut profiles: Vec<_> =
+                            tabs.into_iter().filter(|tab| tab.tab.url.contains("linkedin.com/in/")).collect();
+                        profiles.sort_by_key(|tab| !tab.tab.active);
+                        profiles.into_iter().next()
+                    }
                     _ => None,
+                };
+                let mut tab = None;
+                for _ in 0..50 {
+                    tab = profile_tab();
+                    if tab.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                .ok_or("no active LinkedIn profile tab")?;
+                let tab = tab.ok_or_else(|| {
+                    let open = match bridge.state() {
+                        maverick_core::bridge::BrowserState::Connected { tabs } => tabs
+                            .iter()
+                            .map(|tab| format!("{:?}:{}", tab.connection, tab.tab.url.split('?').next().unwrap_or_default()))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        _ => String::new(),
+                    };
+                    format!("no LinkedIn profile tab is open ({open} tabs seen)")
+                })?;
                 let page = maverick_core::page::Page::attach(bridge, &tab).await.map_err(|e| e.to_string())?;
                 let script = r#"(() => { const out = [document.documentElement.outerHTML];
                     for (const el of document.querySelectorAll('*')) if (el.shadowRoot) out.push('<!--SHADOW ' + el.tagName + '-->' + el.shadowRoot.innerHTML);

@@ -853,6 +853,8 @@ const EMAIL_WALL: &str = "document.querySelector(\"dialog[open] input[type='emai
      [role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
 
 const STEP_WAIT: Duration = Duration::from_secs(10);
+/// How long LinkedIn takes, after the load event, to make its buttons work.
+const SETTLE: Duration = Duration::from_secs(3);
 
 /// Opens the person's profile in the user's Chrome, opens the message or connection dialog,
 /// and types the approved draft. It stops there: the user reviews it and clicks Send.
@@ -891,6 +893,9 @@ async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&st
     if is_wall(landed.as_str().unwrap_or_default()) {
         return Err("LinkedIn is not signed in in this Chrome".into());
     }
+    // LinkedIn wires its buttons up after the load event. Clicked before that, Connect is a plain
+    // link back to the profile, so the click reloads the page and no dialog opens.
+    tokio::time::sleep(SETTLE).await;
     let found = |control: Control| async move {
         page.wait_for(&control.locator(), STEP_WAIT)
             .await
@@ -908,6 +913,16 @@ async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&st
         Slot::Note => {
             if let Ok(connect) = found(Control::Connect).await {
                 page.click(&connect.locator()).await.map_err(said)?;
+                let opened = Locator::script("an open dialog", format!("document.querySelector(\"{OPEN_DIALOG}\")"));
+                if page.wait_for(&opened, SETTLE).await.is_err() {
+                    // The click went to the link, not the dialog. Connect never sends by itself:
+                    // the dialog's own Send buttons do, and Maverick never presses those.
+                    tokio::time::sleep(SETTLE).await;
+                    let again = found(Control::Connect).await.map_err(|_| {
+                        "Connect opened no dialog and is gone now; check the profile in Chrome".to_owned()
+                    })?;
+                    page.click(&again.locator()).await.map_err(said)?;
+                }
             } else {
                 let more = found(Control::MoreActions).await.map_err(|_| {
                     "the profile shows no Connect button; the request may be pending already".to_owned()
