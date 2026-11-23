@@ -599,15 +599,26 @@ impl CheckRun {
 /// lookup cap is spent, People-page lookups are deferred to a later run.
 pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>) -> Result<CheckRun, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
-    let (due, connections) = {
+    let (due, deferred, connections) = {
         let store = Store::open(database).map_err(said)?;
-        let due = to_check(&store.postings().map_err(said)?, &store.checks().map_err(said)?);
-        (due, store.connections().map_err(said)?)
+        let checks = store.checks().map_err(said)?;
+        let due = to_check(&store.postings().map_err(said)?, &checks);
+        let deferred: HashSet<String> = checks
+            .into_iter()
+            .filter(|check| check.verdict == Verdict::Deferred)
+            .map(|check| check.posting_link)
+            .collect();
+        (due, deferred, store.connections().map_err(said)?)
     };
     let mut run = CheckRun::default();
     let mut reader: Option<Reader> = None;
     let mut lookups = bridge.map(|bridge| (bridge, LOOKUP_CAP));
     for posting in due {
+        // A deferred posting only waits for a People lookup, so without one left reading it again is wasted.
+        let can_look_up = matches!(lookups, Some((_, left)) if left > 0);
+        if deferred.contains(&posting.link) && !can_look_up {
+            continue;
+        }
         let (named, mut note) = match named_in(&posting).await {
             Ok(named) => (named, None),
             Err(error) => (Named::default(), Some(format!("posting not read: {error}"))),
@@ -1406,6 +1417,24 @@ mod tests {
             poster_role_key("Sam  Poster", "Backend Engineer (New Grad)"),
             poster_role_key("sam poster", "backend engineer new grad")
         );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_posting_is_not_read_again_when_no_lookup_can_run() {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let mut store = Store::open(&database).unwrap();
+        store
+            .add_found(&[posting("https://simplify.jobs/p/1", 80, "Review - 80")])
+            .unwrap();
+        store
+            .save_check(&check("https://simplify.jobs/p/1", Verdict::Deferred))
+            .unwrap();
+        drop(store);
+
+        let run = check_postings(&database, None).await.unwrap();
+
+        assert_eq!(run.checked, []);
     }
 
     #[test]
