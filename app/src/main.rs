@@ -7,6 +7,7 @@ mod jobs;
 mod main_view;
 mod mav;
 mod models;
+mod outreach;
 mod report;
 mod schedule;
 mod setup;
@@ -162,6 +163,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     let mut view = MainView::new(browser, jobs, cells, icon_file, !setup::done(), window, cx);
                     if let Some(funnel) = funnel {
                         view.run_funnel(funnel, window, cx);
+                        view.run_outreach(window, cx);
                     }
                     view
                 })
