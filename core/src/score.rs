@@ -245,7 +245,7 @@ pub async fn score_all(postings: Vec<Posting>, profile: Profile, mut done: impl 
     scored
 }
 
-const INSTRUCTIONS: &str = "You read one job posting and judge how well it fits one applicant. \
+pub(crate) const INSTRUCTIONS: &str = "You read one job posting and judge how well it fits one applicant. \
 You are given the applicant's resume, facts about them, and the jobs they are looking for. \
 Score the fit from 0 to 100 against the resume and the target: \
 90 to 100 means the level is right and the core of the job is work the resume shows; \
@@ -273,7 +273,7 @@ advisory lists short notes the applicant should know, such as relocation needed,
 or a preferred qualification the resume lacks, each in under ten words. \
 Leave out anything already covered by the other fields, and leave the list empty when nothing stands out.";
 
-fn reading_schema() -> Value {
+pub(crate) fn reading_schema() -> Value {
     json!({
         "type": "object",
         "properties": {

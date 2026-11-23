@@ -602,3 +602,168 @@ pub fn tracker(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+/// Chrome through Maverick's own link, for a command run while the app is closed.
+/// Waits up to a minute for the extension, which tries to connect every 30 seconds.
+async fn chrome() -> Result<std::sync::Arc<maverick_core::bridge::Bridge>, String> {
+    use maverick_core::bridge::{self, Bridge};
+    let socket = maverick_core::socket_path().ok_or("this system has no application data directory")?;
+    let listener = bridge::bind(&socket).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            "Maverick is open and holds the link to Chrome. Use its Outreach view, or quit it first.".to_owned()
+        }
+        _ => format!("could not open the link to Chrome: {error}"),
+    })?;
+    let bridge = Bridge::new();
+    tokio::spawn(bridge.clone().serve(listener));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    println!("Waiting for Chrome to connect...");
+    while bridge.connections().is_empty() {
+        if tokio::time::Instant::now() > deadline {
+            return Err("Chrome did not connect within a minute. Is the Maverick Bridge extension loaded?".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(bridge)
+}
+
+/// `maverick linkedin <connections|check|sweep|drafts|type|status>`: outreach on LinkedIn.
+/// `page` and `read` are for fixing the parsers when LinkedIn changes its pages: `page` saves one
+/// page as Maverick's tab sees it, and `read` shows what Maverick reads in a saved page.
+/// Nothing here sends a message or a connection request.
+pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use maverick_core::jobs::Outreach;
+    use maverick_core::linkedin::{Reader, people_page, posts_page, read_connections};
+    use maverick_core::outreach;
+
+    const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
+                         | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html>";
+    let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
+    let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["connections", file] => {
+            let text = fs::read_to_string(file)?;
+            let connections = read_connections(&text)?;
+            if let Some(folder) = database.parent() {
+                fs::create_dir_all(folder)?;
+            }
+            let stored = Store::open(&database)?.replace_connections(&connections)?;
+            let without = connections.iter().filter(|c| c.profile_url.is_none()).count();
+            println!("Stored {stored} connections in {}.", database.display());
+            if without > 0 {
+                println!("{without} of them have no profile address in the export.");
+            }
+        }
+        ["check", rest @ ..] => {
+            let mut use_chrome = true;
+            let mut only = Vec::new();
+            let mut rest = rest.iter();
+            while let Some(word) = rest.next() {
+                match *word {
+                    "--no-chrome" => use_chrome = false,
+                    "--posting" => only.push(rest.next().ok_or(USAGE)?.to_string()),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            let postings = open_store()?.postings()?;
+            let run = runtime()?.block_on(async {
+                let bridge = if use_chrome { Some(chrome().await?) } else { None };
+                outreach::check_postings(&database, bridge, &only).await
+            })?;
+            for check in &run.checked {
+                let posting = postings.iter().find(|posting| posting.link == check.posting_link);
+                let named = posting.map_or(check.posting_link.clone(), |posting| {
+                    format!("{} | {}", posting.company, posting.title)
+                });
+                println!("  {named} | {}", check.summary());
+                for person in check.people.iter().filter_map(|person| person.profile_url.as_ref()) {
+                    println!("      {person}");
+                }
+                if let Some(note) = &check.note {
+                    println!("      note: {note}");
+                }
+            }
+            println!("{}", run.summary());
+        }
+        ["sweep"] => {
+            let profile = profile()?;
+            let run = runtime()?.block_on(async { outreach::sweep(&database, &profile, chrome().await?).await })?;
+            println!("{}", run.summary());
+            println!("See the drafts with: maverick linkedin drafts");
+        }
+        ["page", address, out] => {
+            if !address.starts_with("https://www.linkedin.com/") {
+                return Err(format!("{address} is not a LinkedIn address").into());
+            }
+            // One page, in a background tab, with nothing clicked.
+            let html = runtime()?.block_on(async {
+                let mut reader = Reader::open(chrome().await?, 1)
+                    .await
+                    .map_err(|stop| stop.to_string())?;
+                let html = reader.load(address, false).await.map_err(|stop| stop.to_string());
+                reader.close().await;
+                html
+            })?;
+            fs::write(out, html)?;
+            println!("Saved {address} to {out}.");
+        }
+        ["read", "people", file] => {
+            let page = people_page(&fs::read_to_string(file)?);
+            println!(
+                "company: {}",
+                page.company.as_deref().unwrap_or("none; not a People page")
+            );
+            for person in &page.people {
+                let degree = person.degree.as_deref().unwrap_or("-");
+                println!("  {} | {degree} | {}", person.name, person.title);
+            }
+            println!("{} people", page.people.len());
+        }
+        ["read", "posts", file] => {
+            let posts = posts_page(&fs::read_to_string(file)?);
+            for post in &posts {
+                let shown: String = post.text.chars().take(80).collect();
+                println!(
+                    "  {} | {} | {} | {} chars{}\n      {}\n      {}",
+                    post.poster,
+                    post.degree.as_deref().unwrap_or("-"),
+                    post.headline,
+                    post.text.chars().count(),
+                    if post.complete { "" } else { ", cut short" },
+                    post.link(),
+                    shown.replace('\n', " ")
+                );
+            }
+            println!("{} posts", posts.len());
+        }
+        ["drafts"] => {
+            for draft in open_store()?.drafts()? {
+                println!(
+                    "#{} {} {} to {} ({}) | {}",
+                    draft.id,
+                    draft.status.as_str(),
+                    draft.slot.as_str(),
+                    draft.person,
+                    draft.profile_url,
+                    draft.about.link()
+                );
+                println!("    {}", draft.text.replace('\n', "\n    "));
+            }
+        }
+        ["type", id] => {
+            let id: i64 = id.parse().map_err(|_| USAGE)?;
+            runtime()?.block_on(async { outreach::type_approved(&database, chrome().await?, id).await })?;
+            println!("Typed draft #{id} in Chrome. Read it there and click Send yourself.");
+            println!("Then: maverick linkedin status {id} sent");
+        }
+        ["status", id, status] => {
+            let id: i64 = id.parse().map_err(|_| USAGE)?;
+            let status = Outreach::parse(&status.replace('-', "_")).ok_or(USAGE)?;
+            Store::open(&database)?.set_draft_status(id, status, jiff::Timestamp::now())?;
+            println!("Draft #{id} is now {}.", status.as_str().replace('_', " "));
+        }
+        _ => return Err(USAGE.into()),
+    }
+    Ok(())
+}

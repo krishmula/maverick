@@ -1,0 +1,1155 @@
+//! LinkedIn: the user's connections export, the pages Maverick reads, and the typing that stops before Send.
+//!
+//! LinkedIn restricts accounts that load many pages, so every page goes through `Visits`:
+//! a cap per run and a random wait between loads. Maverick reads a company's People page
+//! and the hiring-post search, never general people search, and never opens a profile
+//! except to type a draft the user approved.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use jiff::civil::Date;
+use scraper::{ElementRef, Html, Node, Selector};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::bridge::{Bridge, BridgeError, BrowserTab, Command, Tab};
+use crate::page::{Locator, Page, PageError};
+
+const SITE: &str = "https://www.linkedin.com";
+
+/// One row of the Connections.csv file in LinkedIn's data export.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Connection {
+    pub first_name: String,
+    pub last_name: String,
+    /// Some rows in the export have no profile address.
+    pub profile_url: Option<String>,
+    pub email: Option<String>,
+    pub company: String,
+    pub position: String,
+    pub connected_on: Option<Date>,
+}
+
+impl Connection {
+    pub fn name(&self) -> String {
+        format!("{} {}", self.first_name, self.last_name).trim().to_owned()
+    }
+}
+
+const CONNECTION_COLUMNS: [&str; 7] = [
+    "First Name",
+    "Last Name",
+    "URL",
+    "Email Address",
+    "Company",
+    "Position",
+    "Connected On",
+];
+
+/// Reads LinkedIn's Connections.csv. The export starts with a few lines of notes before the header.
+pub fn read_connections(text: &str) -> Result<Vec<Connection>, String> {
+    let rows = csv_rows(text.trim_start_matches('\u{feff}'));
+    let header = rows
+        .iter()
+        .position(|row| row.first().map(String::as_str) == Some("First Name"))
+        .ok_or("this file has no \"First Name\" header, so it is not LinkedIn's Connections.csv")?;
+    let columns: Vec<usize> = CONNECTION_COLUMNS
+        .iter()
+        .map(|name| {
+            rows[header]
+                .iter()
+                .position(|cell| cell.trim() == *name)
+                .ok_or_else(|| format!("Connections.csv has no {name:?} column"))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut connections = Vec::new();
+    for (number, row) in rows.iter().enumerate().skip(header + 1) {
+        let cell = |at: usize| row.get(columns[at]).map(|text| text.trim()).unwrap_or("");
+        let given = |at: usize| Some(cell(at)).filter(|text| !text.is_empty()).map(str::to_owned);
+        if row.iter().all(|cell| cell.trim().is_empty()) {
+            continue;
+        }
+        let connected_on = match given(6) {
+            Some(day) => Some(
+                Date::strptime("%d %b %Y", &day)
+                    .map_err(|_| format!("line {}: {day:?} is not a date like 15 Nov 2026", number + 1))?,
+            ),
+            None => None,
+        };
+        connections.push(Connection {
+            first_name: cell(0).to_owned(),
+            last_name: cell(1).to_owned(),
+            profile_url: given(2).map(|url| profile_address(&url)),
+            email: given(3),
+            company: cell(4).to_owned(),
+            position: cell(5).to_owned(),
+            connected_on,
+        });
+    }
+    Ok(connections)
+}
+
+/// Splits CSV text into rows of cells. Quoted cells may hold commas, quotes and line breaks.
+fn csv_rows(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let (mut row, mut cell) = (Vec::new(), String::new());
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                cell.push('"');
+                chars.next();
+            }
+            (true, '"') => quoted = false,
+            (true, c) => cell.push(c),
+            (false, '"') => quoted = true,
+            (false, ',') => row.push(std::mem::take(&mut cell)),
+            (false, '\r') => {}
+            (false, '\n') => {
+                row.push(std::mem::take(&mut cell));
+                rows.push(std::mem::take(&mut row));
+            }
+            (false, c) => cell.push(c),
+        }
+    }
+    if !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        rows.push(row);
+    }
+    rows
+}
+
+/// A profile address in one form, `https://www.linkedin.com/in/<id>/`, so the same person always compares equal.
+pub fn profile_address(link: &str) -> String {
+    let path = link.split(['?', '#']).next().unwrap_or(link).trim_end_matches('/');
+    match path.split_once("/in/") {
+        Some((_, id)) => format!("{SITE}/in/{}/", id.split('/').next().unwrap_or(id)),
+        None => link.to_owned(),
+    }
+}
+
+/// A company name reduced to what identifies it: lower case, no punctuation, no "Inc." or "LLC".
+pub fn company_key(name: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        "inc",
+        "llc",
+        "ltd",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "plc",
+        "gmbh",
+        "limited",
+    ];
+    let cleaned: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let mut words: Vec<&str> = cleaned.split_whitespace().collect();
+    while words.len() > 1 && words.last().is_some_and(|word| SUFFIXES.contains(word)) {
+        words.pop();
+    }
+    words.join(" ")
+}
+
+/// Companies that count as one employer, a parent with its subsidiaries.
+const SAME_EMPLOYER: &[&[&str]] = &[
+    &["amazon", "aws", "amazon web services"],
+    &["google", "alphabet", "google deepmind", "deepmind", "youtube"],
+    &["meta", "facebook", "instagram", "whatsapp"],
+    &["microsoft", "github", "linkedin"],
+];
+
+/// True when two company names mean the same employer, counting a parent and its subsidiary as one.
+pub fn same_company(one: &str, other: &str) -> bool {
+    let (one, other) = (company_key(one), company_key(other));
+    if one.is_empty() || other.is_empty() {
+        return false;
+    }
+    // "Example" and "Example Robotics" are one employer; "Example" and "Examples" are not.
+    let leads = |long: &str, short: &str| long == short || long.starts_with(&format!("{short} "));
+    if leads(&one, &other) || leads(&other, &one) {
+        return true;
+    }
+    let group = |key: &str| {
+        SAME_EMPLOYER
+            .iter()
+            .position(|names| names.iter().any(|name| leads(key, name)))
+    };
+    group(&one).is_some() && group(&one) == group(&other)
+}
+
+/// Whether the author of a post works at the company that is hiring, read from their headline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PosterCheck {
+    WorksThere,
+    /// The headline names another employer, such as a recruiting agency.
+    Elsewhere,
+    /// The headline names no employer.
+    Unclear,
+}
+
+/// Reads the employers a headline names, as in "Engineer at Example" or "Recruiter @ Agency | ex-Other".
+pub fn poster_check(headline: &str, company: &str) -> PosterCheck {
+    let lowered = headline.to_lowercase();
+    let mut employers = Vec::new();
+    for marker in [" at ", "@"] {
+        let mut rest = lowered.as_str();
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let employer = rest
+                .split(['|', ',', '•', '·', '/', '(', ')', ';'])
+                .next()
+                .unwrap_or("")
+                .split(" - ")
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !employer.is_empty() {
+                employers.push(employer.to_owned());
+            }
+        }
+    }
+    if employers.is_empty() {
+        PosterCheck::Unclear
+    } else if employers.iter().any(|employer| same_company(employer, company)) {
+        PosterCheck::WorksThere
+    } else {
+        PosterCheck::Elsewhere
+    }
+}
+
+/// A person on a company's People page. The card carries enough, so the profile is never opened.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Person {
+    pub name: String,
+    pub title: String,
+    pub profile_url: Option<String>,
+    /// As the card shows it, such as `2nd`. `None` when it shows none.
+    pub degree: Option<String>,
+}
+
+/// What a company's People page showed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeoplePage {
+    /// The company name at the top of the page, to confirm the page is the right company.
+    pub company: Option<String>,
+    pub people: Vec<Person>,
+}
+
+/// The company's People page. LinkedIn ignores a `keywords` parameter on it, so Maverick loads the
+/// plain list and picks people from it. `slug` is the company's part of its page address.
+pub fn people_address(slug: &str) -> String {
+    format!("{SITE}/company/{slug}/people/")
+}
+
+/// The LinkedIn company pages a web page links to, as slugs, the most linked first. A posting page
+/// or a company's own website often links the company's page, whose slug need not match its name.
+pub fn company_pages_in(html: &str) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (at, _) in html.match_indices("linkedin.com/company/") {
+        let rest = &html[at + "linkedin.com/company/".len()..];
+        let slug: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '%'))
+            .collect::<String>()
+            .to_lowercase();
+        if slug.is_empty() || slug == "linkedin" {
+            continue;
+        }
+        match counts.iter_mut().find(|(seen, _)| *seen == slug) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((slug, 1)),
+        }
+    }
+    // Stable, so a tie keeps the slug the page links first.
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts.into_iter().map(|(slug, _)| slug).collect()
+}
+
+/// The company's own website as an Ashby posting names it.
+pub fn company_website_in(html: &str) -> Option<String> {
+    let (_, rest) = html.split_once("\"publicWebsite\":\"")?;
+    let (website, _) = rest.split_once('"')?;
+    website.starts_with("http").then(|| website.to_owned())
+}
+
+/// A guess at a company's page address from its name: lower case, words joined by hyphens.
+pub fn company_slug(company: &str) -> String {
+    company_key(company).replace(' ', "-")
+}
+
+fn selector(css: &str) -> Selector {
+    Selector::parse(css).expect("the selectors in this file are valid CSS")
+}
+
+/// Text with runs of white space made single spaces.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn text_of(element: ElementRef<'_>) -> String {
+    squeezed(&element.text().collect::<String>())
+}
+
+/// The separate pieces of text in an element, in page order.
+fn strings_of(element: ElementRef<'_>) -> Vec<String> {
+    element.text().map(squeezed).filter(|text| !text.is_empty()).collect()
+}
+
+/// The page title less LinkedIn's suffix and the unread count it puts in front, such as `(3) `.
+fn page_title(page: &Html) -> Option<String> {
+    let title = page.select(&selector("title")).next().map(text_of)?;
+    let title = title.strip_suffix(" | LinkedIn").unwrap_or(&title);
+    let title = match title.strip_prefix('(').and_then(|rest| rest.split_once(") ")) {
+        Some((count, rest)) if count.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => title,
+    };
+    Some(title.to_owned())
+}
+
+/// Reads the cards on a company's People page. The page's classes are hashed, so cards are found
+/// by role: each list item with a profile link is a person, whose texts are the name, the degree
+/// (`· 2nd`), the headline and then lines such as a mutual connection, and the name is the text of
+/// the profile link. The "Alumni who work here" list after the main one is left out, and so are
+/// members shown as "LinkedIn Member" and company cards that link a person in another line.
+///
+/// `company` is the name in the title, `Example Co: People | LinkedIn`. Any other title, such as a
+/// missing company's page, gives `None`.
+pub fn people_page(html: &str) -> PeoplePage {
+    let page = Html::parse_document(html);
+    let company = page_title(&page)
+        .and_then(|title| title.strip_suffix(": People").map(str::to_owned))
+        .filter(|name| !name.is_empty());
+    let mut people: Vec<Person> = Vec::new();
+    let mut heading = String::new();
+    // Headings and list items come in page order, so each card knows the list it sits under.
+    for element in page.select(&selector("h2, [role=\"listitem\"]")) {
+        if element.value().name() == "h2" {
+            heading = text_of(element);
+            continue;
+        }
+        if heading.contains("Alumni") {
+            continue;
+        }
+        let strings = strings_of(element);
+        let Some(name) = strings.first().cloned() else { continue };
+        // The name is the text of the person's link. A company card in "People also viewed" links
+        // a person only from a line such as "1 person in your network works here".
+        let Some(link) = element
+            .select(&selector("a[href*=\"/in/\"]"))
+            .find(|link| strings_of(*link).first() == Some(&name))
+        else {
+            continue;
+        };
+        let profile_url = link.attr("href").map(profile_address);
+        if name == "LinkedIn Member" || people.iter().any(|seen| seen.profile_url == profile_url) {
+            continue;
+        }
+        let degree = strings
+            .iter()
+            .find_map(|text| text.strip_prefix('·'))
+            .map(|degree| degree.trim().to_owned());
+        let title = strings
+            .iter()
+            .skip(1)
+            .find(|text| !text.starts_with('·'))
+            .cloned()
+            .unwrap_or_default();
+        people.push(Person {
+            name,
+            title,
+            profile_url,
+            degree,
+        });
+    }
+    PeoplePage { company, people }
+}
+
+/// A post from LinkedIn's content search.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Post {
+    pub poster: String,
+    /// `None` when a company page, not a person, posted it.
+    pub poster_url: Option<String>,
+    pub headline: String,
+    /// As the post shows it, such as `1st` or `3rd+`.
+    pub degree: Option<String>,
+    pub text: String,
+    /// False when LinkedIn cut the text short, ending it with `…`.
+    pub complete: bool,
+}
+
+impl Post {
+    /// The search page carries no id for its posts, so the link is the poster's activity page. A
+    /// fingerprint of the text follows it, so the same post gives the same link on every sweep.
+    pub fn link(&self) -> String {
+        let page = match &self.poster_url {
+            Some(profile) => format!("{profile}recent-activity/all/"),
+            None => format!("{SITE}/feed/"),
+        };
+        // FNV-1a, which unlike the standard hasher stays the same across Rust releases.
+        let fingerprint = self.text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        format!("{page}#post-{fingerprint:016x}")
+    }
+
+    pub fn is_connection(&self) -> bool {
+        self.degree.as_deref() == Some("1st")
+    }
+}
+
+/// LinkedIn's content search for posts from the past day, newest first.
+pub fn post_search_address(keywords: &str) -> String {
+    format!(
+        "{SITE}/search/results/content/?keywords={}&datePosted=%22past-24h%22&sortBy=%22date_posted%22",
+        encoded(keywords)
+    )
+}
+
+/// Reads the posts on a content search page. Each post is a list item whose texts start with the
+/// poster's link (name, then degree), then the headline and the age. The post's text sits in its
+/// expandable text box.
+pub fn posts_page(html: &str) -> Vec<Post> {
+    let page = Html::parse_document(html);
+    let mut posts: Vec<Post> = Vec::new();
+    for card in page.select(&selector("[role=\"listitem\"][componentkey^=\"update-card-focus\"]")) {
+        let Some(body) = card.select(&selector("[data-testid=\"expandable-text-box\"]")).next() else {
+            continue;
+        };
+        let person = card
+            .select(&selector("a[href*=\"/in/\"]"))
+            .find(|link| !strings_of(*link).is_empty());
+        let poster_url = person.and_then(|link| link.attr("href")).map(profile_address);
+        let actor = person.map(strings_of).unwrap_or_default();
+        let poster = actor.first().cloned().unwrap_or_else(|| {
+            card.select(&selector("a[href*=\"/company/\"]"))
+                .map(text_of)
+                .find(|name| !name.is_empty())
+                .unwrap_or_default()
+        });
+        let degree = actor
+            .iter()
+            .find_map(|text| text.strip_prefix('•'))
+            .map(|degree| degree.trim().to_owned());
+        // The headline is the text right after the poster's link, unless the post's age comes first.
+        let strings = strings_of(card);
+        let headline = actor
+            .last()
+            .and_then(|last| strings.iter().position(|text| text == last))
+            .and_then(|at| strings.get(at + 1))
+            .filter(|text| !text.ends_with('•') && text.as_str() != "--")
+            .cloned()
+            .unwrap_or_default();
+        let text = lines_of(body);
+        let post = Post {
+            poster,
+            poster_url,
+            headline,
+            degree,
+            complete: !text.ends_with('…'),
+            text,
+        };
+        if !posts.iter().any(|seen| seen.link() == post.link()) {
+            posts.push(post);
+        }
+    }
+    posts
+}
+
+/// The text of an element, keeping its line breaks and leaving out its buttons.
+fn lines_of(element: ElementRef<'_>) -> String {
+    let mut text = String::new();
+    for node in element.descendants() {
+        let in_button = node
+            .ancestors()
+            .take_while(|ancestor| ancestor.id() != element.id())
+            .any(|ancestor| matches!(ancestor.value(), Node::Element(tag) if tag.name() == "button"));
+        match node.value() {
+            _ if in_button => {}
+            Node::Text(part) => text.push_str(part),
+            Node::Element(tag) if tag.name() == "br" => text.push('\n'),
+            _ => {}
+        }
+    }
+    text.lines()
+        .map(squeezed)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+fn encoded(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The random wait between two LinkedIn page loads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pacing {
+    pub least: Duration,
+    pub most: Duration,
+}
+
+/// Slow enough to read like a person clicking through.
+pub const PACING: Pacing = Pacing {
+    least: Duration::from_secs(8),
+    most: Duration::from_secs(20),
+};
+
+impl Pacing {
+    /// The wait for a roll of the dice between 0 and 1.
+    pub fn wait(&self, roll: f64) -> Duration {
+        self.least + (self.most - self.least).mul_f64(roll.clamp(0.0, 1.0))
+    }
+}
+
+/// The LinkedIn pages one run may still load, and the wait before the next one.
+#[derive(Debug)]
+pub struct Visits {
+    left: usize,
+    pacing: Pacing,
+    loaded: usize,
+}
+
+impl Visits {
+    pub fn new(cap: usize, pacing: Pacing) -> Self {
+        Self {
+            left: cap,
+            pacing,
+            loaded: 0,
+        }
+    }
+
+    /// Takes one page from the cap. Gives the wait before loading it, or `None` when the cap is spent.
+    /// The first page of a run loads at once.
+    pub fn next(&mut self, roll: f64) -> Option<Duration> {
+        self.left = self.left.checked_sub(1)?;
+        self.loaded += 1;
+        Some(if self.loaded == 1 {
+            Duration::ZERO
+        } else {
+            self.pacing.wait(roll)
+        })
+    }
+
+    pub fn loaded(&self) -> usize {
+        self.loaded
+    }
+}
+
+/// Why LinkedIn work stopped.
+#[derive(Debug, PartialEq)]
+pub enum Stop {
+    /// The run used every page it may load.
+    CapReached,
+    /// LinkedIn showed a sign-in page or a security check. Nothing more should load today.
+    SignedOut(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapReached => f.write_str("the run reached its cap of LinkedIn pages"),
+            Self::SignedOut(at) => write!(f, "LinkedIn is not signed in, or asks for a check ({at})"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<PageError> for Stop {
+    fn from(error: PageError) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+/// True for an address LinkedIn sends a visitor to when it will not show the page.
+pub fn is_wall(address: &str) -> bool {
+    ["/login", "/authwall", "/checkpoint", "/uas/", "/signup"]
+        .iter()
+        .any(|wall| address.contains(wall))
+}
+
+/// One background tab in the user's Chrome that loads LinkedIn pages, within a cap and at a person's pace.
+pub struct Reader {
+    page: Page,
+    visits: Visits,
+}
+
+/// Presses "more" on each post LinkedIn cut short, so its full text is in the page. Most posts
+/// carry their full text already; a cut-short one ends with `…`.
+const EXPAND_POSTS: &str = r#"(async () => {
+    for (const box of document.querySelectorAll('[data-testid="expandable-text-box"]')) {
+        const more = box.querySelector('[data-testid="expandable-text-button"]');
+        const text = box.textContent.replace(more?.textContent ?? "", "").trim();
+        if (more && text.endsWith("…")) more.click();
+    }
+    await new Promise((done) => setTimeout(done, 1500));
+    return true;
+})()"#;
+
+impl Reader {
+    /// Opens a tab behind the user's current one. Chrome shows its debugging bar until `close`.
+    pub async fn open(bridge: Arc<Bridge>, cap: usize) -> Result<Self, Stop> {
+        let failed = |error: BridgeError| Stop::Failed(error.to_string());
+        let connection = *bridge
+            .connections()
+            .first()
+            .ok_or_else(|| failed(BridgeError::NotConnected))?;
+        let opened = bridge
+            .request(
+                connection,
+                &Command::OpenTab {
+                    url: "about:blank".into(),
+                    active: false,
+                },
+            )
+            .await
+            .map_err(failed)?;
+        let tab = opened_tab(connection, &opened, false)?;
+        let page = Page::attach(bridge, &tab).await?;
+        Ok(Self {
+            page,
+            visits: Visits::new(cap, PACING),
+        })
+    }
+
+    /// Loads a page after the pacing wait and gives its HTML. `expand` opens cut-short posts first.
+    pub async fn load(&mut self, address: &str, expand: bool) -> Result<String, Stop> {
+        let wait = self.visits.next(fastrand::f64()).ok_or(Stop::CapReached)?;
+        tokio::time::sleep(wait).await;
+        self.page.navigate(address).await?;
+        // LinkedIn draws its results after the load event.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let landed = self.page.evaluate("location.href").await?;
+        let landed = landed.as_str().unwrap_or_default();
+        if is_wall(landed) {
+            return Err(Stop::SignedOut(landed.to_owned()));
+        }
+        if expand {
+            self.page.evaluate(EXPAND_POSTS).await?;
+        }
+        let html = self.page.evaluate("document.documentElement.outerHTML").await?;
+        Ok(html.as_str().unwrap_or_default().to_owned())
+    }
+
+    /// How many pages this reader loaded.
+    pub fn loaded(&self) -> usize {
+        self.visits.loaded()
+    }
+
+    /// Closes the tab. A failure leaves an idle tab behind, which does no harm.
+    pub async fn close(self) {
+        let _ = self.page.send("Page.close", json!({})).await;
+        let _ = self.page.detach().await;
+    }
+}
+
+fn opened_tab(connection: crate::bridge::ConnectionId, opened: &Value, active: bool) -> Result<Tab, Stop> {
+    let number = |key: &str| {
+        opened[key]
+            .as_i64()
+            .and_then(|number| i32::try_from(number).ok())
+            .ok_or_else(|| Stop::Failed("Chrome did not say which tab it opened".into()))
+    };
+    Ok(Tab {
+        connection,
+        tab: BrowserTab {
+            id: number("id")?,
+            window_id: number("windowId")?,
+            title: String::new(),
+            url: String::new(),
+            active,
+        },
+    })
+}
+
+/// Where on LinkedIn a draft goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Slot {
+    /// The note on a connection request: about 300 characters, no attachment.
+    Note,
+    /// A direct message, which only a connection can receive.
+    Message,
+}
+
+impl Slot {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Message => "message",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "note" => Some(Self::Note),
+            "message" => Some(Self::Message),
+            _ => None,
+        }
+    }
+
+    /// A connection gets a message; anyone else gets a connection note first.
+    pub fn for_degree(degree: Option<&str>) -> Self {
+        if degree == Some("1st") {
+            Self::Message
+        } else {
+            Self::Note
+        }
+    }
+}
+
+/// The longest connection note LinkedIn takes.
+pub const NOTE_LIMIT: usize = 300;
+
+/// The only things the typing flow ever clicks. There is no Send here, on purpose:
+/// the user reads the typed draft and clicks Send in Chrome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Control {
+    Message,
+    Connect,
+    MoreActions,
+    ConnectInMenu,
+    AddNote,
+}
+
+impl Control {
+    #[cfg(test)]
+    const ALL: [Control; 5] = [
+        Control::Message,
+        Control::Connect,
+        Control::MoreActions,
+        Control::ConnectInMenu,
+        Control::AddNote,
+    ];
+
+    fn locator(self) -> Locator {
+        // The profile's top card is the first profile card; other people's Connect and Message
+        // controls fill the side column, outside it. The card draws each control twice, once per
+        // layout, so only a control that takes up room on the screen counts.
+        let in_card = |test: &str| {
+            format!(
+                r#"(() => {{
+                    const card = document.querySelector('[componentkey^="com.linkedin.sdui.profile.card"]')
+                        || document.querySelector("main section");
+                    if (!card) return null;
+                    return [...card.querySelectorAll("button, a")].find((control) => {{
+                        if (!control.getClientRects().length) return false;
+                        const label = (control.getAttribute("aria-label") || "").trim();
+                        const text = control.innerText.trim();
+                        const href = control.getAttribute("href") || "";
+                        return {test};
+                    }}) || null;
+                }})()"#
+            )
+        };
+        let (name, script) = match self {
+            Control::Message => (
+                "Message button",
+                in_card(r#"href.includes("/messaging/compose") || /^Message\b/i.test(label) || text === "Message""#),
+            ),
+            Control::Connect => (
+                "Connect button",
+                in_card(r#"/^Invite .* to connect$/i.test(label) || text === "Connect""#),
+            ),
+            Control::MoreActions => (
+                "More button",
+                in_card(r#"label === "More" || label === "More actions" || text === "More""#),
+            ),
+            Control::ConnectInMenu => (
+                "Connect in the More menu",
+                r#"[...document.querySelectorAll("[role='menu'], .artdeco-dropdown__content")]
+                    .flatMap((menu) => [...menu.querySelectorAll("[role='menuitem'], [role='button'], button, a")])
+                    .find((item) => item.getClientRects().length
+                        && (/^Invite .* to connect$/i.test(item.getAttribute("aria-label") || "")
+                            || item.innerText.trim() === "Connect")) || null"#
+                    .to_owned(),
+            ),
+            Control::AddNote => (
+                "Add a note button",
+                r#"[...document.querySelectorAll("[role='dialog'] button")]
+                    .find((button) => (button.getAttribute("aria-label") || button.innerText).trim() === "Add a note") || null"#
+                    .to_owned(),
+            ),
+        };
+        Locator::script(name, script)
+    }
+}
+
+const NOTE_FIELD: &str = "document.querySelector(\"[role='dialog'] textarea[name='message'], textarea#custom-message, \
+                          [role='dialog'] textarea\")";
+/// The message box, and never a comment box on the profile's posts.
+const MESSAGE_FIELD: &str = r#"[...document.querySelectorAll("[contenteditable='true']")]
+    .filter((box) => box.closest(".msg-form")
+        || /message/i.test(box.getAttribute("aria-label") || box.getAttribute("aria-placeholder") || ""))
+    .pop() || null"#;
+/// LinkedIn asks for the person's email before some connection requests. Maverick never invents one.
+const EMAIL_WALL: &str =
+    "document.querySelector(\"[role='dialog'] input[name='email'], [role='dialog'] input[type='email']\")";
+
+const STEP_WAIT: Duration = Duration::from_secs(10);
+
+/// Opens the person's profile in the user's Chrome, opens the message or connection dialog,
+/// and types the approved draft. It stops there: the user reviews it and clicks Send.
+pub async fn type_draft(bridge: Arc<Bridge>, profile_url: &str, slot: Slot, text: &str) -> Result<(), String> {
+    if !profile_url.starts_with(&format!("{SITE}/in/")) {
+        return Err(format!("{profile_url} is not a LinkedIn profile"));
+    }
+    let said = |error: BridgeError| error.to_string();
+    let connection = *bridge
+        .connections()
+        .first()
+        .ok_or_else(|| said(BridgeError::NotConnected))?;
+    let blank = Command::OpenTab {
+        url: "about:blank".into(),
+        active: true,
+    };
+    let opened = bridge.request(connection, &blank).await.map_err(said)?;
+    let tab = opened_tab(connection, &opened, true).map_err(|stop| stop.to_string())?;
+    let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
+    let typed = type_in(&page, profile_url, slot, text).await;
+    // The debugging bar goes away; the dialog and the typed draft stay for the user.
+    let _ = page.detach().await;
+    typed
+}
+
+async fn type_in(page: &Page, profile_url: &str, slot: Slot, text: &str) -> Result<(), String> {
+    let said = |error: PageError| error.to_string();
+    page.navigate(profile_url).await.map_err(said)?;
+    let landed = page.evaluate("location.href").await.map_err(said)?;
+    if is_wall(landed.as_str().unwrap_or_default()) {
+        return Err("LinkedIn is not signed in in this Chrome".into());
+    }
+    let found = |control: Control| async move {
+        page.wait_for(&control.locator(), STEP_WAIT)
+            .await
+            .map(|()| control)
+            .map_err(said)
+    };
+    let field = match slot {
+        Slot::Message => {
+            let message = found(Control::Message)
+                .await
+                .map_err(|_| "the profile has no Message button, so this person may not be a connection".to_owned())?;
+            page.click(&message.locator()).await.map_err(said)?;
+            Locator::script("message box", MESSAGE_FIELD)
+        }
+        Slot::Note => {
+            if let Ok(connect) = found(Control::Connect).await {
+                page.click(&connect.locator()).await.map_err(said)?;
+            } else {
+                let more = found(Control::MoreActions).await.map_err(|_| {
+                    "the profile shows no Connect button; the request may be pending already".to_owned()
+                })?;
+                page.click(&more.locator()).await.map_err(said)?;
+                let connect = found(Control::ConnectInMenu)
+                    .await
+                    .map_err(|_| "the profile offers no Connect action".to_owned())?;
+                page.click(&connect.locator()).await.map_err(said)?;
+            }
+            let add_note = found(Control::AddNote).await;
+            if page.evaluate(&format!("!!({EMAIL_WALL})")).await.map_err(said)? == true {
+                return Err("LinkedIn asks for this person's email address before connecting. \
+                            Maverick stopped; enter it yourself if you know it."
+                    .into());
+            }
+            let add_note = add_note.map_err(|_| "the connection dialog has no Add a note button".to_owned())?;
+            page.click(&add_note.locator()).await.map_err(said)?;
+            Locator::script("note box", NOTE_FIELD)
+        }
+    };
+    page.wait_for(&field, STEP_WAIT).await.map_err(said)?;
+    page.fill(&field, text).await.map_err(said)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONNECTIONS: &str = "Notes:\n\
+\"When exporting your connection data, you may notice that some of the email addresses are missing.\"\n\
+\n\
+First Name,Last Name,URL,Email Address,Company,Position,Connected On\n\
+Ada,Example,https://www.linkedin.com/in/ada-example-1a2b3c,,Example Co,\"Software Engineer, Storage\",15 Nov 2026\n\
+Bo,Sample,https://www.linkedin.com/in/bo-sample?trk=x,bo@sample.test,Sample Inc,\"Recruiter, \"\"Tech\"\"\",02 Jan 2025\n\
+Cy,Nolink,,,Other LLC,Engineer,\n";
+
+    #[test]
+    fn the_connections_export_is_read_past_its_notes() {
+        let read = read_connections(CONNECTIONS).unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(
+            read[0],
+            Connection {
+                first_name: "Ada".into(),
+                last_name: "Example".into(),
+                profile_url: Some("https://www.linkedin.com/in/ada-example-1a2b3c/".into()),
+                email: None,
+                company: "Example Co".into(),
+                position: "Software Engineer, Storage".into(),
+                connected_on: Some(jiff::civil::date(2026, 11, 15)),
+            }
+        );
+        assert_eq!(read[1].position, "Recruiter, \"Tech\"");
+        assert_eq!(read[1].email.as_deref(), Some("bo@sample.test"));
+        assert_eq!(
+            read[1].profile_url.as_deref(),
+            Some("https://www.linkedin.com/in/bo-sample/")
+        );
+        assert_eq!(read[2].profile_url, None);
+        assert_eq!(read[2].connected_on, None);
+        assert!(read_connections("Name,Company\nA,B\n").is_err());
+    }
+
+    #[test]
+    fn companies_match_by_name_and_by_parent() {
+        assert!(same_company("Example Co, Inc.", "example co"));
+        assert!(same_company("Example", "Example Robotics"));
+        assert!(same_company("Amazon", "Amazon Web Services (AWS)"));
+        assert!(same_company("AWS", "Amazon"));
+        assert!(!same_company("Example", "Examples"));
+        assert!(!same_company("Amazon", "Google"));
+        assert!(!same_company("", "Example"));
+        assert_eq!(company_slug("Example Labs, Inc."), "example-labs");
+    }
+
+    #[test]
+    fn the_headline_says_whether_the_poster_works_at_the_company() {
+        assert_eq!(
+            poster_check("Engineering Manager at Example Co | Hiring", "Example"),
+            PosterCheck::WorksThere
+        );
+        assert_eq!(
+            poster_check("Senior SWE @AWS · ex-Sample", "Amazon"),
+            PosterCheck::WorksThere
+        );
+        assert_eq!(
+            poster_check(
+                "Technical Recruiter at Talent Agency - hiring for top startups",
+                "Example"
+            ),
+            PosterCheck::Elsewhere
+        );
+        assert_eq!(
+            poster_check("Helping engineers find jobs", "Example"),
+            PosterCheck::Unclear
+        );
+    }
+
+    /// Made up, shaped like the real page on 2026-11-23: hashed classes, cards as list items,
+    /// the company only in the title and an h2, and an alumni list after the main one.
+    const PEOPLE: &str = r#"<html><head><title>Example Co: People | LinkedIn</title></head><body><main>
+<h2 class="cfsq1">Example Co</h2>
+<h2 class="cfsq1">1,204 associated members</h2>
+<h3 class="cfsz9">How you are connected</h3>
+<div class="cfsa1 cfsb2">
+ <div role="listitem" class="cfsk3" componentkey="auto-component-1">
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/?miniProfileUrn=x" class="cfsp0"><img alt="Ada Example’s profile picture" class="cfsi1"></a>
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsn2"><span class="cfsn3">Ada Example</span></a>
+  <span aria-hidden="true" class="cfsd4">· 2nd</span>
+  <div class="cfsh5"><a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsh6">Software Engineer, Storage Infrastructure</a></div>
+  <p class="cfsm7">Bo Sample is a mutual connection</p>
+  <button class="cfsb8" aria-label="Invite Ada Example to connect"><span>Connect</span></button>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-2">
+  <a href="https://www.linkedin.com/in/cy-person/" class="cfsn2"><span>Cy Person</span></a>
+  <span aria-hidden="true" class="cfsd4">· 3rd</span>
+  <div class="cfsh5">Head of Marketing</div>
+  <p class="cfsm7">Based on your profile</p>
+  <button class="cfsb8"><span>Follow</span></button>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-3">
+  <a href="https://www.linkedin.com/in/ada-example-1a2b3c/" class="cfsn2"><span>Ada Example</span></a>
+ </div>
+ <div role="listitem" class="cfsk3" componentkey="auto-component-4"><span>People highlights</span></div>
+</div>
+<h2 class="cfsq1">People also viewed</h2>
+<div class="cfsa1">
+ <div role="listitem" class="cfsk3"><a href="https://www.linkedin.com/company/other-co/"><span>Other Co</span></a><p>Software Development</p><p>297 followers</p>
+  <p><span><a href="https://www.linkedin.com/in/fay-friend/">1 person in your network works here</a></span></p><button>Follow</button></div>
+</div>
+<h2 class="cfsq1">Alumni who work here</h2>
+<div class="cfsa1">
+ <div role="listitem" class="cfsk3"><a href="https://www.linkedin.com/in/di-alum/"><span>Di Alum</span></a><span>· 2nd</span><div>Engineer</div><button>Connect</button></div>
+</div>
+</main></body></html>"#;
+
+    #[test]
+    fn a_people_page_gives_named_cards_with_title_profile_and_degree() {
+        let page = people_page(PEOPLE);
+        assert_eq!(page.company.as_deref(), Some("Example Co"));
+        assert_eq!(
+            page.people,
+            [
+                Person {
+                    name: "Ada Example".into(),
+                    title: "Software Engineer, Storage Infrastructure".into(),
+                    profile_url: Some("https://www.linkedin.com/in/ada-example-1a2b3c/".into()),
+                    degree: Some("2nd".into()),
+                },
+                Person {
+                    name: "Cy Person".into(),
+                    title: "Head of Marketing".into(),
+                    profile_url: Some("https://www.linkedin.com/in/cy-person/".into()),
+                    degree: Some("3rd".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            people_address("example-co"),
+            "https://www.linkedin.com/company/example-co/people/"
+        );
+        // A wrong guess at the address lands on a page that is not a company's People page.
+        let missing = "<html><head><title>(2) Page not found | LinkedIn</title></head><body></body></html>";
+        assert_eq!(people_page(missing).company, None);
+    }
+
+    #[test]
+    fn a_page_names_the_company_page_it_links_most() {
+        let footer = r#"<a href="https://www.linkedin.com/company/linkedin/">us</a>
+            <a href="https://twitter.com/x">x</a>
+            <a href="https://www.linkedin.com/company/example-co-ai/">LinkedIn</a>
+            <a href="https://linkedin.com/company/Example-Co-AI?trk=footer">LinkedIn</a>
+            <a href="https://www.linkedin.com/company/partner-co/">partner</a>"#;
+        assert_eq!(company_pages_in(footer), ["example-co-ai", "partner-co"]);
+        assert!(company_pages_in("<p>no links</p>").is_empty());
+        let ashby = r#"{"organization":{"name":"Example Co","publicWebsite":"https://example.com/","x":1}}"#;
+        assert_eq!(company_website_in(ashby).as_deref(), Some("https://example.com/"));
+        assert_eq!(company_website_in(r#"{"publicWebsite":""}"#), None);
+    }
+
+    /// Made up, shaped like the real search page on 2026-11-23: each post a list item keyed
+    /// `update-card-focus…`, no post id in the card, the text in an expandable box.
+    const POSTS: &str = r#"<html><head><title>Search | LinkedIn</title></head><body><main>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusAbCdEf0123FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/sam-poster/?miniProfileUrn=x" aria-label="Sam Poster Verified Premium 2nd"><img alt=""></a>
+  <a href="https://www.linkedin.com/in/sam-poster/"><span class="cfsa2">Sam Poster</span><span class="cfsa3">• 2nd</span></a>
+  <p class="cfsa4">Engineering Manager at Example Co</p>
+  <p class="cfsa5">2h •</p>
+  <button class="cfsf6">Follow</button>
+  <div class="cfsb7"><span data-testid="expandable-text-box" class="cfsb8">We're hiring new grad backend engineers!<br>Team: Storage.   Location: Austin, TX<br><br>Apply below.<button data-testid="expandable-text-button" aria-hidden="true">… more</button></span></div>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusZz99FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/company/jobs-digest/"><span>Jobs Digest</span></a>
+  <p class="cfsa5">21h •</p>
+  <span data-testid="expandable-text-box">Top 50 companies hiring this week, and the first ten are…<button data-testid="expandable-text-button">… more</button></span>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusQq11FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/sam-poster/"><span>Sam Poster</span><span>• 2nd</span></a>
+  <p>Engineering Manager at Example Co</p>
+  <p>2h •</p>
+  <span data-testid="expandable-text-box">We're hiring new grad backend engineers!<br>Team: Storage.   Location: Austin, TX<br><br>Apply below.<button data-testid="expandable-text-button">… more</button></span>
+</div>
+<div role="listitem" class="cfsx1" componentkey="update-card-focusRr22FeedType_FLAGSHIP_SEARCH">
+  <h2 class="cfsv0">Feed post</h2>
+  <a href="https://www.linkedin.com/in/eve-new/"><span>Eve New</span><span>• 3rd+</span></a>
+  <p>--</p>
+  <p>7h •</p>
+  <span data-testid="expandable-text-box">Hiring a platform engineer.<button data-testid="expandable-text-button">… more</button></span>
+</div>
+</main></body></html>"#;
+
+    #[test]
+    fn a_search_page_gives_each_post_once_with_its_author_and_full_text() {
+        let posts = posts_page(POSTS);
+        assert_eq!(posts.len(), 3);
+        assert_eq!(
+            posts[0],
+            Post {
+                poster: "Sam Poster".into(),
+                poster_url: Some("https://www.linkedin.com/in/sam-poster/".into()),
+                headline: "Engineering Manager at Example Co".into(),
+                degree: Some("2nd".into()),
+                text: "We're hiring new grad backend engineers!\nTeam: Storage. Location: Austin, TX\n\nApply below."
+                    .into(),
+                complete: true,
+            }
+        );
+        assert!(!posts[0].is_connection());
+        assert_eq!(
+            (
+                posts[1].poster.as_str(),
+                posts[1].poster_url.as_deref(),
+                posts[1].complete
+            ),
+            ("Jobs Digest", None, false)
+        );
+        assert_eq!(
+            (posts[2].headline.as_str(), posts[2].degree.as_deref()),
+            ("", Some("3rd+"))
+        );
+        // The same post gives the same link on every page; another post by the same poster does not.
+        let link = posts[0].link();
+        assert!(link.starts_with("https://www.linkedin.com/in/sam-poster/recent-activity/all/#post-"));
+        assert_eq!(link, posts_page(POSTS)[0].link());
+        let other = Post {
+            text: "We're hiring interns too.".into(),
+            ..posts[0].clone()
+        };
+        assert_ne!(other.link(), link);
+    }
+
+    #[test]
+    fn walls_and_profiles_are_recognized() {
+        assert!(is_wall("https://www.linkedin.com/checkpoint/challenge/abc"));
+        assert!(is_wall("https://www.linkedin.com/authwall?trk=x"));
+        assert!(!is_wall("https://www.linkedin.com/company/example/people/"));
+        assert_eq!(
+            profile_address("https://www.linkedin.com/in/ada/recent-activity/?x=1"),
+            "https://www.linkedin.com/in/ada/"
+        );
+    }
+
+    #[test]
+    fn page_loads_keep_to_the_cap_and_wait_a_random_while_between() {
+        let pacing = Pacing {
+            least: Duration::from_secs(8),
+            most: Duration::from_secs(20),
+        };
+        assert_eq!(pacing.wait(0.0), Duration::from_secs(8));
+        assert_eq!(pacing.wait(0.5), Duration::from_secs(14));
+        assert_eq!(pacing.wait(7.0), Duration::from_secs(20));
+        let mut visits = Visits::new(3, pacing);
+        assert_eq!(visits.next(0.9), Some(Duration::ZERO));
+        for _ in 0..2 {
+            let wait = visits.next(fastrand::f64()).unwrap();
+            assert!((pacing.least..=pacing.most).contains(&wait));
+        }
+        assert_eq!(visits.next(0.5), None);
+        assert_eq!(visits.next(0.5), None);
+        assert_eq!(visits.loaded(), 3);
+        assert!(PACING.least >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn nothing_the_typing_flow_clicks_is_a_send_button() {
+        for control in Control::ALL {
+            let locator = control.locator();
+            let script = locator.as_script().to_lowercase();
+            assert!(!script.contains("send"), "{control:?} could reach a Send button");
+            assert!(!script.contains("submit"), "{control:?} could reach a submit button");
+        }
+        assert_eq!(Slot::for_degree(Some("1st")), Slot::Message);
+        assert_eq!(Slot::for_degree(Some("2nd")), Slot::Note);
+        assert_eq!(Slot::for_degree(None), Slot::Note);
+    }
+}

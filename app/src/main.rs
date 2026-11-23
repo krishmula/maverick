@@ -8,6 +8,7 @@ mod jobs;
 mod main_view;
 mod mav;
 mod models;
+mod outreach;
 mod pane_widths;
 mod queue;
 mod report;
@@ -59,6 +60,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("google") => return cli::google(&arguments.collect::<Vec<_>>()),
         Some("ticktick") => return cli::ticktick(&arguments.collect::<Vec<_>>()),
         Some("models") => return cli::models(&arguments.collect::<Vec<_>>()),
+        Some("linkedin") => return cli::linkedin(&arguments.collect::<Vec<_>>()),
         Some("mav") => return cli::mav(&arguments.collect::<Vec<_>>().join(" ")),
         Some("score") => {
             let mut limit = maverick_core::score::RUN_CAP;
@@ -166,6 +168,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     let mut view = MainView::new(browser, lists, icon_file, !setup::done(), window, cx);
                     if let Some(funnel) = funnel {
                         view.run_funnel(funnel, window, cx);
+                        view.run_outreach(window, cx);
                     }
                     view
                 })
