@@ -1,4 +1,5 @@
 mod band;
+mod board;
 mod browser;
 mod cli;
 mod connections;
@@ -135,7 +136,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     cx,
                 )
             });
-            let (jobs, cells) = schedule::stored_jobs(database.as_deref());
+            let lists = schedule::stored_lists(database.as_deref());
             let funnel = database
                 .clone()
                 .zip(answers_file.clone())
@@ -158,7 +159,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
-                    let mut view = MainView::new(browser, jobs, cells, icon_file, !setup::done(), window, cx);
+                    let mut view = MainView::new(browser, lists, icon_file, !setup::done(), window, cx);
                     if let Some(funnel) = funnel {
                         view.run_funnel(funnel, window, cx);
                     }

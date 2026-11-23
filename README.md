@@ -44,7 +44,7 @@ After an app update, Maverick asks the extension to reload itself. Extension 0.2
 
 ## The window
 
-The bar at the top switches between the **jobs** and **tabs** lists and the **mav** view, and shows the link to Chrome. **connections** at the right end sets up Google, TickTick, the model and Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
+The bar at the top switches between the **jobs** list, the **approvals** board, the **tabs** list and the **mav** view, and shows the link to Chrome. **connections** at the right end sets up Google, TickTick, the model and Chrome. The number next to **mav** counts the TickTick tasks that are overdue or due today. Click the link to measure the round trip again.
 
 On the jobs and tabs lists, the band is under the bar. Each cell is one posting from your tracker, oldest at the left:
 
@@ -323,6 +323,17 @@ From then on, each funnel pass does the following:
 3. It scores what is still found and writes each decision back: Status, Score, Variant, Flags and Notes.
 
 A decision goes only into a row whose Status still says Found when Maverick writes. So if another scorer works on the same sheet, Maverick never overwrites its decisions.
+
+## Approve or skip postings
+
+**approvals** in the bar opens the decision board. The number next to it counts the postings that wait on a decision. The window opens on the board while any wait.
+
+- **Pending** lists the postings in Review or Found that you have not applied to. Each row shows the score, the company, the application system, the variant, the found date, the location, the flags, and a sponsorship badge: sponsors, no sponsorship, or unknown.
+- Sort by **top score** (apply-ready first, the default) or by **latest** found. Decided rows always sort below pending ones.
+- Press `a` to approve the selected posting and `s` to skip it, or click **approve** or **skip**. The selection moves to the next pending posting. `⌘Z` or **undo** takes back the last decision.
+- **Submitted** lists the applications, latest first or by company.
+
+Decisions stay in the local database, apart from the postings, so a sheet sync or a tracker import never undoes them. They are not written to the sheet: the sheet only takes decisions on rows that still say Found, and an approval has no sheet status. A posting you skip leaves the jobs list.
 
 ## Find new postings
 

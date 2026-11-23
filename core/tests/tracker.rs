@@ -2,7 +2,9 @@ use std::io::{Cursor, Write};
 
 use jiff::Timestamp;
 use jiff::civil::date;
-use maverick_core::jobs::{Application, ApplicationStatus, HiringPost, Outreach, Posting, Sponsorship, Stage};
+use maverick_core::jobs::{
+    Application, ApplicationStatus, Decision, HiringPost, Outreach, Posting, Sponsorship, Stage,
+};
 use maverick_core::store::{Store, Summary};
 use maverick_core::tracker::{self, RowProblem, Tracker, TrackerError};
 use zip::ZipWriter;
@@ -584,6 +586,54 @@ fn scoring_decisions_survive_a_reopen_and_a_repeated_import_keeps_the_address() 
     let after_import = &reopened.postings().unwrap()[0];
     assert_eq!(after_import.address, scored.address);
     assert_eq!(after_import.sponsorship, scored.sponsorship);
+}
+
+#[test]
+fn a_decision_survives_a_sheet_sync_that_rewrites_its_posting_and_can_be_taken_back() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("maverick.db");
+    let mut store = Store::open(&path).unwrap();
+    let posting = |link: &str, title: &str| Posting {
+        link: link.into(),
+        found_at: "2026-11-01T00:00:00Z".parse().unwrap(),
+        source: "Board".into(),
+        company: "Example Co".into(),
+        title: title.into(),
+        location: None,
+        email_subject: None,
+        stage: Stage::Review,
+        score: Some(70),
+        variant: None,
+        flags: None,
+        notes: None,
+        address: None,
+        sponsorship: None,
+    };
+    let (first, second) = ("https://board.example.com/p/1", "https://board.example.com/p/2");
+    let tracker = Tracker {
+        postings: vec![posting(first, "Backend Engineer"), posting(second, "Data Engineer")],
+        ..Tracker::default()
+    };
+    store.save_tracker(&tracker).unwrap();
+    store.decide(first, Some(Decision::Approved)).unwrap();
+    store.decide(second, Some(Decision::Approved)).unwrap();
+    store.decide(second, Some(Decision::Skipped)).unwrap();
+    drop(store);
+
+    let mut reopened = Store::open(&path).unwrap();
+    let renamed = Tracker {
+        postings: vec![posting(first, "Backend Engineer II"), posting(second, "Data Engineer")],
+        ..Tracker::default()
+    };
+    reopened.save_tracker(&renamed).unwrap();
+    let decisions = reopened.decisions().unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[first], Decision::Approved);
+    assert_eq!(decisions[second], Decision::Skipped);
+    assert_eq!(reopened.postings().unwrap()[0].stage, Stage::Review);
+
+    reopened.decide(second, None).unwrap();
+    assert_eq!(reopened.decisions().unwrap().keys().collect::<Vec<_>>(), [first]);
 }
 
 #[test]
