@@ -134,7 +134,7 @@ impl Kind {
                 Ok(date) => date.strftime("%B %-d, %Y").to_string(),
                 Err(_) => stated.to_owned(),
             })),
-            Self::Location => Ok(Answer::Text(stated.to_owned())),
+            Self::Location => Ok(Answer::Text(as_searched(stated))),
             Self::YesNo => match stated.to_lowercase().as_str() {
                 "yes" => Ok(Answer::YesNo(true)),
                 "no" => Ok(Answer::YesNo(false)),
@@ -227,6 +227,80 @@ fn asks_for_part_of_a_name(title: &str) -> bool {
 /// Lower case, with each run of white space as one space.
 fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// US states and their postal codes. Location searches list places by the state's name.
+const STATES: [(&str, &str); 51] = [
+    ("AL", "Alabama"),
+    ("AK", "Alaska"),
+    ("AZ", "Arizona"),
+    ("AR", "Arkansas"),
+    ("CA", "California"),
+    ("CO", "Colorado"),
+    ("CT", "Connecticut"),
+    ("DE", "Delaware"),
+    ("DC", "District of Columbia"),
+    ("FL", "Florida"),
+    ("GA", "Georgia"),
+    ("HI", "Hawaii"),
+    ("ID", "Idaho"),
+    ("IL", "Illinois"),
+    ("IN", "Indiana"),
+    ("IA", "Iowa"),
+    ("KS", "Kansas"),
+    ("KY", "Kentucky"),
+    ("LA", "Louisiana"),
+    ("ME", "Maine"),
+    ("MD", "Maryland"),
+    ("MA", "Massachusetts"),
+    ("MI", "Michigan"),
+    ("MN", "Minnesota"),
+    ("MS", "Mississippi"),
+    ("MO", "Missouri"),
+    ("MT", "Montana"),
+    ("NE", "Nebraska"),
+    ("NV", "Nevada"),
+    ("NH", "New Hampshire"),
+    ("NJ", "New Jersey"),
+    ("NM", "New Mexico"),
+    ("NY", "New York"),
+    ("NC", "North Carolina"),
+    ("ND", "North Dakota"),
+    ("OH", "Ohio"),
+    ("OK", "Oklahoma"),
+    ("OR", "Oregon"),
+    ("PA", "Pennsylvania"),
+    ("RI", "Rhode Island"),
+    ("SC", "South Carolina"),
+    ("SD", "South Dakota"),
+    ("TN", "Tennessee"),
+    ("TX", "Texas"),
+    ("UT", "Utah"),
+    ("VT", "Vermont"),
+    ("VA", "Virginia"),
+    ("WA", "Washington"),
+    ("WV", "West Virginia"),
+    ("WI", "Wisconsin"),
+    ("WY", "Wyoming"),
+];
+
+/// A place as location searches spell it. Ashby and Greenhouse list "Austin, Texas, United States",
+/// so a state's postal code and a short name of the country are written out.
+/// The city, the first part, stays as it is.
+fn as_searched(place: &str) -> String {
+    let mut parts = place.split(',').map(str::trim);
+    let city = parts.next().unwrap_or_default().to_owned();
+    let rest = parts.map(|part| {
+        let upper = part.to_uppercase();
+        match upper.as_str() {
+            "US" | "USA" | "U.S." | "U.S.A." => "United States".to_owned(),
+            _ => STATES
+                .iter()
+                .find(|(code, _)| *code == upper)
+                .map_or_else(|| part.to_owned(), |(_, name)| (*name).to_owned()),
+        }
+    });
+    std::iter::once(city).chain(rest).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -422,6 +496,24 @@ mod tests {
             role: None,
         };
         assert_eq!(answers.answer(&question), Err(Unanswered::NoRule));
+    }
+
+    #[test]
+    fn a_location_is_spelled_the_way_location_searches_list_places() {
+        let location = |stated: &str| Kind::Location.answer_from(stated);
+        assert_eq!(location("Austin, TX"), Ok(Answer::Text("Austin, Texas".into())));
+        assert_eq!(
+            location(" springfield , il, USA "),
+            Ok(Answer::Text("springfield, Illinois, United States".into()))
+        );
+        assert_eq!(
+            location("Springfield, Illinois"),
+            Ok(Answer::Text("Springfield, Illinois".into()))
+        );
+        // A city that looks like a code, and a part that is not a state, stay as written.
+        assert_eq!(location("Ca, Spain"), Ok(Answer::Text("Ca, Spain".into())));
+        assert_eq!(location("Toronto, ON"), Ok(Answer::Text("Toronto, ON".into())));
+        assert_eq!(location("Remote"), Ok(Answer::Text("Remote".into())));
     }
 
     #[test]
