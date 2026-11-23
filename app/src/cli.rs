@@ -637,8 +637,9 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::outreach;
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
-                         | type <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
-                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html>";
+                         | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | page <LinkedIn address> <out.html> | read <people|posts> <saved.html> \
+                         | dump-tab <out.html> [script]";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
@@ -737,6 +738,51 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
             println!("{} posts", posts.len());
         }
+        // Saves the open LinkedIn profile tab as it is now, dialogs included, or what `script` gives
+        // there. It reads only, so a stuck typing step can be fixed from the real page.
+        ["dump-tab", out, rest @ ..] => {
+            let html = runtime()?.block_on(async {
+                let bridge = chrome().await?;
+                let profile_tab = || match bridge.state() {
+                    maverick_core::bridge::BrowserState::Connected { tabs } => {
+                        let mut profiles: Vec<_> =
+                            tabs.into_iter().filter(|tab| tab.tab.url.contains("linkedin.com/in/")).collect();
+                        profiles.sort_by_key(|tab| !tab.tab.active);
+                        profiles.into_iter().next()
+                    }
+                    _ => None,
+                };
+                let mut tab = None;
+                for _ in 0..50 {
+                    tab = profile_tab();
+                    if tab.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                let tab = tab.ok_or_else(|| {
+                    let open = match bridge.state() {
+                        maverick_core::bridge::BrowserState::Connected { tabs } => tabs
+                            .iter()
+                            .map(|tab| format!("{:?}:{}", tab.connection, tab.tab.url.split('?').next().unwrap_or_default()))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        _ => String::new(),
+                    };
+                    format!("no LinkedIn profile tab is open ({open} tabs seen)")
+                })?;
+                let page = maverick_core::page::Page::attach(bridge, &tab).await.map_err(|e| e.to_string())?;
+                let script = r#"(() => { const out = [document.documentElement.outerHTML];
+                    for (const el of document.querySelectorAll('*')) if (el.shadowRoot) out.push('<!--SHADOW ' + el.tagName + '-->' + el.shadowRoot.innerHTML);
+                    for (const f of document.querySelectorAll('iframe')) { try { out.push('<!--IFRAME-->' + f.contentDocument.documentElement.outerHTML); } catch (e) { out.push('<!--IFRAME blocked ' + f.src + '-->'); } }
+                    return out.join('\n'); })()"#;
+                let script = rest.first().copied().unwrap_or(script);
+                let html = page.evaluate(script).await.map_err(|e| e.to_string());
+                let _ = page.detach().await;
+                html.map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            })?;
+            fs::write(out, html)?;
+        }
         ["drafts"] => {
             for draft in open_store()?.drafts()? {
                 println!(
@@ -748,8 +794,22 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     draft.profile_url,
                     draft.about.link()
                 );
+                if let Some(subject) = &draft.subject {
+                    println!("    subject: {subject}");
+                }
                 println!("    {}", draft.text.replace('\n', "\n    "));
             }
+        }
+        ["redraft", id] => {
+            let id: i64 = id.parse().map_err(|_| USAGE)?;
+            let profile = profile()?;
+            let draft = runtime()?.block_on(outreach::redraft(&database, &profile, id))?;
+            println!("#{} is now a {}.", draft.id, draft.slot.as_str());
+            if let Some(subject) = &draft.subject {
+                println!("    subject: {subject}");
+                println!("    Sending an InMail uses one of your InMail credits.");
+            }
+            println!("    {}", draft.text.replace('\n', "\n    "));
         }
         ["type", id] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;
@@ -760,7 +820,12 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         ["status", id, status] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;
             let status = Outreach::parse(&status.replace('-', "_")).ok_or(USAGE)?;
-            Store::open(&database)?.set_draft_status(id, status, jiff::Timestamp::now())?;
+            if status == Outreach::Drafted {
+                // Back to waiting for approval, as the Reset button does: only the draft changes.
+                Store::open(&database)?.reset_draft(id, jiff::Timestamp::now())?;
+            } else {
+                Store::open(&database)?.set_draft_status(id, status, jiff::Timestamp::now())?;
+            }
             println!("Draft #{id} is now {}.", status.as_str().replace('_', " "));
         }
         _ => return Err(USAGE.into()),
