@@ -357,7 +357,9 @@ Every hour while the app is open, Maverick looks on LinkedIn for people at the c
 
 ## Answer hiring posts
 
-**posts** in the bar opens the posts tab. Every two hours while the app is open, Maverick searches LinkedIn for posts about hiring new grads and backend or infrastructure engineers. It drafts a note to the poster for each post that fits, up to 10 a day. Each draft works the same way as a draft on the jobs tab: approve it, and Maverick types it, and you click Send. **check and sweep now** runs the people lookup and the post search at once.
+**posts** in the bar opens the posts tab. Every two hours while the app is open, Maverick runs five LinkedIn searches for posts about hiring software, backend and ML infrastructure engineers and new grads. It scrolls each result page up to three times and reads at most 40 new posts. It drafts a note to the poster for each post that fits, up to 10 a day. Each draft works the same way as a draft on the jobs tab: approve it, and Maverick types it, and you click Send. **check and sweep now** runs the people lookup and the post search at once.
+
+Below the drafts, **found, no draft** lists the newest 100 hiring posts that were not skipped and have no draft, from Maverick's searches and from the tracker's `Hiring Posts` tab. Each one shows why it has no draft, and **open post** opens it in your browser.
 
 ## Find new postings
 

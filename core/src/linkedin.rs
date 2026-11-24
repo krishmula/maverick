@@ -413,13 +413,16 @@ pub fn post_search_address(keywords: &str) -> String {
     )
 }
 
+/// One post on a content search page.
+const POST_CARD: &str = r#"[role="listitem"][componentkey^="update-card-focus"]"#;
+
 /// Reads the posts on a content search page. Each post is a list item whose texts start with the
 /// poster's link (name, then degree), then the headline and the age. The post's text sits in its
 /// expandable text box.
 pub fn posts_page(html: &str) -> Vec<Post> {
     let page = Html::parse_document(html);
     let mut posts: Vec<Post> = Vec::new();
-    for card in page.select(&selector("[role=\"listitem\"][componentkey^=\"update-card-focus\"]")) {
+    for card in page.select(&selector(POST_CARD)) {
         let Some(body) = card.select(&selector("[data-testid=\"expandable-text-box\"]")).next() else {
             continue;
         };
@@ -602,6 +605,31 @@ const EXPAND_POSTS: &str = r#"(async () => {
     return true;
 })()"#;
 
+/// The most times one search page is scrolled for more posts.
+const SCROLLS: usize = 3;
+
+/// Scrolls to the last post until LinkedIn stops adding more, at most `SCROLLS` times. A search
+/// page first shows only a screen of posts and loads the next ones when the last comes into view.
+/// Gives how many posts the page holds in the end.
+fn more_posts() -> String {
+    format!(
+        r#"(async () => {{
+    const posts = () => document.querySelectorAll('{POST_CARD}');
+    for (let scroll = 0; scroll < {SCROLLS}; scroll++) {{
+        const before = posts().length;
+        if (before === 0) break;
+        posts()[before - 1].scrollIntoView({{ block: "start" }});
+        const until = Date.now() + 5000;
+        while (posts().length === before && Date.now() < until) {{
+            await new Promise((done) => setTimeout(done, 500));
+        }}
+        if (posts().length === before) break;
+    }}
+    return posts().length;
+}})()"#
+    )
+}
+
 impl Reader {
     /// Opens a tab behind the user's current one. Chrome shows its debugging bar until `close`.
     pub async fn open(bridge: Arc<Bridge>, cap: usize) -> Result<Self, Stop> {
@@ -628,8 +656,9 @@ impl Reader {
         })
     }
 
-    /// Loads a page after the pacing wait and gives its HTML. `expand` opens cut-short posts first.
-    pub async fn load(&mut self, address: &str, expand: bool) -> Result<String, Stop> {
+    /// Loads a page after the pacing wait and gives its HTML. `posts` first scrolls a search page
+    /// for more posts and opens the cut-short ones.
+    pub async fn load(&mut self, address: &str, posts: bool) -> Result<String, Stop> {
         let wait = self.visits.next(fastrand::f64()).ok_or(Stop::CapReached)?;
         tokio::time::sleep(wait).await;
         self.page.navigate(address).await?;
@@ -640,7 +669,8 @@ impl Reader {
         if is_wall(landed) {
             return Err(Stop::SignedOut(landed.to_owned()));
         }
-        if expand {
+        if posts {
+            self.page.evaluate(&more_posts()).await?;
             self.page.evaluate(EXPAND_POSTS).await?;
         }
         let html = self.page.evaluate("document.documentElement.outerHTML").await?;

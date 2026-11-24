@@ -31,12 +31,18 @@ pub const LOOKUP_CAP: usize = 10;
 /// The most new hiring-post drafts in one Pacific day.
 pub const DRAFTS_PER_DAY: usize = 10;
 /// The most posts one sweep reads with the model.
-pub const POSTS_READ: usize = 20;
+pub const POSTS_READ: usize = 40;
 /// LinkedIn content searches for hiring posts. Each one is one page load.
+///
+/// Every search is a hiring phrase in quotes plus plain words. LinkedIn binds `OR` looser than the
+/// words around it, so `"we're hiring" backend OR infrastructure engineer` also matched every post
+/// that says "infrastructure" and "engineer", hiring or not.
 pub const SEARCHES: &[&str] = &[
-    "\"hiring\" \"new grad\" \"software engineer\"",
-    "\"we're hiring\" backend OR infrastructure engineer",
-    "\"hiring\" \"ML infrastructure\" OR \"AI infrastructure\" engineer",
+    "\"we're hiring\" software engineer",
+    "\"I'm hiring\" software engineer",
+    "\"hiring for\" backend engineer",
+    "\"hiring\" ML infrastructure engineer",
+    "\"hiring\" \"software engineer\" \"new grad\"",
 ];
 
 stored_enum! {
