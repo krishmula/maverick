@@ -19,8 +19,9 @@ use crate::bridge::Bridge;
 use crate::description::{self, Fetched};
 use crate::jobs::{HiringPost, Outreach, Posting, Stage, posting_address, stored_enum};
 use crate::linkedin::{
-    self, Connection, INMAIL_BODY_LIMIT, INMAIL_SUBJECT_LIMIT, NOTE_LIMIT, Person, Post, PosterCheck, Reader, Slot,
-    Stop, company_key, company_slug, people_address, people_page, post_search_address, posts_page, same_company,
+    self, Connection, First, INMAIL_BODY_LIMIT, INMAIL_SUBJECT_LIMIT, InMailCost, NOTE_LIMIT, Person, Post,
+    PosterCheck, Reader, Slot, Stop, Typed, company_key, company_slug, people_address, people_page,
+    post_search_address, posts_page, same_company,
 };
 use crate::providers::{self, Job};
 use crate::score::{self, APPLY_READY, Decision, Profile, Reading};
@@ -30,6 +31,8 @@ use crate::store::{Store, StoreError, stored};
 pub const LOOKUP_CAP: usize = 10;
 /// The most new hiring-post drafts in one Pacific day.
 pub const DRAFTS_PER_DAY: usize = 10;
+/// How long a saved count of no free InMail credits is believed.
+const CREDITS_FRESH: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 /// The most posts one sweep reads with the model.
 pub const POSTS_READ: usize = 40;
 /// LinkedIn content searches for hiring posts. Each one is one page load.
@@ -367,6 +370,15 @@ impl Store {
     /// Sets how far a draft has gone. A draft about a hiring post moves the post with it.
     pub fn set_draft_status(&mut self, id: i64, status: Outreach, at: Timestamp) -> Result<(), StoreError> {
         let write = self.db.transaction()?;
+        if status == Outreach::Sent {
+            // A sent InMail used a credit.
+            write.execute(
+                "UPDATE inmail_credits SET credits = max(credits - 1, 0)
+                 WHERE EXISTS (SELECT 1 FROM outreach_drafts
+                               WHERE id = ?1 AND slot = 'inmail' AND status NOT IN ('sent', 'replied'))",
+                [id],
+            )?;
+        }
         write.execute(
             "UPDATE outreach_drafts SET status = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, status.as_str(), at.to_string()],
@@ -415,6 +427,83 @@ impl Store {
             )
             .map_err(said)?;
         Ok(())
+    }
+
+    /// Keeps what a hiring post's page showed, so a draft can be written without loading it again.
+    pub fn save_post_reading(&self, post_link: &str, post: &Post, at: Timestamp) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO post_readings (post_link, poster, poster_url, headline, degree, text, read_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (post_link) DO UPDATE SET poster = excluded.poster, poster_url = excluded.poster_url,
+                 headline = excluded.headline, degree = excluded.degree, text = excluded.text,
+                 read_at = excluded.read_at",
+            params![
+                post_link,
+                post.poster,
+                post.poster_url,
+                post.headline,
+                post.degree,
+                post.text,
+                at.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// What the hiring post's page showed when Maverick last read it.
+    pub fn post_reading(&self, post_link: &str) -> Result<Option<Post>, StoreError> {
+        self.db
+            .query_row(
+                "SELECT poster, poster_url, headline, degree, text FROM post_readings WHERE post_link = ?1",
+                [post_link],
+                |row| {
+                    let text: String = row.get(4)?;
+                    Ok(Post {
+                        poster: row.get(0)?,
+                        poster_url: row.get(1)?,
+                        headline: row.get(2)?,
+                        degree: row.get(3)?,
+                        complete: !text.ends_with('…'),
+                        text,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Saves the InMail credits a LinkedIn message window said are left.
+    pub fn save_inmail_credits(&self, credits: u32, at: Timestamp) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO inmail_credits (id, credits, read_at) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET credits = excluded.credits, read_at = excluded.read_at",
+            params![credits, at.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The InMail credits no waiting draft has a claim on: the credits LinkedIn last showed, less
+    /// the InMail drafts not sent yet. `None` when LinkedIn must be asked: no count is saved, or
+    /// the saved count leaves none free and is over a day old, so a new month may have added some.
+    pub fn free_inmail_credits(&self, now: Timestamp) -> Result<Option<u32>, StoreError> {
+        let saved: Option<(u32, String)> = self
+            .db
+            .query_row("SELECT credits, read_at FROM inmail_credits WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let Some((credits, read_at)) = saved else {
+            return Ok(None);
+        };
+        let claimed: u32 = self.db.query_row(
+            "SELECT count(*) FROM outreach_drafts WHERE slot = 'inmail' AND status IN ('drafted', 'typed')",
+            [],
+            |row| row.get(0),
+        )?;
+        let free = credits.saturating_sub(claimed);
+        let fresh = read_at
+            .parse::<Timestamp>()
+            .is_ok_and(|read_at| now.duration_since(read_at) < CREDITS_FRESH);
+        Ok((free > 0 || fresh).then_some(free))
     }
 
     /// Puts a draft in another form, such as a note rewritten as an InMail.
@@ -852,7 +941,7 @@ async fn look_up(reader: &mut Option<Reader>, bridge: &Arc<Bridge>, company: &st
         *reader = Some(Reader::open(bridge.clone(), LOOKUP_CAP).await?);
     }
     let reader = reader.as_mut().expect("the reader was just opened");
-    let html = reader.load(&people_address(slug), false).await?;
+    let html = reader.load(&people_address(slug), First::Nothing).await?;
     let page = people_page(&html);
     match page.company {
         Some(name) if same_company(&name, company) => Ok(Lookup::Found(page.people)),
@@ -1155,7 +1244,7 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
         .map_err(|stop| stop.to_string())?;
     let mut posts: Vec<Post> = Vec::new();
     for search in SEARCHES {
-        match reader.load(&post_search_address(search), true).await {
+        match reader.load(&post_search_address(search), First::ScrollForPosts).await {
             Ok(html) => {
                 for post in posts_page(&html) {
                     if !posts.iter().any(|seen| seen.link() == post.link()) {
@@ -1227,15 +1316,12 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
             ));
             None
         } else {
-            let slot = Slot::for_degree(post.degree.as_deref());
+            let slot = Slot::to_reach(post.degree.as_deref(), inmail_credit_is_free(database));
             let ask = Ask {
                 slot,
                 person: &post.poster,
                 headline: &post.headline,
-                context: format!(
-                    "It is about this LinkedIn post, for the {} role at {}:\n{}",
-                    reading.role, reading.company, post.text
-                ),
+                context: post_context(&reading.role, &reading.company, &post.text),
             };
             match write_draft(profile, &ask).await {
                 Ok(written) => {
@@ -1270,6 +1356,12 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
         };
         let store = Store::open(database).map_err(said)?;
         store.add_hiring_post(&kept).map_err(said)?;
+        if kept.outreach != Outreach::Skipped {
+            // Kept so the user can ask for a draft later without another page load.
+            store
+                .save_post_reading(&kept.post_link, &post, kept.found_at)
+                .map_err(said)?;
+        }
         if let Some(draft) = draft {
             store.add_draft(&draft).map_err(said)?;
         }
@@ -1290,6 +1382,197 @@ fn poster_flag(post: &Post, company: &str) -> Option<String> {
             post.headline
         )),
     }
+}
+
+/// What the model is told a draft to a post's author is about.
+fn post_context(role: &str, company: &str, text: &str) -> String {
+    format!("It is about this LinkedIn post, for the {role} role at {company}:\n{text}")
+}
+
+/// True when the saved count says an InMail credit is free. When LinkedIn would have to be asked,
+/// this is false, so the draft is a connection note.
+fn inmail_credit_is_free(database: &Path) -> bool {
+    Store::open(database)
+        .and_then(|store| store.free_inmail_credits(Timestamp::now()))
+        .is_ok_and(|free| free.is_some_and(|free| free > 0))
+}
+
+/// Why no draft can be written from a post's link alone, or `None` when Maverick can read the post.
+pub fn post_without_a_page(post_link: &str) -> Option<&'static str> {
+    post_link.contains("/search/results/").then_some(
+        "The tracker links this post to a search page, not to the post, so Maverick cannot tell who posted it.",
+    )
+}
+
+/// A draft the user asked for, and why it is a connection note when an InMail was not ruled out.
+#[derive(Debug)]
+pub struct PostDraft {
+    pub draft: Draft,
+    pub credits_unread: Option<String>,
+}
+
+/// A LinkedIn tab that opens only when something has to be read there.
+struct LazyReader {
+    bridge: Option<Arc<Bridge>>,
+    reader: Option<Reader>,
+}
+
+impl LazyReader {
+    async fn get(&mut self) -> Result<&mut Reader, String> {
+        if self.reader.is_none() {
+            let bridge = self
+                .bridge
+                .clone()
+                .ok_or("Chrome is not connected, so LinkedIn could not be read")?;
+            // One page for the post and one for the poster's message window.
+            self.reader = Some(Reader::open(bridge, 2).await.map_err(|stop| stop.to_string())?);
+        }
+        Ok(self.reader.as_mut().expect("the reader was just opened"))
+    }
+
+    async fn close(self) {
+        if let Some(reader) = self.reader {
+            reader.close().await;
+        }
+    }
+}
+
+/// The post behind a hiring post's link, read in LinkedIn unless the store holds it, and whether
+/// an InMail credit is free for its author.
+async fn post_and_credit(
+    database: &Path,
+    post_link: &str,
+    linkedin: &mut LazyReader,
+) -> Result<(Post, bool, Option<String>), String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let now = Timestamp::now();
+    let (kept, free) = {
+        let store = Store::open(database).map_err(said)?;
+        (
+            store.post_reading(post_link).map_err(said)?,
+            store.free_inmail_credits(now).map_err(said)?,
+        )
+    };
+    let post = match kept {
+        Some(post) => post,
+        None => {
+            if let Some(why) = post_without_a_page(post_link) {
+                return Err(why.to_owned());
+            }
+            let html = linkedin
+                .get()
+                .await?
+                .load(post_link, First::OpenPosts)
+                .await
+                .map_err(|stop| stop.to_string())?;
+            let mut posts = posts_page(&html).into_iter();
+            // A post Maverick's own sweep found is linked by its author's activity page.
+            let post = if post_link.contains("#post-") {
+                posts
+                    .find(|post| post.link() == post_link)
+                    .ok_or("the post is no longer on its author's activity page")?
+            } else {
+                posts
+                    .next()
+                    .ok_or("LinkedIn showed no post at that address; it may be deleted")?
+            };
+            Store::open(database)
+                .and_then(|store| store.save_post_reading(post_link, &post, now))
+                .map_err(said)?;
+            post
+        }
+    };
+    let Some(profile_url) = &post.poster_url else {
+        return Err("a company page posted this, so there is no person to write to".into());
+    };
+    if post.degree.as_deref() == Some("1st") {
+        return Ok((post, false, None));
+    }
+    if let Some(free) = free {
+        return Ok((post, free > 0, None));
+    }
+    let read = match linkedin.get().await {
+        Ok(reader) => reader.inmail_cost(profile_url).await.map_err(|stop| stop.to_string()),
+        Err(why) => Err(why),
+    };
+    match read {
+        // This person takes an InMail without a credit.
+        Ok(Some(InMailCost::Free)) => Ok((post, true, None)),
+        Ok(Some(InMailCost::Credit { left })) => {
+            let free = Store::open(database)
+                .and_then(|store| {
+                    store.save_inmail_credits(left, now)?;
+                    store.free_inmail_credits(now)
+                })
+                .map_err(said)?;
+            Ok((post, free.is_some_and(|free| free > 0), None))
+        }
+        Ok(None) => Ok((
+            post,
+            false,
+            Some("the message window said nothing about InMail credits".into()),
+        )),
+        Err(why) => Ok((post, false, Some(why))),
+    }
+}
+
+/// Drafts a message to a hiring post's author because the user asked for one: an InMail while a
+/// credit is free, a connection note otherwise, and a message when the author is a connection.
+/// The poster check and the daily cap, which hold the sweep back, do not apply.
+pub async fn draft_for_post(
+    database: &Path,
+    profile: &Profile,
+    bridge: Option<Arc<Bridge>>,
+    post_link: &str,
+) -> Result<PostDraft, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let about = About::Post(post_link.to_owned());
+    let found = {
+        let store = Store::open(database).map_err(said)?;
+        if store.drafts().map_err(said)?.iter().any(|draft| draft.about == about) {
+            return Err("this post already has a draft".into());
+        }
+        store
+            .hiring_posts()
+            .map_err(said)?
+            .into_iter()
+            .find(|post| post.post_link == post_link)
+            .ok_or("the post is no longer in the database")?
+    };
+    let mut linkedin = LazyReader { bridge, reader: None };
+    let read = post_and_credit(database, post_link, &mut linkedin).await;
+    linkedin.close().await;
+    let (post, credit, credits_unread) = read?;
+    let slot = Slot::to_reach(post.degree.as_deref(), credit);
+    let ask = Ask {
+        slot,
+        person: &post.poster,
+        headline: &post.headline,
+        context: post_context(&found.role, &found.company, &post.text),
+    };
+    let written = write_draft(profile, &ask).await?;
+    let now = Timestamp::now();
+    let mut draft = Draft {
+        id: 0,
+        about,
+        person: post.poster.clone(),
+        headline: post.headline.clone(),
+        profile_url: post.poster_url.clone().expect("a post without an author was refused"),
+        slot,
+        subject: written.subject,
+        text: written.text,
+        status: Outreach::Drafted,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut store = Store::open(database).map_err(said)?;
+    draft.id = store
+        .add_draft(&draft)
+        .map_err(said)?
+        .ok_or_else(|| format!("{} already has a draft about this post", draft.person))?;
+    // The post moves to drafted with its draft.
+    store.set_draft_status(draft.id, Outreach::Drafted, now).map_err(said)?;
+    Ok(PostDraft { draft, credits_unread })
 }
 
 /// Drafts a note to the first person a check found who has a profile, for the user to approve.
@@ -1316,7 +1599,7 @@ pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &
         .iter()
         .find(|person| person.profile_url.is_some())
         .ok_or("nobody the check found has a LinkedIn profile to write to")?;
-    let slot = Slot::for_degree(person.degree.as_deref());
+    let slot = Slot::to_reach(person.degree.as_deref(), inmail_credit_is_free(database));
     let team = check
         .team
         .as_deref()
@@ -1415,25 +1698,39 @@ pub fn redraft_context(about: &str, draft: &Draft) -> String {
     )
 }
 
-/// Types an approved draft into LinkedIn in the user's Chrome and marks it typed. The user clicks Send.
-pub async fn type_approved(database: &Path, bridge: Arc<Bridge>, id: i64) -> Result<(), String> {
+/// Types an approved draft into LinkedIn in the user's Chrome and marks it typed. A message or an
+/// InMail gets `resume` attached. The user clicks Send.
+pub async fn type_approved(
+    database: &Path,
+    bridge: Arc<Bridge>,
+    id: i64,
+    resume: Option<&Path>,
+) -> Result<Typed, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
     let draft = Store::open(database)
         .and_then(|store| store.draft(id))
         .map_err(said)?
         .ok_or("the draft is no longer in the database")?;
     let written = check_written(draft.subject.as_deref(), &draft.text, draft.slot)?;
-    linkedin::type_draft(
+    let typed = linkedin::type_draft(
         bridge,
         &draft.profile_url,
         draft.slot,
         written.subject.as_deref(),
         &written.text,
+        resume,
     )
     .await?;
+    let now = Timestamp::now();
     Store::open(database)
-        .and_then(|mut store| store.set_draft_status(id, Outreach::Typed, Timestamp::now()))
-        .map_err(said)
+        .and_then(|mut store| {
+            if let Some(credits) = typed.credits {
+                store.save_inmail_credits(credits, now)?;
+            }
+            store.set_draft_status(id, Outreach::Typed, now)
+        })
+        .map_err(said)?;
+    Ok(typed)
 }
 
 #[cfg(test)]
@@ -1720,6 +2017,80 @@ mod tests {
             poster_role_key("Sam  Poster", "Backend Engineer (New Grad)"),
             poster_role_key("sam poster", "backend engineer new grad")
         );
+    }
+
+    #[test]
+    fn an_inmail_credit_is_free_until_waiting_inmails_claim_it_and_a_sent_one_uses_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        let read: Timestamp = "2026-11-24T17:00:00Z".parse().unwrap();
+        let soon: Timestamp = "2026-11-24T18:00:00Z".parse().unwrap();
+        let two_days_on: Timestamp = "2026-11-26T18:00:00Z".parse().unwrap();
+        // Nothing saved yet, so LinkedIn must be asked.
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), None);
+        assert_eq!(Slot::to_reach(Some("2nd"), false), Slot::Note);
+
+        store.save_inmail_credits(2, read).unwrap();
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(2));
+        let inmail = |profile: &str| Draft {
+            id: 0,
+            about: About::Post(format!("https://www.linkedin.com/feed/update/{profile}/")),
+            person: "Sam Poster".into(),
+            headline: "Engineer at Example Co".into(),
+            profile_url: format!("https://www.linkedin.com/in/{profile}/"),
+            slot: Slot::InMail,
+            subject: Some("Backend role".into()),
+            text: "Hi Sam".into(),
+            status: Outreach::Drafted,
+            created_at: read,
+            updated_at: read,
+        };
+        let first = store.add_draft(&inmail("one")).unwrap().unwrap();
+        let second = store.add_draft(&inmail("two")).unwrap().unwrap();
+        // Two waiting InMails claim both credits. The count is fresh, so it is believed.
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(0));
+        // A skipped draft gives its credit back.
+        store.set_draft_status(second, Outreach::Skipped, soon).unwrap();
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(1));
+        // A typed one still claims its credit, and sending it uses that credit once.
+        store.set_draft_status(first, Outreach::Typed, soon).unwrap();
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(1));
+        store.set_draft_status(first, Outreach::Sent, soon).unwrap();
+        store.set_draft_status(first, Outreach::Sent, soon).unwrap();
+        store.set_draft_status(first, Outreach::Replied, soon).unwrap();
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(1));
+        // An old count with none free is not believed: a new month may have added credits.
+        store.save_inmail_credits(0, read).unwrap();
+        assert_eq!(store.free_inmail_credits(soon).unwrap(), Some(0));
+        assert_eq!(store.free_inmail_credits(two_days_on).unwrap(), None);
+    }
+
+    #[test]
+    fn what_a_posts_page_showed_is_kept_for_a_later_draft() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        let at: Timestamp = "2026-11-24T17:00:00Z".parse().unwrap();
+        let link = "https://www.linkedin.com/feed/update/urn:li:activity:1/";
+        assert_eq!(store.post_reading(link).unwrap(), None);
+        let post = Post {
+            poster: "Sam Poster".into(),
+            poster_url: Some("https://www.linkedin.com/in/sam-poster/".into()),
+            headline: "Engineer at Example Co".into(),
+            degree: Some("2nd".into()),
+            text: "We are hiring a backend engineer.".into(),
+            complete: true,
+        };
+        store.save_post_reading(link, &post, at).unwrap();
+        assert_eq!(store.post_reading(link).unwrap(), Some(post.clone()));
+        // A later reading replaces the earlier one.
+        let longer = Post {
+            text: "We are hiring a backend engineer in Seattle.".into(),
+            ..post
+        };
+        store.save_post_reading(link, &longer, at).unwrap();
+        assert_eq!(store.post_reading(link).unwrap(), Some(longer));
+        assert!(post_without_a_page("https://www.linkedin.com/search/results/content/?keywords=hiring").is_some());
+        assert_eq!(post_without_a_page(link), None);
     }
 
     #[test]

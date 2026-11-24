@@ -234,7 +234,8 @@ impl Page {
                     element.focus();
                     if (typeof element.select === "function") element.select();
                     else getSelection().selectAllChildren(element);
-                    return document.activeElement === element ? "focused" : "unfocused";
+                    // Inside a shadow root, the document's active element is the root's host.
+                    return element.getRootNode().activeElement === element ? "focused" : "unfocused";
                 }})()"#,
                 element.script
             ))
@@ -263,7 +264,7 @@ impl Page {
                     const box = element.getBoundingClientRect();
                     const x = box.left + box.width / 2;
                     const y = box.top + box.height / 2;
-                    const top = document.elementFromPoint(x, y);
+                    const top = element.getRootNode().elementFromPoint(x, y);
                     return top && element.contains(top) ? {{ x, y }} : "covered";
                 }})()"#,
                 element.script
