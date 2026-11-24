@@ -300,7 +300,7 @@ impl OutreachView {
             .answers
             .as_deref()
             .ok_or("This system has no application data directory.")?;
-        Ok(Profile::from(&Answers::load(file)?))
+        Profile::load(file)
     }
 
     /// Runs a check-and-sweep on the background runtime, then reloads and shows what it said at the

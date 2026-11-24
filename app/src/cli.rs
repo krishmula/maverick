@@ -146,15 +146,15 @@ fn open_store() -> Result<Store, Box<dyn Error>> {
 
 fn profile() -> Result<Profile, Box<dyn Error>> {
     let file = maverick_core::answers_path().ok_or("this system has no application data directory")?;
-    let answers = Answers::load(&file)?;
-    if answers.background.is_empty() {
+    let profile = Profile::load(&file)?;
+    if profile.background.is_empty() {
         return Err(format!(
             "{} has no background, so there is no resume to score against",
             file.display()
         )
         .into());
     }
-    Ok(Profile::from(&answers))
+    Ok(profile)
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -637,7 +637,7 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::outreach;
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
-                         | credits <profile address> | draft-post <post link> | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | credits <profile address> | draft-post <post link> | try-draft <post link> <note|message|inmail> | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
                          | page <LinkedIn address> <out.html> | read <people|posts> <saved.html> \
                          | dump-tab <out.html> [script]";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
@@ -861,6 +861,16 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 println!("    subject: {subject}");
             }
             println!("    {}", draft.text.replace('\n', "\n    "));
+        }
+        // Prints a draft to a post's author in a given slot and saves nothing: for judging the voice.
+        ["try-draft", link, slot] => {
+            let slot = maverick_core::linkedin::Slot::parse(slot).ok_or(USAGE)?;
+            let profile = profile()?;
+            let written = runtime()?.block_on(outreach::try_draft(&database, &profile, link, slot))?;
+            if let Some(subject) = &written.subject {
+                println!("subject: {subject}\n");
+            }
+            println!("{}", written.text);
         }
         ["status", id, status] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;
