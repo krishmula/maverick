@@ -1632,8 +1632,14 @@ pub async fn draft_for_post(
     Ok(PostDraft { draft, credits_unread })
 }
 
-/// Drafts a note to the first person a check found who has a profile, for the user to approve.
-pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &str) -> Result<Draft, String> {
+/// Drafts a note to one person a check found, picked by their profile address, for the user to approve.
+/// A connection gets a message, anyone else an InMail while a credit is free, else a connection note.
+pub async fn draft_for_check(
+    database: &Path,
+    profile: &Profile,
+    posting_link: &str,
+    person_profile: &str,
+) -> Result<Draft, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
     let (posting, check) = {
         let store = Store::open(database).map_err(said)?;
@@ -1654,8 +1660,8 @@ pub async fn draft_for_check(database: &Path, profile: &Profile, posting_link: &
     let person = check
         .people
         .iter()
-        .find(|person| person.profile_url.is_some())
-        .ok_or("nobody the check found has a LinkedIn profile to write to")?;
+        .find(|person| person.profile_url.as_deref() == Some(person_profile))
+        .ok_or("that person is no longer in the posting's outreach check")?;
     let slot = Slot::to_reach(person.degree.as_deref(), inmail_credit_is_free(database));
     let team = check
         .team

@@ -152,7 +152,8 @@ pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>, Vec<HiringPost>) {
 /// A row that can have work of its own: a posting's check on the left, or a draft on the right.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowKey {
-    Posting(String),
+    /// One person a posting's check found: the posting's link and the person's profile address.
+    Person(String, String),
     Draft(i64),
     /// A hiring post with no draft, by its link.
     Post(String),
@@ -560,9 +561,10 @@ impl OutreachView {
         cx.notify();
     }
 
-    /// Drafts a note for a posting's check. The row shows "drafting…", then where the draft went.
-    fn draft_for(&mut self, posting_link: String, window: &mut Window, cx: &mut Context<Self>) {
-        let key = RowKey::Posting(posting_link.clone());
+    /// Drafts a note to one person a posting's check found. Their row shows "drafting…", then where
+    /// the draft went.
+    fn draft_for(&mut self, posting_link: String, person: String, window: &mut Window, cx: &mut Context<Self>) {
+        let key = RowKey::Person(posting_link.clone(), person.clone());
         let Some(database) = self.database_for(&key, cx) else {
             return;
         };
@@ -573,7 +575,7 @@ impl OutreachView {
             key,
             "drafting…",
             async move {
-                let draft = outreach::draft_for_check(&database, &profile, &posting_link).await?;
+                let draft = outreach::draft_for_check(&database, &profile, &posting_link, &person).await?;
                 Ok(Finished {
                     said: format!(
                         "Drafted a {} to {}. It is below, outlined.",
@@ -734,26 +736,8 @@ impl OutreachView {
             .iter()
             .filter(|row| row.draft.about == About::Posting(link.to_owned()))
             .collect();
-        let can_draft = drafts.is_empty() && check.people.iter().any(|person| person.profile_url.is_some());
-        let key = RowKey::Posting(link.to_owned());
-        let owned = link.to_owned();
-        let draft_button: Option<AnyElement> = match self.row_states.get(&key) {
-            Some(RowState::Working(doing)) => {
-                Some(Self::pending(format!("draft-{link}"), doing, palette).into_any_element())
-            }
-            _ => can_draft.then(|| {
-                ui::button(
-                    SharedString::from(format!("draft-{link}")),
-                    "Draft a note",
-                    ui::quiet_face("draft note", palette),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.draft_for(owned.clone(), window, cx)))
-                .into_any_element()
-            }),
-        };
-        let said = self.row_said(&key, format!("said-{link}"), palette);
         let cards: Vec<AnyElement> = drafts
-            .into_iter()
+            .iter()
             .map(|row| self.draft_card(row, palette, cx).into_any_element())
             .collect();
         section
@@ -767,24 +751,96 @@ impl OutreachView {
                     .child(ui::chip(signal, label, palette))
                     .children(check.team.as_ref().map(|team| ui::boxed(team, palette.faint))),
             )
-            .children(check.people.iter().map(|person| {
-                h_flex().gap(px(8.)).child(ui::square(palette.signal(signal))).child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(palette.muted)
-                        .child(SharedString::from(person_line(person))),
-                )
-            }))
+            .children(
+                check
+                    .people
+                    .iter()
+                    .map(|person| self.person_row(link, person, &drafts, signal, palette, cx)),
+            )
             .children(check.note.as_ref().map(|note| {
                 div()
                     .text_size(px(11.))
                     .text_color(palette.faint)
                     .child(SharedString::from(note.clone()))
             }))
-            .children(draft_button.map(|button| h_flex().child(button)))
-            .children(said)
             .children(cards)
+            .into_any_element()
+    }
+
+    /// One person at a posting, with their own ways to reach them: a draft to them, or where their
+    /// draft stands, and their LinkedIn profile.
+    fn person_row(
+        &self,
+        link: &str,
+        person: &Person,
+        drafts: &[&DraftRow],
+        signal: Signal,
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = h_flex().gap(px(8.)).child(ui::square(palette.signal(signal))).child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(palette.muted)
+                .child(SharedString::from(person_line(person))),
+        );
+        let Some(profile) = person.profile_url.clone() else {
+            return line
+                .child(ui::caps("no profile").flex_none().text_color(palette.faint))
+                .into_any_element();
+        };
+        let id = |what: &str| SharedString::from(format!("{what}-{link}|{profile}"));
+        let key = RowKey::Person(link.to_owned(), profile.clone());
+        let draft = drafts.iter().find(|row| row.draft.profile_url == profile);
+        let reach: AnyElement = match (self.row_states.get(&key), draft) {
+            (Some(RowState::Working(doing)), _) => {
+                Self::pending(id("draft").to_string(), doing, palette).into_any_element()
+            }
+            (_, Some(row)) => {
+                let (signal, word) = draft_state(row.draft.status);
+                let word = if row.draft.status == Outreach::Typed {
+                    "typed"
+                } else {
+                    word
+                };
+                let form = match row.draft.slot {
+                    Slot::InMail => "inmail",
+                    Slot::Note => "note",
+                    Slot::Message => "message",
+                };
+                ui::chip(signal, format!("{form} {word}"), palette).into_any_element()
+            }
+            (_, None) => {
+                let first = person.degree.as_deref() == Some("1st");
+                let word = if first { "draft message" } else { "draft" };
+                let name = format!("Draft to {}", person.name);
+                let (posting, person) = (link.to_owned(), profile.clone());
+                ui::button(id("draft"), name, ui::quiet_face(word, palette))
+                    .tip(if first {
+                        "Write a message to this connection."
+                    } else {
+                        "Write an InMail while a credit is free, otherwise a connection note."
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.draft_for(posting.clone(), person.clone(), window, cx)
+                    }))
+                    .into_any_element()
+            }
+        };
+        let open = profile.clone();
+        let said = self.row_said(&key, id("said").to_string(), palette);
+        v_flex()
+            .gap(px(4.))
+            .child(
+                line.child(reach).child(
+                    ui::button(id("profile"), "Open profile", ui::quiet_face("profile ↗", palette))
+                        .tip("Open their LinkedIn profile in your browser.")
+                        .on_click(move |_, _, cx| cx.open_url(&open)),
+                ),
+            )
+            .children(said)
             .into_any_element()
     }
 
@@ -1324,6 +1380,51 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn each_person_at_a_posting_can_be_reached_on_their_own(cx: &mut TestAppContext) {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        seeded(&database);
+        let person = |name: &str, profile: Option<&str>, degree: &str| Person {
+            name: name.into(),
+            title: "Software Engineer".into(),
+            profile_url: profile.map(Into::into),
+            degree: Some(degree.into()),
+        };
+        // Bo Sample already has a draft about this posting. Di Other and Ed Nolink do not.
+        Store::open(&database)
+            .unwrap()
+            .save_check(&Check {
+                posting_link: "https://simplify.jobs/p/1".into(),
+                verdict: Verdict::Connection,
+                team: None,
+                people: vec![
+                    person("Bo Sample", Some("https://www.linkedin.com/in/bo-sample/"), "2nd"),
+                    person("Di Other", Some("https://www.linkedin.com/in/di-other/"), "1st"),
+                    person("Ed Nolink", None, "2nd"),
+                ],
+                note: None,
+                checked_at: "2026-11-23T17:00:00Z".parse().unwrap(),
+            })
+            .unwrap();
+        let runtime = runtime();
+        let (window, _) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"]);
+        let id = |what: &str, profile: &str| {
+            SharedString::from(format!(
+                "{what}-https://simplify.jobs/p/1|https://www.linkedin.com/in/{profile}/"
+            ))
+        };
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(id("draft", "bo-sample")).is_none());
+            assert_eq!(window.find(id("draft", "di-other")).label(), Some("Draft to Di Other"));
+            for profile in ["bo-sample", "di-other"] {
+                assert_eq!(window.find(id("profile", profile)).label(), Some("Open profile"));
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn a_row_click_is_never_dropped_and_each_row_shows_its_own_work(cx: &mut TestAppContext) {
         let scratch = tempfile::tempdir().unwrap();
         let database = scratch.path().join("maverick.db");
@@ -1352,7 +1453,10 @@ mod tests {
             &runtime,
             &["https://simplify.jobs/p/1", "https://simplify.jobs/p/2"],
         );
-        let posting = RowKey::Posting("https://simplify.jobs/p/2".into());
+        let posting = RowKey::Person(
+            "https://simplify.jobs/p/2".into(),
+            "https://www.linkedin.com/in/cy-person/".into(),
+        );
         let draft = RowKey::Draft(id);
 
         // A scheduled check is running. A click on a row still does something, and says so on the row:
@@ -1360,11 +1464,14 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, _| view.working = Some("checking postings".into()));
             window.render_frame(cx);
-            window.click("draft-https://simplify.jobs/p/2", cx);
+            window.click(
+                "draft-https://simplify.jobs/p/2|https://www.linkedin.com/in/cy-person/",
+                cx,
+            );
             window.render_frame(cx);
             assert!(
                 window
-                    .find("said-https://simplify.jobs/p/2")
+                    .find("said-https://simplify.jobs/p/2|https://www.linkedin.com/in/cy-person/")
                     .label()
                     .unwrap()
                     .starts_with("Could not read your answers")
@@ -1394,7 +1501,9 @@ mod tests {
             });
             window.render_frame(cx);
             assert_eq!(
-                window.find("draft-https://simplify.jobs/p/2").label(),
+                window
+                    .find("draft-https://simplify.jobs/p/2|https://www.linkedin.com/in/cy-person/")
+                    .label(),
                 Some("drafting…")
             );
             assert_eq!(
@@ -1426,7 +1535,9 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(
-                window.find("said-https://simplify.jobs/p/2").label(),
+                window
+                    .find("said-https://simplify.jobs/p/2|https://www.linkedin.com/in/cy-person/")
+                    .label(),
                 Some("Drafted a connection note to Cy Person. It is below, outlined.")
             );
             assert_eq!(
