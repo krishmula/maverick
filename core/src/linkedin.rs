@@ -755,6 +755,7 @@ pub enum Slot {
     /// A direct message, which only a connection can receive.
     Message,
     /// A Premium InMail to someone outside the network: a subject and a body. Sending one uses a credit.
+    #[serde(alias = "inmail")]
     InMail,
 }
 

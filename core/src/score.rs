@@ -5,6 +5,7 @@
 //! into a decision are code in this file, so they are tested and cannot drift.
 
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -17,6 +18,7 @@ use crate::description::{self, Fetched, Source};
 use crate::jobs::{Application, Posting, Sponsorship, Stage, posting_address};
 use crate::providers::{self, Job};
 use crate::rules::{SeenJobs, prefilter};
+use crate::voice::Voice;
 
 /// A score at or above this, with no blocking flag, makes a posting ready to apply to.
 pub const APPLY_SCORE: u8 = 75;
@@ -39,6 +41,8 @@ pub struct Profile {
     pub background: Vec<String>,
     pub facts: Vec<String>,
     pub target: Vec<String>,
+    /// How the user writes messages. Empty until `with_voice` reads it.
+    pub voice: Voice,
 }
 
 impl From<&Answers> for Profile {
@@ -47,7 +51,17 @@ impl From<&Answers> for Profile {
             background: answers.background.clone(),
             facts: answers.facts.clone(),
             target: answers.target.clone(),
+            voice: Voice::default(),
         }
+    }
+}
+
+impl Profile {
+    /// The profile in the answers file, with the voice file beside it when there is one.
+    pub fn load(answers: &Path) -> Result<Self, String> {
+        let mut profile = Self::from(&Answers::load(answers)?);
+        profile.voice = Voice::load(&answers.with_file_name("voice.json"))?;
+        Ok(profile)
     }
 }
 

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::bridge::Bridge;
 use crate::description::{self, Fetched};
-use crate::jobs::{HiringPost, Outreach, Posting, Stage, posting_address, stored_enum};
+use crate::jobs::{Application, HiringPost, Outreach, Posting, Stage, posting_address, stored_enum};
 use crate::linkedin::{
     self, Connection, First, INMAIL_BODY_LIMIT, INMAIL_SUBJECT_LIMIT, InMailCost, NOTE_LIMIT, Person, Post,
     PosterCheck, Reader, Slot, Stop, Typed, company_key, company_slug, people_address, people_page,
@@ -1117,6 +1117,12 @@ and never describe work the resume does not list as built work. \
 Never use em dashes or en dashes; use commas, hyphens or separate sentences. \
 No placeholders and no bullet lists. Put no subject line in the text: \
 an InMail's subject goes in subject, and anything else has subject null. \
+When messages the applicant wrote are given, write as they do: the same greeting and sign-off, \
+the same length and line breaks, the same plain wording. Reuse their own sentence for a fact when it fits, \
+but pick the work that fits this role, not the work the examples happen to repeat. \
+Those messages are also a source of facts about the applicant. Copy nothing about the person or the role from them. \
+The applicant's rules for a message come before these instructions where they differ. \
+Say the applicant applied only when told they have. \
 If the resume and the facts lack something the message needs, text is null and missing says what is missing.";
 
 fn draft_schema() -> Value {
@@ -1147,12 +1153,12 @@ pub fn form_of(slot: Slot) -> String {
             "This is a connection request note: at most {} characters, two or three sentences, no attachment.",
             NOTE_LIMIT - 20
         ),
-        Slot::Message => "This is a direct message to a connection: 50 to 110 words. \
+        Slot::Message => "This is a direct message to a connection: 40 to 90 words. \
                           It may say the resume is attached."
             .to_owned(),
         Slot::InMail => format!(
             "This is a LinkedIn InMail to someone outside the applicant's network: a subject of at most \
-             {INMAIL_SUBJECT_LIMIT} characters that names the role, and a body of 80 to 150 words. \
+             {INMAIL_SUBJECT_LIMIT} characters that names the role, and a body of 50 to 100 words. \
              It may say the resume is attached."
         ),
     }
@@ -1162,6 +1168,7 @@ pub fn form_of(slot: Slot) -> String {
 pub async fn write_draft(profile: &Profile, ask: &Ask<'_>) -> Result<Written, String> {
     let form = form_of(ask.slot);
     let mut request = profile_text(profile);
+    request.push_str(&profile.voice.told(ask.slot));
     let _ = write!(
         request,
         "\n{form}\nIt goes to {} ({}).\n\n{}\n",
@@ -1321,7 +1328,7 @@ pub async fn sweep(database: &Path, profile: &Profile, bridge: Arc<Bridge>) -> R
                 slot,
                 person: &post.poster,
                 headline: &post.headline,
-                context: post_context(&reading.role, &reading.company, &post.text),
+                context: post_context(database, &reading.role, &reading.company, &post.text),
             };
             match write_draft(profile, &ask).await {
                 Ok(written) => {
@@ -1385,8 +1392,58 @@ fn poster_flag(post: &Post, company: &str) -> Option<String> {
 }
 
 /// What the model is told a draft to a post's author is about.
-fn post_context(role: &str, company: &str, text: &str) -> String {
-    format!("It is about this LinkedIn post, for the {role} role at {company}:\n{text}")
+fn post_context(database: &Path, role: &str, company: &str, text: &str) -> String {
+    let applications = Store::open(database)
+        .and_then(|store| store.applications())
+        .unwrap_or_default();
+    let applied = applied_line(&applications, company);
+    format!("It is about this LinkedIn post, for the {role} role at {company}:\n{text}\n\n{applied}")
+}
+
+/// What the model is told about whether the user applied. The tracker names a company and a role
+/// on one line, so the model judges whether an application there is for this role.
+fn applied_line(applications: &[Application], company: &str) -> String {
+    let company = company.trim().to_lowercase();
+    let there: Vec<_> = applications
+        .iter()
+        .filter_map(|application| application.role.as_deref())
+        .filter(|role| company.chars().count() >= 3 && role.to_lowercase().contains(&company))
+        .collect();
+    if there.is_empty() {
+        return "The applicant has not applied to this role, so the message must not say they applied.".into();
+    }
+    format!(
+        "The applicant has applied to these roles at the company: {}. \
+         Say they applied only if one of them is this role.",
+        there.join("; ")
+    )
+}
+
+/// Writes a draft to a post's author in `slot` and keeps nothing: for reading how drafts come out.
+/// The post must be one Maverick has already read, so LinkedIn is not opened.
+pub async fn try_draft(database: &Path, profile: &Profile, post_link: &str, slot: Slot) -> Result<Written, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let (found, post) = {
+        let store = Store::open(database).map_err(said)?;
+        let found = store
+            .hiring_posts()
+            .map_err(said)?
+            .into_iter()
+            .find(|post| post.post_link == post_link)
+            .ok_or("no such post in the database")?;
+        let post = store
+            .post_reading(post_link)
+            .map_err(said)?
+            .ok_or("Maverick has not read this post, so there is nothing to draft from")?;
+        (found, post)
+    };
+    let ask = Ask {
+        slot,
+        person: &post.poster,
+        headline: &post.headline,
+        context: post_context(database, &found.role, &found.company, &post.text),
+    };
+    write_draft(profile, &ask).await
 }
 
 /// True when the saved count says an InMail credit is free. When LinkedIn would have to be asked,
@@ -1548,7 +1605,7 @@ pub async fn draft_for_post(
         slot,
         person: &post.poster,
         headline: &post.headline,
-        context: post_context(&found.role, &found.company, &post.text),
+        context: post_context(database, &found.role, &found.company, &post.text),
     };
     let written = write_draft(profile, &ask).await?;
     let now = Timestamp::now();
@@ -2246,9 +2303,26 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_is_told_the_user_applied_only_when_the_tracker_has_the_company() {
+        let applied = |role: &str| Application {
+            role: Some(role.to_owned()),
+            ..Application::submitted_today("", "https://example.com/job")
+        };
+        let applications = [
+            applied("Example Co Backend Engineer"),
+            applied("Other Co Platform Engineer"),
+        ];
+        let told = applied_line(&applications, "example co");
+        assert!(told.contains("Example Co Backend Engineer"));
+        assert!(!told.contains("Other Co"));
+        assert!(applied_line(&applications, "Third Co").contains("must not say they applied"));
+        assert!(applied_line(&applications, "").contains("must not say they applied"));
+    }
+
+    #[test]
     fn a_redraft_asks_for_the_other_form_and_keeps_the_earlier_facts() {
         assert!(form_of(Slot::InMail).contains("subject of at most 200 characters"));
-        assert!(form_of(Slot::InMail).contains("80 to 150 words"));
+        assert!(form_of(Slot::InMail).contains("50 to 100 words"));
         assert!(form_of(Slot::Note).contains("at most 280 characters"));
         let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
         let draft = Draft {

@@ -369,7 +369,25 @@ Maverick picks the form of every draft by who it goes to:
 - Anyone else gets an InMail while an InMail credit is free, and a connection note when none is. LinkedIn's message window shows the credits left. Maverick reads that number there, and an InMail draft that is not sent yet holds one credit.
 - A person whose message window says **Free message** gets an InMail, which uses no credit.
 
-An InMail is 80 to 150 words with a subject. A connection note is at most 280 characters. When Maverick types a message or an InMail, it attaches the resume named in `answers.json`. Remove it in LinkedIn before you click Send if you do not want it.
+An InMail is 50 to 100 words with a subject. A connection note is at most 280 characters. When Maverick types a message or an InMail, it attaches the resume named in `answers.json`. Remove it in LinkedIn before you click Send if you do not want it.
+
+### Make drafts sound like you
+
+Put your rules and messages you sent in `~/Library/Application Support/dev.maverick.app/voice.json`. Every draft is written from them. Without the file, drafts are written from your resume alone.
+
+```json
+{
+  "rules": ["End on one ask.", "Never mention visa status."],
+  "examples": [
+    { "slot": "note", "about": "a recruiter who posted the role", "text": "Hi Bo, I saw your post about the Backend Engineer role. Would love to connect." },
+    { "slot": "inmail", "about": "an engineer; got a reply", "subject": "Backend Engineer, Payments", "text": "Hi Ada,\n\nI saw your post.\n\nThanks,\nSam" }
+  ]
+}
+```
+
+A note is written from your notes. A message and an InMail are written from your messages and InMails. A draft says you applied only when your applications hold a role at that company.
+
+To read a draft without saving it, run `maverick linkedin try-draft <post link> <note|message|inmail>`. The post must be one Maverick has read.
 
 ## Find new postings
 

@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::Timestamp;
-use maverick_core::answers::Answers;
 use maverick_core::funnel;
 use maverick_core::jobs::Decision;
 use maverick_core::score::Profile;
@@ -75,7 +74,7 @@ impl Funnel {
         let ran = self
             .background
             .spawn(async move {
-                let profile = Profile::from(&Answers::load(&answers)?);
+                let profile = Profile::load(&answers)?;
                 let sheet = maverick_core::sheet::linked_session().await?;
                 let pass = funnel::run_once(&database, profile, sheet).await?;
                 let lists = tokio::task::spawn_blocking(move || stored_lists(Some(&database)))
