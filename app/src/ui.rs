@@ -8,6 +8,7 @@ use std::cell::Cell;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::list::ListItem;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -175,7 +176,7 @@ pub fn score(score: Option<u8>, size: f32) -> Div {
         ))
 }
 
-/// Labelled values, one per line. A value that is empty is left out.
+/// Labelled values, one per line. A value that is empty is left out. Values can be selected and copied.
 pub fn facts(facts: &[(&str, String)], palette: &Palette) -> Div {
     v_flex().gap(px(7.)).children(
         facts
@@ -191,10 +192,32 @@ pub fn facts(facts: &[(&str, String)], palette: &Palette) -> Div {
                             .flex_1()
                             .min_w_0()
                             .text_color(palette.muted)
-                            .child(SharedString::from(value.clone())),
+                            .child(selectable(format!("fact-{label}"), value)),
                     )
             }),
     )
+}
+
+/// Text the user can select with the pointer and copy with ⌘C. It takes the color and font around it.
+pub fn selectable(id: impl Into<ElementId>, text: &str) -> TextView {
+    TextView::markdown(id, literal_markdown(text)).selectable(true)
+}
+
+/// Markdown that shows `text` as it is: no emphasis, links or lists, and each line break kept.
+fn literal_markdown(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + text.len() / 8);
+    for (ix, line) in text.lines().enumerate() {
+        if ix > 0 {
+            escaped.push_str("\\\n");
+        }
+        for ch in line.chars() {
+            if ch.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 /// Something to click. `name` is what a screen reader and the tests call it.
