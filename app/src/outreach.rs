@@ -95,13 +95,28 @@ pub fn draft_state(status: Outreach) -> (Signal, &'static str) {
     }
 }
 
-/// Reads the checks, and the drafts with the postings and posts they are about.
-pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>) {
+/// Where a hiring post without a draft in Maverick stands.
+pub fn post_state(status: Outreach) -> (Signal, &'static str) {
+    match status {
+        Outreach::NotStarted => (Signal::Yours, "no draft"),
+        Outreach::Drafted | Outreach::Typed => (Signal::Model, "drafted elsewhere"),
+        Outreach::Sent => (Signal::Done, "sent"),
+        Outreach::Replied => (Signal::Done, "replied"),
+        Outreach::Skipped => (Signal::Failed, "skipped"),
+    }
+}
+
+/// The most hiring posts without a draft that the Posts tab lists.
+const FOUND_SHOWN: usize = 100;
+
+/// Reads the checks, the drafts with the postings and posts they are about, and the hiring posts
+/// that were not skipped and have no draft, newest first.
+pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>, Vec<HiringPost>) {
     let postings: Vec<Posting> = store.postings().unwrap_or_default();
     let posts: Vec<HiringPost> = store.hiring_posts().unwrap_or_default();
     let posting_of = |link: &str| postings.iter().find(|posting| posting.link == link);
     let checks = store.checks().unwrap_or_default();
-    let drafts = store
+    let drafts: Vec<DraftRow> = store
         .drafts()
         .unwrap_or_default()
         .into_iter()
@@ -119,7 +134,19 @@ pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>) {
             DraftRow { draft, about, score }
         })
         .collect();
-    (checks, drafts)
+    let drafted: HashSet<&str> = drafts
+        .iter()
+        .filter_map(|row| match &row.draft.about {
+            About::Post(link) => Some(link.as_str()),
+            About::Posting(_) => None,
+        })
+        .collect();
+    let found = posts
+        .iter()
+        .filter(|post| post.outreach != Outreach::Skipped && !drafted.contains(post.post_link.as_str()))
+        .cloned()
+        .collect();
+    (checks, drafts, found)
 }
 
 /// A row that can have work of its own: a posting's check on the left, or a draft on the right.
@@ -161,6 +188,8 @@ pub struct OutreachView {
     answers: Option<PathBuf>,
     checks: Vec<Check>,
     drafts: Vec<DraftRow>,
+    /// The hiring posts worth a look that have no draft, newest first.
+    found: Vec<HiringPost>,
     /// The draft open in the editor.
     editing: Option<i64>,
     editor: Entity<TextareaState>,
@@ -194,6 +223,7 @@ impl OutreachView {
             answers,
             checks: Vec::new(),
             drafts: Vec::new(),
+            found: Vec::new(),
             editing: None,
             editor,
             working: None,
@@ -254,7 +284,7 @@ impl OutreachView {
             .filter(|path| path.is_file())
             .and_then(|path| Store::open(path).ok());
         if let Some(store) = store {
-            (self.checks, self.drafts) = rows(&store);
+            (self.checks, self.drafts, self.found) = rows(&store);
         }
     }
 
@@ -707,7 +737,8 @@ impl OutreachView {
             .into_any_element()
     }
 
-    /// The Posts tab: the drafts for hiring posts, and the run that finds them.
+    /// The Posts tab: the drafts for hiring posts, the posts found without one, and the run that
+    /// finds them.
     fn posts_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let mut rows: Vec<&DraftRow> = self
             .drafts
@@ -765,6 +796,81 @@ impl OutreachView {
             }))
             .children(empty)
             .children(cards)
+            .children((!self.found.is_empty()).then(|| {
+                let count = match self.found.len() {
+                    all if all > FOUND_SHOWN => format!("newest {FOUND_SHOWN} of {all}"),
+                    all => all.to_string(),
+                };
+                ui::caps(format!("found, no draft · {count}"))
+                    .pt(px(8.))
+                    .text_color(palette.muted)
+            }))
+            .children(
+                self.found
+                    .iter()
+                    .take(FOUND_SHOWN)
+                    .enumerate()
+                    .map(|(at, post)| Self::post_card(at, post, palette)),
+            )
+    }
+
+    /// A hiring post with no draft: who posted it, the role, why there is no draft, and the post.
+    fn post_card(at: usize, post: &HiringPost, palette: &Palette) -> impl IntoElement + use<> {
+        let (signal, state) = post_state(post.outreach);
+        let about = format!("{} at {}", post.role, post.company);
+        let link = post.post_link.clone();
+        v_flex()
+            .id(SharedString::from(format!("post-{at}")))
+            .test_support()
+            .role(gpui_kit::Role::Group)
+            .aria_label(format!("{} · {about} · {state}", post.poster))
+            .gap(px(5.))
+            .p(px(12.))
+            .border_1()
+            .border_color(palette.line)
+            .bg(palette.background)
+            .child(
+                h_flex()
+                    .gap(px(10.))
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(3.))
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .child(ui::chip(signal, state, palette))
+                                    .child(ui::boxed(post.found_at.strftime("%b %-d").to_string(), palette.faint)),
+                            )
+                            .child(ui::serif(post.poster.clone()).text_color(palette.ink))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(palette.muted)
+                                    .truncate()
+                                    .child(SharedString::from(about)),
+                            ),
+                    )
+                    .child(ui::score(Some(post.score), 22.).text_color(palette.muted)),
+            )
+            .children(post.notes.clone().map(|notes| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(palette.faint)
+                    .child(SharedString::from(notes))
+            }))
+            .child(
+                h_flex().child(
+                    ui::button(
+                        SharedString::from(format!("open-found-post-{at}")),
+                        format!("Open the post by {}", post.poster),
+                        ui::quiet_face("open post", palette),
+                    )
+                    .on_click(move |_, _, cx| cx.open_url(&link)),
+                ),
+            )
     }
 
     fn draft_card(&self, row: &DraftRow, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1362,7 +1468,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_posts_tab_lists_only_hiring_post_drafts(cx: &mut TestAppContext) {
+    fn the_posts_tab_lists_hiring_post_drafts_and_the_posts_found_without_one(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::ui::install(cx);
@@ -1388,6 +1494,51 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+        let post = |link: &str, poster: &str, found_at: &str, outreach: Outreach, notes: &str| HiringPost {
+            post_link: link.into(),
+            role: "Backend Engineer".into(),
+            found_at: found_at.parse().unwrap(),
+            poster: poster.into(),
+            company: "Example Co".into(),
+            score: 72,
+            variant: "Backend/Infra".into(),
+            outreach,
+            notes: Some(notes.into()),
+        };
+        let update = "https://www.linkedin.com/feed/update/urn:li:activity";
+        let store = Store::open(&database).unwrap();
+        for found in [
+            post(
+                &format!("{update}:1/"),
+                "Di Poster",
+                "2026-11-23T17:00:00Z",
+                Outreach::Drafted,
+                "72, Backend/Infra",
+            ),
+            post(
+                &format!("{update}:2/"),
+                "Ed Older",
+                "2026-11-22T17:00:00Z",
+                Outreach::Drafted,
+                "Drafted in the sheet",
+            ),
+            post(
+                &format!("{update}:3/"),
+                "Fay Newer",
+                "2026-11-23T19:00:00Z",
+                Outreach::NotStarted,
+                "Poster check unclear",
+            ),
+            post(
+                &format!("{update}:4/"),
+                "Gus Skipped",
+                "2026-11-23T20:00:00Z",
+                Outreach::Skipped,
+                "Skipped - senior roles only",
+            ),
+        ] {
+            assert!(store.add_hiring_post(&found).unwrap());
+        }
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let background = runtime.handle().clone();
         let browser = cx.update(|cx| {
@@ -1422,6 +1573,17 @@ mod tests {
             );
             assert!(window.try_find("check-https://simplify.jobs/p/1").is_none());
             assert_eq!(view.read(cx).waiting(), 1);
+            // The posts with no draft follow, newest first. The drafted post has its card above,
+            // and the skipped one is left out.
+            assert_eq!(
+                window.find("post-0").label(),
+                Some("Fay Newer · Backend Engineer at Example Co · no draft")
+            );
+            assert_eq!(
+                window.find("post-1").label(),
+                Some("Ed Older · Backend Engineer at Example Co · drafted elsewhere")
+            );
+            assert!(window.try_find("post-2").is_none());
         })
         .unwrap();
     }
