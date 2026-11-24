@@ -361,6 +361,16 @@ Every hour while the app is open, Maverick looks on LinkedIn for people at the c
 
 Below the drafts, **found, no draft** lists the newest 100 hiring posts that were not skipped and have no draft, from Maverick's searches and from the tracker's `Hiring Posts` tab. Each one shows why it has no draft, and **open post** opens it in your browser.
 
+**draft** on a found post writes a message to its author. Maverick opens the post in a background tab to read it and to find the author. A post that the tracker links to a search page has no **draft**, because Maverick cannot tell who posted it.
+
+Maverick picks the form of every draft by who it goes to:
+
+- A connection gets a message.
+- Anyone else gets an InMail while an InMail credit is free, and a connection note when none is. LinkedIn's message window shows the credits left. Maverick reads that number there, and an InMail draft that is not sent yet holds one credit.
+- A person whose message window says **Free message** gets an InMail, which uses no credit.
+
+An InMail is 80 to 150 words with a subject. A connection note is at most 280 characters. When Maverick types a message or an InMail, it attaches the resume named in `answers.json`. Remove it in LinkedIn before you click Send if you do not want it.
+
 ## Find new postings
 
 While the app is open, it runs the funnel every hour from 8 AM to 11 PM Pacific time, starting a minute after launch. Each pass pulls new postings and then scores what is found. The bar shows what the last pass did, and the jobs tab updates. A pass never submits an application.

@@ -154,6 +154,8 @@ pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>, Vec<HiringPost>) {
 pub enum RowKey {
     Posting(String),
     Draft(i64),
+    /// A hiring post with no draft, by its link.
+    Post(String),
 }
 
 /// What a row's own work is doing or did, shown on that row.
@@ -365,14 +367,22 @@ impl OutreachView {
         cx.spawn_in(window, async move |this, cx| {
             let outcome = done.await.unwrap_or_else(|stopped| Err(stopped.to_string()));
             this.update(cx, |this, cx| {
-                let state = match outcome {
+                let (key, state) = match outcome {
                     Ok(finished) => {
                         if finished.draft.is_some() {
                             this.outlined = finished.draft;
                         }
-                        RowState::Done(finished.said)
+                        // A post with a draft leaves the found list, so its draft's card says what happened.
+                        let key = match (key, finished.draft) {
+                            (RowKey::Post(post), Some(draft)) => {
+                                this.row_states.remove(&RowKey::Post(post));
+                                RowKey::Draft(draft)
+                            }
+                            (key, _) => key,
+                        };
+                        (key, RowState::Done(finished.said))
                     }
-                    Err(why) => RowState::Failed(why),
+                    Err(why) => (key, RowState::Failed(why)),
                 };
                 this.row_states.insert(key, state);
                 this.reload();
@@ -459,16 +469,20 @@ impl OutreachView {
             return;
         };
         let typing = self.typing.clone();
+        // The resume goes into a message or an InMail. Without it the draft is still typed.
+        let resume = self
+            .answers
+            .as_deref()
+            .and_then(|file| Answers::load(file).ok())
+            .map(|answers| answers.resume);
         self.run_row(
             key,
             "typing in chrome…",
             async move {
                 // Another draft may be typing; this one waits for the tab to be free.
                 let _turn = typing.lock().await;
-                outreach::type_approved(&database, bridge, id).await?;
-                Ok(Finished::said(
-                    "Typed in Chrome. Read it there and click Send yourself, then mark it sent.",
-                ))
+                let typed = outreach::type_approved(&database, bridge, id, resume.as_deref()).await?;
+                Ok(Finished::said(typed.said()))
             },
             window,
             cx,
@@ -596,6 +610,43 @@ impl OutreachView {
                         _ => "Rewritten as a connection note.".into(),
                     },
                     draft: Some(draft.id),
+                })
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Drafts a message to the author of a found hiring post. Maverick reads the post in Chrome
+    /// when the store does not hold it.
+    fn draft_post(&mut self, post_link: String, window: &mut Window, cx: &mut Context<Self>) {
+        let key = RowKey::Post(post_link.clone());
+        let Some(database) = self.database_for(&key, cx) else {
+            return;
+        };
+        let Some(profile) = self.profile_for(&key, cx) else {
+            return;
+        };
+        let bridge = self.bridge(cx);
+        self.run_row(
+            key,
+            "reading and drafting…",
+            async move {
+                let made = outreach::draft_for_post(&database, &profile, bridge, &post_link).await?;
+                let form = match made.draft.slot {
+                    Slot::InMail => "an InMail",
+                    Slot::Note => "a connection note",
+                    Slot::Message => "a message",
+                };
+                let mut said = format!("Drafted {form} to {}.", made.draft.person);
+                if let Some(why) = made.credits_unread {
+                    said.push_str(&format!(
+                        " Your InMail credits could not be read ({why}), so it is a connection note."
+                    ));
+                }
+                Ok(Finished {
+                    said,
+                    draft: Some(made.draft.id),
                 })
             },
             window,
@@ -810,15 +861,43 @@ impl OutreachView {
                     .iter()
                     .take(FOUND_SHOWN)
                     .enumerate()
-                    .map(|(at, post)| Self::post_card(at, post, palette)),
+                    .map(|(at, post)| self.post_card(at, post, palette, cx))
+                    .collect::<Vec<_>>(),
             )
     }
 
     /// A hiring post with no draft: who posted it, the role, why there is no draft, and the post.
-    fn post_card(at: usize, post: &HiringPost, palette: &Palette) -> impl IntoElement + use<> {
+    fn post_card(
+        &self,
+        at: usize,
+        post: &HiringPost,
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let (signal, state) = post_state(post.outreach);
         let about = format!("{} at {}", post.role, post.company);
         let link = post.post_link.clone();
+        let key = RowKey::Post(link.clone());
+        let draft = match self.row_states.get(&key) {
+            Some(RowState::Working(doing)) => {
+                Some(Self::pending(format!("pending-post-{at}"), doing, palette).into_any_element())
+            }
+            // A post the tracker links to a search page has no author Maverick can find.
+            _ if outreach::post_without_a_page(&link).is_some() => None,
+            _ => {
+                let link = link.clone();
+                Some(
+                    ui::button(
+                        SharedString::from(format!("draft-post-{at}")),
+                        format!("Draft a message to {}", post.poster),
+                        ui::primary_face("draft", None, palette),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.draft_post(link.clone(), window, cx)))
+                    .into_any_element(),
+                )
+            }
+        };
+        let said = self.row_said(&key, format!("said-post-{at}"), palette);
         v_flex()
             .id(SharedString::from(format!("post-{at}")))
             .test_support()
@@ -862,7 +941,7 @@ impl OutreachView {
                     .child(SharedString::from(notes))
             }))
             .child(
-                h_flex().child(
+                h_flex().gap(px(8.)).children(draft).child(
                     ui::button(
                         SharedString::from(format!("open-found-post-{at}")),
                         format!("Open the post by {}", post.poster),
@@ -871,6 +950,7 @@ impl OutreachView {
                     .on_click(move |_, _, cx| cx.open_url(&link)),
                 ),
             )
+            .children(said)
     }
 
     fn draft_card(&self, row: &DraftRow, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -908,7 +988,8 @@ impl OutreachView {
         };
         let credit = (draft.slot == Slot::InMail && draft.status == Outreach::Drafted).then(|| {
             div().text_size(px(11.)).text_color(palette.muted).child(
-                "Sending an InMail uses one of your InMail credits. Maverick only fills the box; you click Send.",
+                "Sending an InMail uses one of your InMail credits, unless LinkedIn's window says Free message. \
+                 Maverick fills the box and attaches your resume; you click Send.",
             )
         });
         let mut actions = h_flex().gap(px(8.)).flex_wrap();
@@ -1536,6 +1617,13 @@ mod tests {
                 Outreach::Skipped,
                 "Skipped - senior roles only",
             ),
+            post(
+                "https://www.linkedin.com/search/results/content/?keywords=hiring",
+                "Hal Searched",
+                "2026-11-21T17:00:00Z",
+                Outreach::NotStarted,
+                "From the tracker",
+            ),
         ] {
             assert!(store.add_hiring_post(&found).unwrap());
         }
@@ -1583,7 +1671,15 @@ mod tests {
                 window.find("post-1").label(),
                 Some("Ed Older · Backend Engineer at Example Co · drafted elsewhere")
             );
-            assert!(window.try_find("post-2").is_none());
+            // A post offers a draft unless the tracker links it to a search page.
+            assert!(window.try_find("draft-post-0").is_some());
+            assert!(window.try_find("draft-post-1").is_some());
+            assert_eq!(
+                window.find("post-2").label(),
+                Some("Hal Searched · Backend Engineer at Example Co · no draft")
+            );
+            assert!(window.try_find("draft-post-2").is_none());
+            assert!(window.try_find("post-3").is_none());
         })
         .unwrap();
     }

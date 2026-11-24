@@ -16,7 +16,7 @@ use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::credentials::{Password, SignIn};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
 use maverick_core::greenhouse;
-use maverick_core::linkedin::{Reader, posts_page};
+use maverick_core::linkedin::{First, Reader, posts_page};
 use maverick_core::page::{Locator, Page, PageError};
 use maverick_core::workday;
 use serde_json::json;
@@ -1295,8 +1295,8 @@ async fn a_search_page_in_a_background_tab_is_scrolled_three_times_for_more_post
     .await;
 
     let mut reader = Reader::open(bridge, 2).await.unwrap();
-    let first_screen = posts_page(&reader.load(&search, false).await.unwrap());
-    let scrolled = posts_page(&reader.load(&search, true).await.unwrap());
+    let first_screen = posts_page(&reader.load(&search, First::Nothing).await.unwrap());
+    let scrolled = posts_page(&reader.load(&search, First::ScrollForPosts).await.unwrap());
     reader.close().await;
     assert_eq!(first_screen.len(), 4);
     assert_eq!(scrolled.len(), 16);
