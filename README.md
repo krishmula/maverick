@@ -458,7 +458,7 @@ To compare the scorer with the scores the database already holds, run `check-sco
 
 Maverick shows a macOS notification when:
 
-- a queued form finishes filling and is ready to submit, needs your answer, or failed,
+- a queued form finishes filling and is ready to submit, was submitted by Maverick, needs your answer, or failed,
 - the hourly check scores new apply-ready postings,
 - the hiring-post sweep drafts new notes.
 

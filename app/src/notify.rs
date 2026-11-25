@@ -27,6 +27,11 @@ pub fn fill_ended(title: &str, step: &Step) -> Option<Notice> {
             "Ready to submit",
             "Every required field is answered. Review it and click Submit.".to_owned(),
         ),
+        // A fill ends on `Submitting` only when Maverick submitted and the system confirmed it.
+        Step::Submitting => (
+            "Applied",
+            "Maverick submitted it and the application system confirmed.".to_owned(),
+        ),
         Step::NeedsYou(why) => ("Needs you", why.clone()),
         Step::Failed(why) => ("Fill failed", format!("Nothing was submitted. {why}")),
         Step::Queued | Step::Opening | Step::Filling | Step::Applied => return None,
@@ -196,6 +201,13 @@ mod tests {
             Some((
                 "Fill failed: Engineer, Example Co".into(),
                 "Nothing was submitted. the page did not load".into()
+            ))
+        );
+        assert_eq!(
+            said(Step::Submitting),
+            Some((
+                "Applied: Engineer, Example Co".into(),
+                "Maverick submitted it and the application system confirmed.".into()
             ))
         );
         for quiet in [Step::Queued, Step::Opening, Step::Filling, Step::Applied] {
