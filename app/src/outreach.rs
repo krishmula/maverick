@@ -663,7 +663,7 @@ impl OutreachView {
         };
         let bridge = self.bridge(cx);
         let profile = self.profile();
-        let auto_reach = maverick_core::auto::is_on(&database);
+        let auto_apply = maverick_core::auto::is_on(&database);
         let typing = self.typing.clone();
         let resume = self
             .answers
@@ -683,7 +683,7 @@ impl OutreachView {
                         .await?
                         .summary(),
                 ];
-                if auto_reach && let (Some(bridge), Ok(profile)) = (&bridge, &profile) {
+                if auto_apply && let (Some(bridge), Ok(profile)) = (&bridge, &profile) {
                     // Chrome has one active tab, so sends wait for any draft being typed.
                     let _turn = typing.lock().await;
                     let reached = maverick_core::auto::reach(&database, profile, bridge.clone(), resume.as_deref());

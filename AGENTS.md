@@ -21,5 +21,6 @@ _Avoid_: approvals, decision board, jobs list
 The view for hiring posts found on LinkedIn and the notes drafted to their posters.
 _Avoid_: outreach tab
 
-**Auto-reach**:
-The Jobs tab switch that lets Maverick approve each posting scored 75 or more and send a LinkedIn draft to the best two people at it, without the user's review.
+**Auto-apply**:
+The switch in Connections that lets Maverick approve each posting scored 75 or more and send a LinkedIn draft to the best two people at it, without the user's review. While it is off, the user approves each posting.
+_Avoid_: auto-reach

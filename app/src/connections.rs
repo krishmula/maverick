@@ -517,6 +517,8 @@ impl Connections {
                     }
                     all.push(section(part, self, cx));
                 }
+                all.push(rule(palette).into_any_element());
+                all.push(self.auto_apply(palette, cx).into_any_element());
                 all
             }
         }
@@ -747,6 +749,54 @@ impl Connections {
             }
         }
         section
+    }
+
+    /// The auto-apply switch. Without a data directory there is nothing to switch.
+    fn auto_apply(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let database = self.browser.read(cx).database();
+        let on = database.as_deref().is_some_and(maverick_core::auto::is_on);
+        let state = if on { "on" } else { "off" };
+        let explained = if on {
+            "Maverick approves each posting scored 75 or more and queues its form. Each hour it sends a \
+             LinkedIn draft to the best two people found at those postings, up to 20 a day, without your \
+             review. The auto-submit switch on the Jobs tab decides whether a filled form is submitted."
+        } else {
+            "You approve each posting on the Jobs tab, and every LinkedIn draft waits for you. Turn this on to \
+             let Maverick approve postings scored 75 or more and message the best two people at each."
+        };
+        v_flex()
+            .gap(px(10.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(ui::caps("auto-apply").text_color(palette.muted))
+                    .child(status_line(
+                        "auto-apply-status",
+                        state,
+                        palette.signal(if on { Signal::Done } else { Signal::Yours }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("auto-apply-switch")
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(format!("auto-apply {state}"))
+                    .cursor_pointer()
+                    .child(h_flex().gap(px(8.)).child(checkbox(on, palette)).child(ui::serif(
+                        "Apply and reach out on my behalf for postings scored 75 or more",
+                    )))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(database) = this.browser.read(cx).database() else {
+                            return;
+                        };
+                        if let Err(error) = maverick_core::auto::set_on(&database, !on) {
+                            this.problem = Some(format!("Could not save the auto-apply choice: {error}"));
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(ui::serif(explained).text_color(palette.muted).max_w(px(620.)))
     }
 
     fn chrome(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
@@ -991,6 +1041,43 @@ mod tests {
             );
             assert_eq!(window.find("ticktick-status").label(), Some("connected · 1 lists"));
             assert!(window.try_find("add-account").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_auto_apply_switch_starts_off_and_a_click_turns_it_on(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let bridge = maverick_core::bridge::Bridge::new();
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                crate::browser::Browser::new(bridge, background, Ok("/x".into()), None, Some(database.clone()), cx)
+            })
+        });
+        let (window, _view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Connections::new(browser, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("auto-apply-switch").label(), Some("auto-apply off"));
+            assert!(!maverick_core::auto::is_on(&database));
+            window.click("auto-apply-switch", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("auto-apply-switch").label(), Some("auto-apply on"));
+            assert!(maverick_core::auto::is_on(&database));
+            window.click("auto-apply-switch", cx);
+            window.render_frame(cx);
+            assert!(!maverick_core::auto::is_on(&database));
         })
         .unwrap();
     }

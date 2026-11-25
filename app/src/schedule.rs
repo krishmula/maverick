@@ -1,4 +1,4 @@
-//! Runs the funnel every hour while the app is open: intake, scoring, then the approvals auto-reach makes.
+//! Runs the funnel every hour while the app is open: intake, scoring, then the approvals auto-apply makes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,7 +81,7 @@ impl Funnel {
                 if maverick_core::auto::is_on(&database) {
                     let approved = maverick_core::auto::approve(&database)
                         .map_err(|error| format!("the database failed: {error}"))?;
-                    summary.push_str(&format!("; {approved} approved by auto-reach"));
+                    summary.push_str(&format!("; {approved} approved by auto-apply"));
                 }
                 let lists = tokio::task::spawn_blocking(move || stored_lists(Some(&database)))
                     .await

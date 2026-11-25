@@ -1,6 +1,7 @@
-//! Auto-reach: Maverick approves each posting scored 75 or more, and sends a draft to the best two
-//! people its outreach check found there, without the user's review. The user turns it off on the
-//! Jobs tab. Whether an approved form is also submitted is the auto-submit switch's call.
+//! Auto-apply: Maverick approves each posting scored 75 or more, and sends a draft to the best two
+//! people its outreach check found there, without the user's review. The user turns it on in
+//! Connections; while it is off, the user approves each posting. Whether an approved form is also
+//! submitted is the auto-submit switch's call.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,14 +35,14 @@ const FAILURES_IN_A_ROW: usize = 2;
 
 /// Where the switch is kept: a file next to the database that says `on` or `off`.
 fn switch_file(database: &Path) -> Option<PathBuf> {
-    Some(database.parent()?.join("auto-reach"))
+    Some(database.parent()?.join("auto-apply"))
 }
 
-/// Whether auto-reach is on. It is on until the user turns it off.
+/// Whether auto-apply is on. It is off until the user turns it on.
 pub fn is_on(database: &Path) -> bool {
     switch_file(database)
         .and_then(|file| std::fs::read_to_string(file).ok())
-        .is_none_or(|saved| saved.trim() != "off")
+        .is_some_and(|saved| saved.trim() == "on")
 }
 
 pub fn set_on(database: &Path, on: bool) -> std::io::Result<()> {
@@ -157,7 +158,7 @@ pub fn to_reach(
     picks
 }
 
-/// What one auto-reach run did.
+/// What one auto-apply outreach run did.
 #[derive(Debug, Default)]
 pub struct ReachRun {
     /// The people a draft went to.
@@ -170,7 +171,7 @@ pub struct ReachRun {
 
 impl ReachRun {
     pub fn summary(&self) -> String {
-        let mut line = format!("auto-reach sent {}", self.sent.len());
+        let mut line = format!("auto-apply sent {}", self.sent.len());
         if !self.sent.is_empty() {
             line.push_str(&format!(" ({})", self.sent.join(", ")));
         }
@@ -413,13 +414,13 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_is_on_until_turned_off() {
+    fn the_switch_is_off_until_turned_on() {
         let scratch = tempfile::tempdir().unwrap();
         let database = scratch.path().join("maverick.db");
-        assert!(is_on(&database));
-        set_on(&database, false).unwrap();
         assert!(!is_on(&database));
         set_on(&database, true).unwrap();
         assert!(is_on(&database));
+        set_on(&database, false).unwrap();
+        assert!(!is_on(&database));
     }
 }
