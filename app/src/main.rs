@@ -7,6 +7,7 @@ mod icon;
 mod main_view;
 mod mav;
 mod models;
+mod notify;
 mod outreach;
 mod pane_widths;
 mod queue;
@@ -91,6 +92,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             return cli::score(limit, dry_run);
         }
+        Some("notify") => {
+            let title = arguments.collect::<Vec<_>>().join(" ");
+            return notify::try_one(if title.is_empty() {
+                "Maverick notifications work"
+            } else {
+                &title
+            });
+        }
         Some("check-scores") => {
             let count = match arguments.next() {
                 Some(count) => count.parse().map_err(|_| "usage: maverick check-scores [count]")?,
@@ -130,6 +139,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            notify::ask_permission();
             let widths_file = maverick_core::data_dir().map(|dir| dir.join("pane-widths.json"));
             cx.set_global(pane_widths::PaneWidths::load(widths_file));
             ui::install(cx);

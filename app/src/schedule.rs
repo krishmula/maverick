@@ -77,6 +77,9 @@ impl Funnel {
                 let profile = Profile::load(&answers)?;
                 let sheet = maverick_core::sheet::linked_session().await?;
                 let pass = funnel::run_once(&database, profile, sheet).await?;
+                if let Some(notice) = crate::notify::apply_ready(pass.apply_ready()) {
+                    crate::notify::post(notice);
+                }
                 let mut summary = pass.summary();
                 if maverick_core::auto::is_on(&database) {
                     let approved = maverick_core::auto::approve(&database)
