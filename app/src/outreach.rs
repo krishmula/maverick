@@ -106,6 +106,19 @@ pub fn post_state(status: Outreach) -> (Signal, &'static str) {
     }
 }
 
+/// Which hiring posts the Posts tab lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PostsSection {
+    /// Posts that still need a note from the user: no draft, drafted, typed or skipped.
+    Waiting,
+    /// Posts whose note went out, and those that got a reply.
+    Sent,
+}
+
+fn is_sent(status: Outreach) -> bool {
+    matches!(status, Outreach::Sent | Outreach::Replied)
+}
+
 /// The most hiring posts without a draft that the Posts tab lists.
 const FOUND_SHOWN: usize = 100;
 
@@ -208,6 +221,7 @@ pub struct OutreachView {
     drafts: Vec<DraftRow>,
     /// The hiring posts worth a look that have no draft, newest first.
     found: Vec<HiringPost>,
+    section: PostsSection,
     /// The draft open in the editor.
     editing: Option<i64>,
     editor: Entity<TextareaState>,
@@ -244,6 +258,7 @@ impl OutreachView {
             scorer_reads: HashMap::new(),
             drafts: Vec::new(),
             found: Vec::new(),
+            section: PostsSection::Waiting,
             editing: None,
             editor,
             working: None,
@@ -1032,25 +1047,40 @@ impl OutreachView {
             .into_any_element()
     }
 
-    /// The Posts tab: the drafts for hiring posts, the posts found without one, and the run that
-    /// finds them.
+    /// The Posts tab: the hiring posts waiting on a note, or those whose note went out, and the run
+    /// that finds them.
     fn posts_column(&self, palette: &Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let mut rows: Vec<&DraftRow> = self
-            .drafts
-            .iter()
-            .filter(|row| matches!(row.draft.about, About::Post(_)))
-            .collect();
-        // Drafts waiting for a decision come first; decided ones keep their order below.
-        rows.sort_by_key(|row| row.draft.status != Outreach::Drafted);
+        let section = self.section;
+        let in_section = |status: Outreach| is_sent(status) == (section == PostsSection::Sent);
+        let post_drafts = || {
+            self.drafts
+                .iter()
+                .filter(|row| matches!(row.draft.about, About::Post(_)))
+        };
+        let mut rows: Vec<&DraftRow> = post_drafts().filter(|row| in_section(row.draft.status)).collect();
+        match section {
+            // Drafts waiting for a decision come first; decided ones keep their order below.
+            PostsSection::Waiting => rows.sort_by_key(|row| row.draft.status != Outreach::Drafted),
+            PostsSection::Sent => rows.sort_by_key(|row| std::cmp::Reverse(row.draft.updated_at)),
+        }
+        let found: Vec<&HiringPost> = self.found.iter().filter(|post| in_section(post.outreach)).collect();
+        let count = |sent: bool| {
+            post_drafts().filter(|row| is_sent(row.draft.status) == sent).count()
+                + self.found.iter().filter(|post| is_sent(post.outreach) == sent).count()
+        };
+        let (waiting, sent) = (count(false), count(true));
         let cards: Vec<AnyElement> = rows
             .into_iter()
             .map(|row| self.draft_card(row, palette, cx).into_any_element())
             .collect();
-        let empty = cards.is_empty().then(|| {
-            ui::serif(
-                "No drafts yet. Every two hours the sweep reads LinkedIn for hiring posts \
-                 and drafts a note for the ones that fit, up to 10 a day.",
-            )
+        let empty = (cards.is_empty() && found.is_empty()).then(|| {
+            ui::serif(match section {
+                PostsSection::Waiting => {
+                    "No drafts yet. Every two hours the sweep reads LinkedIn for hiring posts \
+                     and drafts a note for the ones that fit, up to 10 a day."
+                }
+                PostsSection::Sent => "No notes sent yet. A note lands here once you mark it sent.",
+            })
             .text_color(palette.muted)
         });
         let run_now = ui::button(
@@ -1059,6 +1089,17 @@ impl OutreachView {
             ui::quiet_face("check and sweep now", palette),
         )
         .on_click(cx.listener(|this, _, window, cx| this.run_now(true, window, cx)));
+        let choice = |id: &'static str, name: String, word: String, shows: PostsSection| {
+            let ink = palette.ink;
+            let face = ui::caps(word)
+                .text_color(if section == shows { palette.ink } else { palette.faint })
+                .hover(move |face| face.text_color(ink));
+            ui::button(id, name, face)
+        };
+        let found_heading = match section {
+            PostsSection::Waiting => "found, no draft",
+            PostsSection::Sent => "sent outside maverick",
+        };
         v_flex()
             .id("outreach-drafts")
             .size_full()
@@ -1069,8 +1110,26 @@ impl OutreachView {
             .gap(px(12.))
             .child(
                 h_flex()
-                    .justify_between()
-                    .child(ui::caps(format!("hiring posts · {} waiting", self.waiting())).text_color(palette.muted))
+                    .gap_4()
+                    .child(
+                        choice(
+                            "posts-waiting",
+                            format!("Waiting · {waiting}"),
+                            format!("waiting {waiting}"),
+                            PostsSection::Waiting,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.show_section(PostsSection::Waiting, cx))),
+                    )
+                    .child(
+                        choice(
+                            "posts-sent",
+                            format!("Sent · {sent}"),
+                            format!("sent {sent}"),
+                            PostsSection::Sent,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.show_section(PostsSection::Sent, cx))),
+                    )
+                    .child(div().flex_1())
                     .children(self.working.is_none().then_some(run_now)),
             )
             .children(
@@ -1091,23 +1150,28 @@ impl OutreachView {
             }))
             .children(empty)
             .children(cards)
-            .children((!self.found.is_empty()).then(|| {
-                let count = match self.found.len() {
+            .children((!found.is_empty()).then(|| {
+                let count = match found.len() {
                     all if all > FOUND_SHOWN => format!("newest {FOUND_SHOWN} of {all}"),
                     all => all.to_string(),
                 };
-                ui::caps(format!("found, no draft · {count}"))
+                ui::caps(format!("{found_heading} · {count}"))
                     .pt(px(8.))
                     .text_color(palette.muted)
             }))
             .children(
-                self.found
-                    .iter()
+                found
+                    .into_iter()
                     .take(FOUND_SHOWN)
                     .enumerate()
                     .map(|(at, post)| self.post_card(at, post, palette, cx))
                     .collect::<Vec<_>>(),
             )
+    }
+
+    fn show_section(&mut self, section: PostsSection, cx: &mut Context<Self>) {
+        self.section = section;
+        cx.notify();
     }
 
     /// A hiring post with no draft: who posted it, the role, why there is no draft, and the post.
@@ -1128,6 +1192,8 @@ impl OutreachView {
             }
             // A post the tracker links to a search page has no author Maverick can find.
             _ if outreach::post_without_a_page(&link).is_some() => None,
+            // Its note already went out from somewhere else.
+            _ if is_sent(post.outreach) => None,
             _ => {
                 let link = link.clone();
                 Some(
@@ -2049,6 +2115,93 @@ mod tests {
             );
             assert!(window.try_find("draft-post-2").is_none());
             assert!(window.try_find("post-3").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_note_marked_sent_leaves_waiting_for_sent(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let at: Timestamp = "2026-11-23T17:00:00Z".parse().unwrap();
+        let update = "https://www.linkedin.com/feed/update/urn:li:activity";
+        let store = Store::open(&database).unwrap();
+        let post = |n: u8, poster: &str, outreach: Outreach| HiringPost {
+            post_link: format!("{update}:{n}/"),
+            role: "Backend Engineer".into(),
+            found_at: at,
+            poster: poster.into(),
+            company: "Example Co".into(),
+            score: 72,
+            variant: "Backend/Infra".into(),
+            outreach,
+            notes: None,
+        };
+        // Di Poster has a draft in Maverick. Jo Sheet's note went out before Maverick, so only the sheet knows.
+        for found in [
+            post(1, "Di Poster", Outreach::Drafted),
+            post(2, "Jo Sheet", Outreach::Sent),
+        ] {
+            assert!(store.add_hiring_post(&found).unwrap());
+        }
+        let id = store
+            .add_draft(&Draft {
+                id: 0,
+                about: About::Post(format!("{update}:1/")),
+                person: "Di Poster".into(),
+                headline: "Engineering Manager".into(),
+                profile_url: "https://www.linkedin.com/in/di-poster/".into(),
+                slot: Slot::Note,
+                subject: None,
+                text: "Hi Di, I saw your post about the backend team.".into(),
+                status: Outreach::Typed,
+                created_at: at,
+                updated_at: at,
+            })
+            .unwrap()
+            .unwrap();
+        drop(store);
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| Browser::new(Bridge::new(), background, Ok("/x".into()), None, Some(database), cx))
+        });
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| OutreachView::new(browser, None, window, cx))
+            })
+            .unwrap()
+        });
+        let card = SharedString::from(format!("draft-{id}"));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("posts-waiting").label(), Some("Waiting · 1"));
+            assert_eq!(window.find("posts-sent").label(), Some("Sent · 1"));
+            assert!(window.try_find(card.clone()).is_some());
+            assert!(window.try_find("post-0").is_none());
+
+            view.update(cx, |view, cx| view.set_status(id, Outreach::Sent, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("posts-waiting").label(), Some("Waiting · 0"));
+            assert_eq!(window.find("posts-sent").label(), Some("Sent · 2"));
+            assert!(window.try_find(card.clone()).is_none());
+
+            view.update(cx, |view, cx| view.show_section(PostsSection::Sent, cx));
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(card.clone()).label(),
+                Some("Di Poster · Backend Engineer at Example Co · post · sent")
+            );
+            assert_eq!(
+                window.find("post-0").label(),
+                Some("Jo Sheet · Backend Engineer at Example Co · sent")
+            );
+            // Its note is out, so the post offers no draft.
+            assert!(window.try_find("draft-post-0").is_none());
         })
         .unwrap();
     }
