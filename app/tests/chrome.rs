@@ -16,6 +16,7 @@ use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::credentials::{Password, SignIn};
 use maverick_core::extension::{NATIVE_HOST, native_host_manifest};
 use maverick_core::greenhouse;
+use maverick_core::linkedin::{First, Reader, posts_page};
 use maverick_core::page::{Locator, Page, PageError};
 use maverick_core::workday;
 use serde_json::json;
@@ -1459,3 +1460,56 @@ const BLANK_PDF: &str = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
     2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
     3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n\
     trailer<</Root 1 0 R>>\n%%EOF\n";
+
+/// Made up, shaped like LinkedIn's content search: a screen of posts, and four more each time the
+/// last one comes into view, up to twenty.
+const SEARCH: &str = r#"<!doctype html>
+<title>Search</title>
+<main></main>
+<script>
+  const main = document.querySelector("main");
+  let made = 0;
+  const watcher = new IntersectionObserver((seen) => {
+    if (seen.some((entry) => entry.isIntersecting) && made < 20) add();
+  });
+  function add() {
+    watcher.disconnect();
+    for (let more = 0; more < 4; more++) {
+      made++;
+      main.insertAdjacentHTML("beforeend", `
+        <div role="listitem" componentkey="update-card-focus-${made}" style="height: 900px">
+          <a href="https://www.linkedin.com/in/person-${made}/">Person ${made}</a>
+          <p>Engineer at Example Co</p>
+          <div data-testid="expandable-text-box">We are hiring engineer number ${made}.</div>
+        </div>`);
+    }
+    watcher.observe(main.lastElementChild);
+  }
+  add();
+</script>
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_search_page_in_a_background_tab_is_scrolled_three_times_for_more_posts() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>Start</title>");
+    let search = serve(SEARCH).await;
+    wait_for(&mut states, "the start tab listed", |tabs| {
+        titled(tabs, "Start").is_some()
+    })
+    .await;
+
+    let mut reader = Reader::open(bridge, 2).await.unwrap();
+    let first_screen = posts_page(&reader.load(&search, First::Nothing).await.unwrap());
+    let scrolled = posts_page(&reader.load(&search, First::ScrollForPosts).await.unwrap());
+    reader.close().await;
+    assert_eq!(first_screen.len(), 4);
+    assert_eq!(scrolled.len(), 16);
+    assert_eq!(scrolled[15].poster, "Person 16");
+    assert_eq!(scrolled[15].text, "We are hiring engineer number 16.");
+}

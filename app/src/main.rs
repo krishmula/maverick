@@ -15,6 +15,7 @@ mod schedule;
 mod setup;
 mod tabs;
 mod ui;
+mod verdict;
 
 use std::error::Error;
 use std::io;

@@ -146,15 +146,15 @@ fn open_store() -> Result<Store, Box<dyn Error>> {
 
 fn profile() -> Result<Profile, Box<dyn Error>> {
     let file = maverick_core::answers_path().ok_or("this system has no application data directory")?;
-    let answers = Answers::load(&file)?;
-    if answers.background.is_empty() {
+    let profile = Profile::load(&file)?;
+    if profile.background.is_empty() {
         return Err(format!(
             "{} has no background, so there is no resume to score against",
             file.display()
         )
         .into());
     }
-    Ok(Profile::from(&answers))
+    Ok(profile)
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -637,7 +637,7 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use maverick_core::outreach;
 
     const USAGE: &str = "usage: maverick linkedin connections <Connections.csv> | check [--no-chrome] [--posting <link>]... | sweep | drafts \
-                         | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
+                         | credits <profile address> | draft-post <post link> | try-draft <post link> <note|message|inmail> | type <draft id> | redraft <draft id> | status <draft id> <not-started|skipped|drafted|typed|sent|replied> \
                          | page <LinkedIn address> <out.html> | read <people|posts> <saved.html> \
                          | dump-tab <out.html> [script]";
     let database = maverick_core::database_path().ok_or("this system has no application data directory")?;
@@ -702,7 +702,10 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 let mut reader = Reader::open(chrome().await?, 1)
                     .await
                     .map_err(|stop| stop.to_string())?;
-                let html = reader.load(address, false).await.map_err(|stop| stop.to_string());
+                let html = reader
+                    .load(address, maverick_core::linkedin::First::Nothing)
+                    .await
+                    .map_err(|stop| stop.to_string());
                 reader.close().await;
                 html
             })?;
@@ -813,9 +816,61 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         ["type", id] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;
-            runtime()?.block_on(async { outreach::type_approved(&database, chrome().await?, id).await })?;
-            println!("Typed draft #{id} in Chrome. Read it there and click Send yourself.");
+            let resume = maverick_core::answers_path()
+                .and_then(|file| Answers::load(&file).ok())
+                .map(|answers| answers.resume);
+            let typed = runtime()?
+                .block_on(async { outreach::type_approved(&database, chrome().await?, id, resume.as_deref()).await })?;
+            println!("Draft #{id}: {}", typed.said());
             println!("Then: maverick linkedin status {id} sent");
+        }
+        // Shows the message window of a profile outside the network, where LinkedIn says how many
+        // InMail credits are left. It types nothing.
+        ["credits", profile] => {
+            let text = runtime()?.block_on(async {
+                let mut reader = Reader::open(chrome().await?, 1)
+                    .await
+                    .map_err(|stop| stop.to_string())?;
+                let text = reader.message_window(profile).await.map_err(|stop| stop.to_string());
+                reader.close().await;
+                text
+            })?;
+            println!("{text}");
+            match maverick_core::linkedin::inmail_cost(&text) {
+                Some(cost) => println!("An InMail to this person: {cost:?}"),
+                None => println!("The window says nothing about what an InMail costs."),
+            }
+        }
+        // Drafts a message to the author of a hiring post the store holds, as the Posts tab's draft button does.
+        ["draft-post", link] => {
+            let profile = profile()?;
+            let made = runtime()?
+                .block_on(async { outreach::draft_for_post(&database, &profile, Some(chrome().await?), link).await })?;
+            let draft = made.draft;
+            println!(
+                "#{} {} to {} ({})",
+                draft.id,
+                draft.slot.as_str(),
+                draft.person,
+                draft.profile_url
+            );
+            if let Some(why) = made.credits_unread {
+                println!("    Your InMail credits could not be read ({why}), so this is a connection note.");
+            }
+            if let Some(subject) = &draft.subject {
+                println!("    subject: {subject}");
+            }
+            println!("    {}", draft.text.replace('\n', "\n    "));
+        }
+        // Prints a draft to a post's author in a given slot and saves nothing: for judging the voice.
+        ["try-draft", link, slot] => {
+            let slot = maverick_core::linkedin::Slot::parse(slot).ok_or(USAGE)?;
+            let profile = profile()?;
+            let written = runtime()?.block_on(outreach::try_draft(&database, &profile, link, slot))?;
+            if let Some(subject) = &written.subject {
+                println!("subject: {subject}\n");
+            }
+            println!("{}", written.text);
         }
         ["status", id, status] => {
             let id: i64 = id.parse().map_err(|_| USAGE)?;

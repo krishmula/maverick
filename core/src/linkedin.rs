@@ -2,9 +2,10 @@
 //!
 //! LinkedIn restricts accounts that load many pages, so every page goes through `Visits`:
 //! a cap per run and a random wait between loads. Maverick reads a company's People page
-//! and the hiring-post search, never general people search, and never opens a profile
-//! except to type a draft the user approved.
+//! and the hiring-post search, never general people search. It opens a profile only to type a
+//! draft the user approved, or to read what an InMail costs when the user asks for a draft.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -413,13 +414,16 @@ pub fn post_search_address(keywords: &str) -> String {
     )
 }
 
+/// One post on a content search page.
+const POST_CARD: &str = r#"[role="listitem"][componentkey^="update-card-focus"]"#;
+
 /// Reads the posts on a content search page. Each post is a list item whose texts start with the
 /// poster's link (name, then degree), then the headline and the age. The post's text sits in its
 /// expandable text box.
 pub fn posts_page(html: &str) -> Vec<Post> {
     let page = Html::parse_document(html);
     let mut posts: Vec<Post> = Vec::new();
-    for card in page.select(&selector("[role=\"listitem\"][componentkey^=\"update-card-focus\"]")) {
+    for card in page.select(&selector(POST_CARD)) {
         let Some(body) = card.select(&selector("[data-testid=\"expandable-text-box\"]")).next() else {
             continue;
         };
@@ -584,6 +588,16 @@ pub fn is_wall(address: &str) -> bool {
         .any(|wall| address.contains(wall))
 }
 
+/// What a `Reader` does on a page before it reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum First {
+    Nothing,
+    /// Opens the posts LinkedIn cut short. For a post's own page.
+    OpenPosts,
+    /// Scrolls a search page for more posts, then opens the cut-short ones.
+    ScrollForPosts,
+}
+
 /// One background tab in the user's Chrome that loads LinkedIn pages, within a cap and at a person's pace.
 pub struct Reader {
     page: Page,
@@ -601,6 +615,31 @@ const EXPAND_POSTS: &str = r#"(async () => {
     await new Promise((done) => setTimeout(done, 1500));
     return true;
 })()"#;
+
+/// The most times one search page is scrolled for more posts.
+const SCROLLS: usize = 3;
+
+/// Scrolls to the last post until LinkedIn stops adding more, at most `SCROLLS` times. A search
+/// page first shows only a screen of posts and loads the next ones when the last comes into view.
+/// Gives how many posts the page holds in the end.
+fn more_posts() -> String {
+    format!(
+        r#"(async () => {{
+    const posts = () => document.querySelectorAll('{POST_CARD}');
+    for (let scroll = 0; scroll < {SCROLLS}; scroll++) {{
+        const before = posts().length;
+        if (before === 0) break;
+        posts()[before - 1].scrollIntoView({{ block: "start" }});
+        const until = Date.now() + 5000;
+        while (posts().length === before && Date.now() < until) {{
+            await new Promise((done) => setTimeout(done, 500));
+        }}
+        if (posts().length === before) break;
+    }}
+    return posts().length;
+}})()"#
+    )
+}
 
 impl Reader {
     /// Opens a tab behind the user's current one. Chrome shows its debugging bar until `close`.
@@ -628,8 +667,8 @@ impl Reader {
         })
     }
 
-    /// Loads a page after the pacing wait and gives its HTML. `expand` opens cut-short posts first.
-    pub async fn load(&mut self, address: &str, expand: bool) -> Result<String, Stop> {
+    /// Loads a page after the pacing wait, does what `first` says, and gives the page's HTML.
+    pub async fn load(&mut self, address: &str, first: First) -> Result<String, Stop> {
         let wait = self.visits.next(fastrand::f64()).ok_or(Stop::CapReached)?;
         tokio::time::sleep(wait).await;
         self.page.navigate(address).await?;
@@ -640,11 +679,40 @@ impl Reader {
         if is_wall(landed) {
             return Err(Stop::SignedOut(landed.to_owned()));
         }
-        if expand {
+        if first == First::ScrollForPosts {
+            self.page.evaluate(&more_posts()).await?;
+        }
+        if first != First::Nothing {
             self.page.evaluate(EXPAND_POSTS).await?;
         }
         let html = self.page.evaluate("document.documentElement.outerHTML").await?;
         Ok(html.as_str().unwrap_or_default().to_owned())
+    }
+
+    /// Opens the profile and its message window, and gives what the window says an InMail costs.
+    /// `None` when the window says nothing about it. Nothing is typed there.
+    pub async fn inmail_cost(&mut self, profile_url: &str) -> Result<Option<InMailCost>, Stop> {
+        Ok(inmail_cost(&self.message_window(profile_url).await?))
+    }
+
+    /// Opens the profile and its message window, and gives the window's text. Nothing is typed there.
+    pub async fn message_window(&mut self, profile_url: &str) -> Result<String, Stop> {
+        self.load(profile_url, First::Nothing).await?;
+        self.page.wait_for(&Control::Message.locator(), STEP_WAIT).await?;
+        self.page.click(&Control::Message.locator()).await?;
+        let window = Locator::script("message window", compose_text());
+        self.page.wait_for(&window, STEP_WAIT).await?;
+        // The credits line is drawn a few seconds after the window.
+        let mut text = String::new();
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let shown = self.page.evaluate(&compose_text()).await?;
+            text = shown.as_str().unwrap_or_default().to_owned();
+            if inmail_cost(&text).is_some() {
+                break;
+            }
+        }
+        Ok(text)
     }
 
     /// How many pages this reader loaded.
@@ -687,6 +755,7 @@ pub enum Slot {
     /// A direct message, which only a connection can receive.
     Message,
     /// A Premium InMail to someone outside the network: a subject and a body. Sending one uses a credit.
+    #[serde(alias = "inmail")]
     InMail,
 }
 
@@ -718,12 +787,13 @@ impl Slot {
         }
     }
 
-    /// A connection gets a message; anyone else gets a connection note first.
-    pub fn for_degree(degree: Option<&str>) -> Self {
-        if degree == Some("1st") {
-            Self::Message
-        } else {
-            Self::Note
+    /// A connection gets a message. Anyone else gets an InMail while a credit is free, and a
+    /// connection note otherwise.
+    pub fn to_reach(degree: Option<&str>, inmail_credit: bool) -> Self {
+        match degree {
+            Some("1st") => Self::Message,
+            _ if inmail_credit => Self::InMail,
+            _ => Self::Note,
         }
     }
 }
@@ -817,35 +887,98 @@ impl Control {
 const OPEN_DIALOG: &str = "dialog[open], [role='dialog']:not([aria-hidden='true'])";
 const NOTE_FIELD: &str = "document.querySelector(\"dialog[open] textarea, [role='dialog'] textarea[name='message'], \
                           textarea#custom-message, dialog[open] [contenteditable='true']\")";
-/// The message box, and never a comment box on the profile's posts.
-const MESSAGE_FIELD: &str = r#"[...document.querySelectorAll("[contenteditable='true']")]
-    .filter((box) => box.closest(".msg-form")
-        || /message/i.test(box.getAttribute("aria-label") || box.getAttribute("aria-placeholder") || ""))
-    .pop() || null"#;
-/// The windows an InMail compose may open in: a native dialog, the messaging overlay, or a box
-/// LinkedIn marks as a compose. Not verified on a real page yet.
-const COMPOSE_WINDOWS: &str = "dialog[open], [role='dialog']:not([aria-hidden='true']), \
-                               .msg-overlay-conversation-bubble, [data-testid*='compose' i], [class*='compose' i]";
+/// The newest open message form. LinkedIn draws its message windows inside a shadow root, which a
+/// query on the document does not reach, so this looks in the document and in that root.
+const MESSAGE_FORM: &str = r#"[document, ...[...document.querySelectorAll('[data-testid="interop-shadowdom"]')]
+        .map((host) => host.shadowRoot).filter(Boolean)]
+    .flatMap((root) => [...root.querySelectorAll(".msg-form")])
+    .filter((form) => form.getClientRects().length > 0)
+    .pop()"#;
 
-/// The InMail subject field and the body field beside it, as a script that gives one of them.
-fn inmail_field(which: &str) -> String {
-    format!(
-        r#"(() => {{
-            const shown = (element) => element.getClientRects().length > 0;
-            const isSubject = (field) => field.matches("input")
-                && /subject/i.test([field.placeholder, field.getAttribute("aria-label"), field.name].join(" "));
-            // The innermost visible window that holds a subject field.
-            const window = [...document.querySelectorAll("{COMPOSE_WINDOWS}")]
-                .filter(shown)
-                .reverse()
-                .find((candidate) => [...candidate.querySelectorAll("input")].some((field) => shown(field) && isSubject(field)));
-            if (!window) return null;
-            const subject = [...window.querySelectorAll("input")].find((field) => shown(field) && isSubject(field));
-            if ("{which}" === "subject") return subject;
-            return [...window.querySelectorAll("[contenteditable='true'], textarea")]
-                .find((field) => shown(field) && field !== subject) || null;
-        }})()"#
+/// A script that gives one part of the newest open message form, or `null`.
+fn in_message_form(part: &str) -> String {
+    format!("(() => {{ const form = {MESSAGE_FORM}; return form ? ({part}) : null; }})()")
+}
+
+/// The box a message or an InMail body is typed in.
+fn message_field() -> String {
+    in_message_form(r#"form.querySelector("[contenteditable='true']")"#)
+}
+
+/// The subject field, which only an InMail has.
+fn inmail_subject_field() -> String {
+    in_message_form(r#"form.querySelector("input[name='subject']")"#)
+}
+
+/// The file input that takes a document. The one before it takes images only.
+fn attachment_field() -> String {
+    in_message_form(
+        r#"[...form.querySelectorAll("input[type='file']")].find((input) => input.accept.includes(".pdf")) || null"#,
     )
+}
+
+/// The text of the window the newest message form is in, or `null` while none is open.
+fn compose_text() -> String {
+    in_message_form(r#"(form.closest(".msg-overlay-conversation-bubble") || form).innerText"#)
+}
+
+/// The InMail credits a message window says are left, as in "Use 1 of 3 InMail credits".
+pub fn credits_in(compose: &str) -> Option<u32> {
+    let words: Vec<&str> = compose.split_whitespace().collect();
+    words
+        .windows(3)
+        .find(|part| part[1] == "InMail" && part[2].starts_with("credit"))
+        .and_then(|part| part[0].parse().ok())
+}
+
+/// What a message window says an InMail to its person costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InMailCost {
+    /// The person takes messages from anyone, so no credit is used.
+    Free,
+    /// One credit, of this many left.
+    Credit { left: u32 },
+}
+
+pub fn inmail_cost(compose: &str) -> Option<InMailCost> {
+    if compose.contains("Free message") {
+        return Some(InMailCost::Free);
+    }
+    credits_in(compose).map(|left| InMailCost::Credit { left })
+}
+
+/// Whether the user's resume went into a typed message.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resume {
+    /// A connection note takes no file, or no resume was given.
+    NotAsked,
+    Attached,
+    /// The message is typed, but the file did not go in.
+    NotAttached(String),
+}
+
+/// What typing a draft left in LinkedIn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Typed {
+    pub resume: Resume,
+    /// The InMail credits the message window said are left.
+    pub credits: Option<u32>,
+}
+
+impl Typed {
+    /// What to tell the user to do next.
+    pub fn said(&self) -> String {
+        match &self.resume {
+            Resume::NotAsked => "Typed in Chrome. Read it there and click Send yourself, then mark it sent.".into(),
+            Resume::Attached => "Typed in Chrome with your resume attached. Read it there and click Send yourself, \
+                                 then mark it sent."
+                .into(),
+            Resume::NotAttached(why) => format!(
+                "Typed in Chrome, but your resume was not attached: {why}. Attach it there if you want it, \
+                 click Send yourself, then mark it sent."
+            ),
+        }
+    }
 }
 
 /// LinkedIn asks for the person's email before some connection requests. Maverick never invents one.
@@ -857,14 +990,16 @@ const STEP_WAIT: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_secs(3);
 
 /// Opens the person's profile in the user's Chrome, opens the message or connection dialog,
-/// and types the approved draft. It stops there: the user reviews it and clicks Send.
+/// and types the approved draft. A message or an InMail also gets `resume` attached.
+/// It stops there: the user reviews it and clicks Send.
 pub async fn type_draft(
     bridge: Arc<Bridge>,
     profile_url: &str,
     slot: Slot,
     subject: Option<&str>,
     text: &str,
-) -> Result<(), String> {
+    resume: Option<&Path>,
+) -> Result<Typed, String> {
     if !profile_url.starts_with(&format!("{SITE}/in/")) {
         return Err(format!("{profile_url} is not a LinkedIn profile"));
     }
@@ -880,13 +1015,35 @@ pub async fn type_draft(
     let opened = bridge.request(connection, &blank).await.map_err(said)?;
     let tab = opened_tab(connection, &opened, true).map_err(|stop| stop.to_string())?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
-    let typed = type_in(&page, profile_url, slot, subject, text).await;
+    let typed = type_in(&page, profile_url, slot, subject, text, resume).await;
     // The debugging bar goes away; the dialog and the typed draft stay for the user.
     let _ = page.detach().await;
     typed
 }
 
-async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&str>, text: &str) -> Result<(), String> {
+/// Puts the resume into the open message form. The message stays typed when this fails.
+async fn attach(page: &Page, resume: Option<&Path>) -> Resume {
+    let Some(resume) = resume else {
+        return Resume::NotAsked;
+    };
+    if !resume.is_file() {
+        return Resume::NotAttached(format!("{} is not a file", resume.display()));
+    }
+    let field = Locator::script("attach a file", attachment_field());
+    match page.upload(&field, &[resume]).await {
+        Ok(()) => Resume::Attached,
+        Err(error) => Resume::NotAttached(error.to_string()),
+    }
+}
+
+async fn type_in(
+    page: &Page,
+    profile_url: &str,
+    slot: Slot,
+    subject: Option<&str>,
+    text: &str,
+    resume: Option<&Path>,
+) -> Result<Typed, String> {
     let said = |error: PageError| error.to_string();
     page.navigate(profile_url).await.map_err(said)?;
     let landed = page.evaluate("location.href").await.map_err(said)?;
@@ -908,7 +1065,13 @@ async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&st
                 .await
                 .map_err(|_| "the profile has no Message button, so this person may not be a connection".to_owned())?;
             page.click(&message.locator()).await.map_err(said)?;
-            Locator::script("message box", MESSAGE_FIELD)
+            let field = Locator::script("message box", message_field());
+            page.wait_for(&field, STEP_WAIT).await.map_err(said)?;
+            page.fill(&field, text).await.map_err(said)?;
+            return Ok(Typed {
+                resume: attach(page, resume).await,
+                credits: None,
+            });
         }
         Slot::Note => {
             if let Ok(connect) = found(Control::Connect).await {
@@ -960,24 +1123,31 @@ async fn type_in(page: &Page, profile_url: &str, slot: Slot, subject: Option<&st
             page.click(&Control::Message.locator())
                 .await
                 .map_err(step(1, "the top card's Message button"))?;
-            let subject_field = Locator::script("InMail subject field", inmail_field("subject"));
+            let subject_field = Locator::script("InMail subject field", inmail_subject_field());
             page.wait_for(&subject_field, STEP_WAIT)
                 .await
                 .map_err(step(2, "the InMail window with a subject field"))?;
             page.fill(&subject_field, subject)
                 .await
                 .map_err(step(3, "the InMail subject field"))?;
-            let body = Locator::script("InMail body field", inmail_field("body"));
+            let body = Locator::script("InMail body field", message_field());
             page.wait_for(&body, STEP_WAIT)
                 .await
                 .map_err(step(4, "the InMail body field"))?;
             page.fill(&body, text).await.map_err(step(4, "the InMail body field"))?;
-            return Ok(());
+            let window = page.evaluate(&compose_text()).await.map_err(said)?;
+            return Ok(Typed {
+                resume: attach(page, resume).await,
+                credits: credits_in(window.as_str().unwrap_or_default()),
+            });
         }
     };
     page.wait_for(&field, STEP_WAIT).await.map_err(said)?;
     page.fill(&field, text).await.map_err(said)?;
-    Ok(())
+    Ok(Typed {
+        resume: Resume::NotAsked,
+        credits: None,
+    })
 }
 
 #[cfg(test)]
@@ -1243,6 +1413,21 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
     }
 
     #[test]
+    fn a_message_window_says_how_many_inmail_credits_are_left() {
+        let window = "Sam Poster\nEngineer at Example Co\nPremium\nUse 1 of 3 InMail credits\nSubject (optional)";
+        assert_eq!(credits_in(window), Some(3));
+        assert_eq!(credits_in("You have 0 InMail credits"), Some(0));
+        assert_eq!(credits_in("Use 1 of 1 InMail credit"), Some(1));
+        assert_eq!(credits_in("Sam Poster\nWrite a message…"), None);
+        assert_eq!(inmail_cost(window), Some(InMailCost::Credit { left: 3 }));
+        assert_eq!(
+            inmail_cost("Sam Poster\nPremium InMail composer\nFree message | Why?"),
+            Some(InMailCost::Free)
+        );
+        assert_eq!(inmail_cost("Sam Poster\nWrite a message…"), None);
+    }
+
+    #[test]
     fn nothing_the_typing_flow_clicks_is_a_send_button() {
         for control in Control::ALL {
             let locator = control.locator();
@@ -1250,13 +1435,19 @@ Cy,Nolink,,,Other LLC,Engineer,\n";
             assert!(!script.contains("send"), "{control:?} could reach a Send button");
             assert!(!script.contains("submit"), "{control:?} could reach a submit button");
         }
-        for which in ["subject", "body"] {
-            let script = inmail_field(which).to_lowercase();
+        for script in [
+            message_field(),
+            inmail_subject_field(),
+            attachment_field(),
+            compose_text(),
+        ] {
+            let script = script.to_lowercase();
             assert!(!script.contains("send") && !script.contains("submit") && !script.contains("click"));
         }
-        assert_eq!(Slot::for_degree(Some("1st")), Slot::Message);
-        assert_eq!(Slot::for_degree(Some("2nd")), Slot::Note);
-        assert_eq!(Slot::for_degree(None), Slot::Note);
+        assert_eq!(Slot::to_reach(Some("1st"), true), Slot::Message);
+        assert_eq!(Slot::to_reach(Some("2nd"), true), Slot::InMail);
+        assert_eq!(Slot::to_reach(Some("3rd+"), false), Slot::Note);
+        assert_eq!(Slot::to_reach(None, false), Slot::Note);
         for slot in [Slot::Note, Slot::Message, Slot::InMail] {
             assert_eq!(Slot::parse(slot.as_str()), Some(slot));
         }

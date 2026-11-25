@@ -29,6 +29,7 @@ pub mod store;
 pub mod text;
 pub mod ticktick;
 pub mod tracker;
+pub mod voice;
 pub mod workday;
 pub mod xlsx;
 

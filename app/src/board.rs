@@ -15,12 +15,13 @@ use crate::queue::{Run, Step};
 use crate::report;
 use crate::tabs::host_of;
 use crate::ui::{self, Palette, Signal};
+use crate::verdict::Verdict;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::{IndexPath, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TestSupportExt as _, Window, div, px, relative,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
 use maverick_core::apply::{self, System};
@@ -76,6 +77,11 @@ pub fn address_of(posting: &Posting) -> String {
     apply::posting_address(&address).unwrap_or(address)
 }
 
+/// Scoring found nothing that blocks an application. Muse worded the rest of that verdict differently.
+fn is_apply_ready(notes: &str) -> bool {
+    notes.starts_with(APPLY_READY) || notes.starts_with("Apply-ready")
+}
+
 /// What the board shows: the postings and the applications.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BoardData {
@@ -110,10 +116,7 @@ impl BoardData {
                 found_at: posting.found_at,
                 source: posting.source.clone(),
                 address: address_of(posting),
-                apply_ready: posting
-                    .notes
-                    .as_deref()
-                    .is_some_and(|notes| notes.starts_with(APPLY_READY)),
+                apply_ready: posting.notes.as_deref().is_some_and(is_apply_ready),
                 decision: decisions.get(&posting.link).copied(),
             })
             .filter(|entry| !applied.contains(&entry.address))
@@ -145,9 +148,9 @@ pub fn system_label(address: &str) -> &'static str {
     if on("simplify.jobs") {
         "Simplify"
     } else if on("amazon.jobs") {
-        "Amazon"
+        "Amazon Jobs"
     } else if on("oraclecloud.com") {
-        "Oracle"
+        "Oracle Cloud"
     } else if on("lever.co") {
         "Lever"
     } else if on("linkedin.com") {
@@ -352,11 +355,9 @@ impl ListDelegate for Rows {
                     (None, Some(score)) if score < 60 => palette.faint,
                     _ => palette.muted,
                 };
-                let mut from = vec![entry.company.clone(), entry.system().to_owned()];
-                from.extend(entry.variant.clone());
+                let company_tone = if selected { palette.ink } else { palette.muted };
                 let mut more = vec![entry.found_at.strftime("%b %-d").to_string()];
                 more.extend(entry.location.clone());
-                more.extend(entry.flags.clone());
                 let outreach = self.outreach.read(cx);
                 let reach = reach_line(outreach.check(&entry.link), &palette);
                 let draft = outreach.draft_status(&entry.link).map(|status| {
@@ -372,7 +373,20 @@ impl ListDelegate for Rows {
                             .flex_1()
                             .min_w_0()
                             .child(ui::serif(entry.title.clone()).truncate().text_color(tone))
-                            .child(ui::caps(from.join(" / ")).truncate().text_color(palette.faint))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap(px(7.))
+                                    .py(px(2.))
+                                    .child(
+                                        ui::caps(&entry.company)
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .text_color(company_tone),
+                                    )
+                                    .child(ui::caps("on").flex_none().text_color(palette.faint))
+                                    .child(ui::caps(entry.system()).flex_none().text_color(palette.muted)),
+                            )
                             .child(ui::caps(more.join(" · ")).truncate().text_color(palette.faint))
                             .child(reach),
                     )
@@ -450,6 +464,8 @@ pub struct Board {
     focus: FocusHandle,
     /// How many of the applications sent in this run the board has moved to Submitted.
     moved: usize,
+    /// The address last copied, so its button can say so.
+    copied: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -497,6 +513,7 @@ impl Board {
             problem: None,
             focus: cx.focus_handle(),
             moved: 0,
+            copied: None,
             _subscriptions,
         };
         board.replace(data, window, cx);
@@ -713,6 +730,82 @@ impl Board {
         .detach();
     }
 
+    /// The address of the selected posting or application.
+    fn selected_address(&self, cx: &App) -> Option<String> {
+        let rows = self.list.read(cx).delegate();
+        match rows.selected_entry() {
+            Some(entry) => Some(entry.address.clone()),
+            None => rows.selected_application()?.link.clone(),
+        }
+    }
+
+    /// Opens the selected posting in the default browser.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(address) = self.selected_address(cx) {
+            cx.open_url(&address);
+        }
+    }
+
+    fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(address) = self.selected_address(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(address.clone()));
+            self.copied = Some(address);
+            cx.notify();
+        }
+    }
+
+    /// The buttons that open and copy the posting's address, and the address itself, which opens it too.
+    fn link_bar(&self, address: &str, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let copied = self.copied.as_deref() == Some(address);
+        let ink = palette.ink;
+        let shown = address
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.")
+            .to_owned();
+        h_flex()
+            .flex_none()
+            .gap_3()
+            .px_4()
+            .pb(px(12.))
+            .border_b_1()
+            .border_color(palette.line)
+            .child(
+                ui::button(
+                    "open-posting",
+                    "Open posting",
+                    ui::quiet_face("open posting ↗  o", palette),
+                )
+                .tip("Open the posting in your browser.")
+                .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
+            )
+            .child(
+                ui::button(
+                    "copy-link",
+                    "Copy link",
+                    ui::quiet_face(if copied { "copied" } else { "copy link" }, palette),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.copy_selected(cx))),
+            )
+            .child(
+                ui::button(
+                    "posting-address",
+                    "Posting address",
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(ui::MONO)
+                        .text_size(px(11.))
+                        .truncate()
+                        .text_color(palette.faint)
+                        .hover(move |face| face.text_color(ink))
+                        .child(SharedString::from(shown)),
+                )
+                .tip(SharedString::from(address.to_owned()))
+                .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
+            )
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Letters typed into a draft are text, not decisions.
         if self.outreach.read(cx).is_editing() {
@@ -724,6 +817,7 @@ impl Board {
             _ if modifiers.modified() => return,
             "a" => self.decide(Decision::Approved, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
+            "o" => self.open_selected(cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -883,9 +977,11 @@ impl Board {
                 ("notes", sent.notes.clone().unwrap_or_default()),
             ];
             let role = sent.role.clone().unwrap_or_else(|| "(no company in the sheet)".into());
+            let link = sent.link.clone();
             return v_flex()
                 .size_full()
                 .child(header("submitted", &role, None, palette))
+                .children(link.map(|link| self.link_bar(&link, palette, cx)))
                 .child(div().px_4().py_3().child(ui::facts(&facts, palette)));
         }
         let Some(entry) = rows.selected_entry().cloned() else {
@@ -897,17 +993,12 @@ impl Board {
             Sponsorship::Unknown => "unknown",
         };
         let facts = [
-            ("variant", entry.variant.clone().unwrap_or_default()),
-            ("flags", entry.flags.clone().unwrap_or_default()),
-            ("visa", sponsorship.to_owned()),
             ("location", entry.location.clone().unwrap_or_default()),
+            ("visa", sponsorship.to_owned()),
             ("found", entry.found_at.strftime("%b %-d, %Y").to_string()),
             ("source", entry.source.clone()),
-            ("system", entry.system().to_owned()),
             ("address", entry.address.clone()),
-            ("verdict", entry.notes.clone().unwrap_or_default()),
         ];
-        let tag = format!("{} / {}", entry.company, entry.system());
         let run = match entry.decision {
             Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
             _ => None,
@@ -951,9 +1042,11 @@ impl Board {
                     .into_any_element()
             })
         };
+        let link_bar = self.link_bar(&entry.address, palette, cx);
         v_flex()
             .size_full()
-            .child(header(&tag, &entry.title, Some(entry.score), palette))
+            .child(posting_header(&entry, palette))
+            .child(link_bar)
             .children(run.as_ref().map(|run| run_status(run, palette)))
             .child(
                 div()
@@ -963,11 +1056,13 @@ impl Board {
                     .overflow_y_scroll()
                     .px_4()
                     .py_3()
-                    .child(outreach)
                     .child(match run.as_ref().and_then(|run| run.report.as_ref()) {
                         Some(report) => report::sections(report, palette),
-                        None => ui::facts(&facts, palette),
-                    }),
+                        None => verdict_view(&entry, palette),
+                    })
+                    .child(outreach)
+                    .child(ui::caps("details").pb(px(8.)).text_color(palette.faint))
+                    .child(ui::facts(&facts, palette)),
             )
             .child(
                 h_flex()
@@ -986,6 +1081,117 @@ impl Board {
                     .child(ui::serif(note).ml_auto().text_size(px(13.5)).text_color(palette.muted)),
             )
     }
+}
+
+/// The company and the application system above the posting's title, all of which can be copied.
+fn posting_header(entry: &Entry, palette: &Palette) -> Div {
+    h_flex()
+        .flex_none()
+        .items_end()
+        .justify_between()
+        .gap_4()
+        .px_4()
+        .pt(px(14.))
+        .pb(px(10.))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(6.))
+                .child(
+                    h_flex()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_family(ui::MONO)
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_size(px(13.))
+                                .line_height(px(17.))
+                                .text_color(palette.ink)
+                                .child(ui::selectable("posting-company", &entry.company.to_uppercase())),
+                        )
+                        .child(ui::boxed(entry.system(), palette.muted)),
+                )
+                .child(
+                    div()
+                        .font_family(ui::SERIF)
+                        .text_size(px(26.))
+                        .line_height(px(30.))
+                        .text_color(palette.ink)
+                        .child(ui::selectable("posting-title", &entry.title)),
+                ),
+        )
+        .child(ui::score(entry.score, 54.).text_color(palette.ink))
+}
+
+/// What scoring said, in parts: the reason, then what blocks, what to watch, the team and whom to reach.
+fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
+    let verdict = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref());
+    let status = match (&entry.notes, entry.apply_ready) {
+        (_, true) => ui::chip(Signal::Yours, "apply-ready", palette),
+        (None, _) => ui::boxed("not scored", palette.faint),
+        (Some(_), false) => ui::boxed("review", palette.muted),
+    };
+    let reading = |size: f32, line: f32| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .font_family(ui::SERIF)
+            .text_size(px(size))
+            .line_height(px(line))
+    };
+    let points = |id: &'static str, label: &str, items: &[String], mark: gpui_kit::Hsla| {
+        (!items.is_empty()).then(|| {
+            v_flex()
+                .gap(px(5.))
+                .child(ui::caps(label).text_color(palette.faint))
+                .children(items.iter().enumerate().map(|(ix, item)| {
+                    h_flex()
+                        .items_start()
+                        .gap(px(9.))
+                        .child(ui::square(mark).mt(px(7.)))
+                        .child(
+                            reading(13.5, 19.)
+                                .text_color(palette.muted)
+                                .child(ui::selectable(format!("{id}-{ix}"), item)),
+                        )
+                }))
+        })
+    };
+    let team: Vec<String> = verdict.team.iter().cloned().collect();
+    v_flex()
+        .gap(px(12.))
+        .pb(px(14.))
+        .mb(px(14.))
+        .border_b_1()
+        .border_color(palette.line)
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .child(ui::caps("verdict").text_color(palette.faint))
+                .child(status)
+                .children(entry.variant.clone().map(|variant| ui::boxed(variant, palette.faint))),
+        )
+        .children((!verdict.reason.is_empty()).then(|| {
+            reading(15., 22.)
+                .text_color(palette.ink)
+                .child(ui::selectable("verdict-reason", &verdict.reason))
+        }))
+        .children(points(
+            "blocking",
+            "blocking",
+            &verdict.blocking,
+            palette.signal(Signal::Yours),
+        ))
+        .children(points("advisory", "watch for", &verdict.advisory, palette.muted))
+        .children(points("team", "team", &team, palette.faint))
+        .children(points(
+            "scorer-outreach",
+            "scorer's outreach note",
+            &verdict.outreach,
+            palette.faint,
+        ))
 }
 
 /// Where a queued posting is, and the fill report's map once there is one.
@@ -1225,8 +1431,8 @@ mod tests {
         for (address, system) in [
             (ASHBY, "Ashby"),
             ("https://job-boards.greenhouse.io/example/jobs/123", "Greenhouse"),
-            ("https://www.amazon.jobs/en/jobs/123/engineer", "Amazon"),
-            ("https://example.fa.us2.oraclecloud.com/hcmUI/job/1", "Oracle"),
+            ("https://www.amazon.jobs/en/jobs/123/engineer", "Amazon Jobs"),
+            ("https://example.fa.us2.oraclecloud.com/hcmUI/job/1", "Oracle Cloud"),
             ("https://jobs.lever.co/example/1", "Lever"),
             ("https://simplify.jobs/p/9", "Simplify"),
             ("https://careers.example.com/jobs/1", "Company site"),
@@ -1379,6 +1585,16 @@ mod tests {
                 2
             )
         );
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("copy-link", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("copy-link").label(), Some("Copy link"));
+        })
+        .unwrap();
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("https://simplify.jobs/p/4"));
 
         cx.update_window(window, |_, window, cx| {
             window.click("board-submitted", cx);

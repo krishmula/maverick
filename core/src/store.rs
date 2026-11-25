@@ -173,6 +173,23 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE outreach_drafts;
     ALTER TABLE outreach_drafts_inmail RENAME TO outreach_drafts;
 ",
+    "
+    CREATE TABLE post_readings (
+        post_link TEXT PRIMARY KEY,
+        poster TEXT NOT NULL,
+        poster_url TEXT,
+        headline TEXT NOT NULL,
+        degree TEXT,
+        text TEXT NOT NULL,
+        read_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE inmail_credits (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        credits INTEGER NOT NULL CHECK (credits >= 0),
+        read_at TEXT NOT NULL
+    ) STRICT;
+",
 ];
 
 pub struct Store {
