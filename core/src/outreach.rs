@@ -310,6 +310,15 @@ impl Store {
         Ok(added == 1)
     }
 
+    /// Sets where a hiring post stands, as when the user rejects it or takes it back. Its drafts stay as they are.
+    pub fn set_post_outreach(&self, post_link: &str, outreach: Outreach) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE hiring_posts SET outreach = ?2 WHERE post_link = ?1",
+            params![post_link, outreach.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Saves a new draft and gives its id. `None` when the person already has a draft about the same thing.
     pub fn add_draft(&self, draft: &Draft) -> Result<Option<i64>, StoreError> {
         let added = self.db.execute(
@@ -1700,6 +1709,97 @@ pub async fn draft_for_post(
     Ok(PostDraft { draft, credits_unread })
 }
 
+/// The link to a LinkedIn post the user pasted, without the tracking query LinkedIn's share
+/// button adds, or why it is not one.
+pub fn pasted_post_link(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Paste a LinkedIn post's link first.".into());
+    }
+    let link = text.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/');
+    let path = link
+        .strip_prefix("https://www.linkedin.com")
+        .or_else(|| link.strip_prefix("https://linkedin.com"))
+        .ok_or("That is not a LinkedIn link. Copy the post's link from LinkedIn and paste it here.")?;
+    if !(path.starts_with("/posts/") || path.starts_with("/feed/update/")) {
+        return Err("That LinkedIn link is not a post. Use the post's own link (… → Copy link to post).".into());
+    }
+    Ok(format!("https://www.linkedin.com{path}/"))
+}
+
+/// What adding a post by its link came to.
+#[derive(Debug)]
+pub enum Added {
+    New(HiringPost),
+    /// Maverick already held the post, as it stands now.
+    Known(HiringPost),
+}
+
+/// Adds a hiring post the user found and pasted: reads it in LinkedIn, has the model read who is
+/// hiring for what, and keeps it with no draft. The sweep's rules, which skip a post or hold back
+/// its draft, only leave a note, since the user chose this post.
+pub async fn add_post(
+    database: &Path,
+    profile: &Profile,
+    bridge: Option<Arc<Bridge>>,
+    pasted: &str,
+) -> Result<Added, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let link = pasted_post_link(pasted)?;
+    let known = |link: &str| -> Result<Option<HiringPost>, String> {
+        let store = Store::open(database).map_err(said)?;
+        Ok(store
+            .hiring_posts()
+            .map_err(said)?
+            .into_iter()
+            .find(|post| post.post_link == link))
+    };
+    if let Some(post) = known(&link)? {
+        return Ok(Added::Known(post));
+    }
+    let bridge = bridge.ok_or("Chrome is not connected, so the post could not be read.")?;
+    let mut reader = Reader::open(bridge, 1).await.map_err(|stop| stop.to_string())?;
+    let html = reader
+        .load(&link, First::OpenPosts)
+        .await
+        .map_err(|stop| stop.to_string());
+    reader.close().await;
+    let post = posts_page(&html?)
+        .into_iter()
+        .next()
+        .ok_or("LinkedIn showed no post at that link; it may be deleted or need you signed in.")?;
+    // The sweep keeps the posts it finds under their author's activity page.
+    if let Some(post) = known(&post.link())? {
+        return Ok(Added::Known(post));
+    }
+    let reading = read_post(&post, profile).await?;
+    let mut notes = vec!["Added by you".to_owned()];
+    if let Some(reason) = post_skip(&reading) {
+        notes.push(format!("the sweep would skip it: {reason}"));
+    }
+    if post.poster_url.is_none() {
+        notes.push("a company page posted it, so there is no person to write to".into());
+    } else if let Some(flag) = poster_flag(&post, &reading.company) {
+        notes.push(flag);
+    }
+    let now = Timestamp::now();
+    let kept = HiringPost {
+        post_link: link,
+        role: reading.role,
+        found_at: now,
+        poster: post.poster.clone(),
+        company: reading.company,
+        score: reading.fit.score,
+        variant: reading.fit.variant,
+        outreach: Outreach::NotStarted,
+        notes: Some(notes.join("; ")),
+    };
+    let store = Store::open(database).map_err(said)?;
+    store.add_hiring_post(&kept).map_err(said)?;
+    store.save_post_reading(&kept.post_link, &post, now).map_err(said)?;
+    Ok(Added::New(kept))
+}
+
 /// Drafts a note to one person a posting's outreach check found, by their profile address.
 pub async fn draft_for_check(
     database: &Path,
@@ -2497,6 +2597,62 @@ mod tests {
         let run = check_postings(&database, None, &[]).await.unwrap();
 
         assert_eq!(run.checked, []);
+    }
+
+    #[test]
+    fn a_pasted_post_link_loses_its_tracking_and_anything_else_is_refused() {
+        assert_eq!(
+            pasted_post_link(
+                " https://www.linkedin.com/posts/sam-poster_hiring-activity-7400000000000000000-AbCd?utm_source=share&utm_medium=member_desktop "
+            ),
+            Ok("https://www.linkedin.com/posts/sam-poster_hiring-activity-7400000000000000000-AbCd/".into())
+        );
+        assert_eq!(
+            pasted_post_link("https://linkedin.com/feed/update/urn:li:activity:7400000000000000000"),
+            Ok("https://www.linkedin.com/feed/update/urn:li:activity:7400000000000000000/".into())
+        );
+        assert!(pasted_post_link("https://www.linkedin.com/in/sam-poster/").is_err());
+        assert!(pasted_post_link("https://www.linkedin.com/search/results/content/?keywords=hiring").is_err());
+        assert!(pasted_post_link("https://example.com/posts/1").is_err());
+        assert!(pasted_post_link("").is_err());
+    }
+
+    #[test]
+    fn a_rejected_post_stays_rejected_when_the_sheet_still_says_not_started() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        let post = |outreach: Outreach| HiringPost {
+            post_link: "https://www.linkedin.com/posts/sam-poster_1/".into(),
+            role: "Backend Engineer".into(),
+            found_at: "2026-11-23T17:00:00Z".parse().unwrap(),
+            poster: "Sam Poster".into(),
+            company: "Example Co".into(),
+            score: 82,
+            variant: "Backend/Infra".into(),
+            outreach,
+            notes: None,
+        };
+        let sheet = |outreach: Outreach| crate::tracker::Tracker {
+            postings: Vec::new(),
+            applications: Vec::new(),
+            hiring_posts: vec![post(outreach)],
+            unreadable: Vec::new(),
+        };
+        let status = |store: &Store| store.hiring_posts().unwrap()[0].outreach;
+        store.save_tracker(&sheet(Outreach::NotStarted)).unwrap();
+        store
+            .set_post_outreach(&post(Outreach::NotStarted).post_link, Outreach::Skipped)
+            .unwrap();
+        store.save_tracker(&sheet(Outreach::NotStarted)).unwrap();
+        assert_eq!(status(&store), Outreach::Skipped);
+        // Taken back, it is found again; a note the sheet says went out moves it on.
+        store
+            .set_post_outreach(&post(Outreach::NotStarted).post_link, Outreach::NotStarted)
+            .unwrap();
+        store.save_tracker(&sheet(Outreach::NotStarted)).unwrap();
+        assert_eq!(status(&store), Outreach::NotStarted);
+        store.save_tracker(&sheet(Outreach::Sent)).unwrap();
+        assert_eq!(status(&store), Outreach::Sent);
     }
 
     #[test]
