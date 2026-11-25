@@ -1,4 +1,5 @@
-//! LinkedIn: the user's connections export, the pages Maverick reads, and the typing that stops before Send.
+//! LinkedIn: the user's connections export, the pages Maverick reads, the typing that stops before
+//! Send, and the one flow that presses Send, for postings Maverick reaches by itself.
 //!
 //! LinkedIn restricts accounts that load many pages, so every page goes through `Visits`:
 //! a cap per run and a random wait between loads. Maverick reads a company's People page
@@ -805,8 +806,8 @@ pub const INMAIL_SUBJECT_LIMIT: usize = 200;
 /// The longest InMail body LinkedIn takes.
 pub const INMAIL_BODY_LIMIT: usize = 1900;
 
-/// The only things the typing flow ever clicks. There is no Send here, on purpose:
-/// the user reads the typed draft and clicks Send in Chrome.
+/// The only things the typing flow ever clicks. There is no Send here, on purpose: only
+/// `send_draft` presses Send, and the user clicks Send on every draft typed for them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
     Message,
@@ -1000,6 +1001,15 @@ pub async fn type_draft(
     text: &str,
     resume: Option<&Path>,
 ) -> Result<Typed, String> {
+    let page = open_profile_tab(bridge, profile_url).await?;
+    let typed = type_in(&page, profile_url, slot, subject, text, resume).await;
+    // The debugging bar goes away; the dialog and the typed draft stay for the user.
+    let _ = page.detach().await;
+    typed
+}
+
+/// A new, active tab in the user's Chrome with the debugger attached, for typing to `profile_url`.
+async fn open_profile_tab(bridge: Arc<Bridge>, profile_url: &str) -> Result<Page, String> {
     if !profile_url.starts_with(&format!("{SITE}/in/")) {
         return Err(format!("{profile_url} is not a LinkedIn profile"));
     }
@@ -1014,11 +1024,134 @@ pub async fn type_draft(
     };
     let opened = bridge.request(connection, &blank).await.map_err(said)?;
     let tab = opened_tab(connection, &opened, true).map_err(|stop| stop.to_string())?;
-    let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
-    let typed = type_in(&page, profile_url, slot, subject, text, resume).await;
-    // The debugging bar goes away; the dialog and the typed draft stay for the user.
+    Page::attach(bridge, &tab).await.map_err(|error| error.to_string())
+}
+
+/// What pressing Send led to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Delivery {
+    /// The page showed the draft as sent.
+    Sent,
+    /// Send was pressed, but the page did not show the draft as sent. The tab stays open.
+    Unconfirmed(String),
+}
+
+/// How long LinkedIn may take to show a sent draft, with an attached resume still uploading.
+const SEND_WAIT: Duration = Duration::from_secs(30);
+
+/// Types a draft like `type_draft`, presses Send, and checks the page shows it sent. A sent draft's
+/// tab closes; any other stays open for the user. An error means Send was never pressed.
+pub async fn send_draft(
+    bridge: Arc<Bridge>,
+    profile_url: &str,
+    slot: Slot,
+    subject: Option<&str>,
+    text: &str,
+    resume: Option<&Path>,
+) -> Result<(Typed, Delivery), String> {
+    let page = open_profile_tab(bridge, profile_url).await?;
+    let sent = async {
+        let typed = type_in(&page, profile_url, slot, subject, text, resume).await?;
+        // The Send button stays disabled while the resume uploads.
+        let send = send_button(slot);
+        page.wait_for(&send, SEND_WAIT)
+            .await
+            .map_err(|error| format!("{error}. The draft is typed in Chrome; nothing was sent"))?;
+        page.click(&send)
+            .await
+            .map_err(|error| format!("{error}. The draft is typed in Chrome; nothing was sent"))?;
+        Ok::<_, String>((typed, confirm_sent(&page, slot, text).await))
+    }
+    .await;
+    if let Ok((_, Delivery::Sent)) = &sent {
+        let _ = page.send("Page.close", json!({})).await;
+    }
     let _ = page.detach().await;
-    typed
+    sent
+}
+
+/// The Send button that goes with a typed draft, once it can be pressed.
+fn send_button(slot: Slot) -> Locator {
+    const ENABLED: &str = r#"(button) => button.getClientRects().length && !button.disabled
+        && button.getAttribute("aria-disabled") !== "true""#;
+    match slot {
+        Slot::Note => Locator::script(
+            "the invitation's Send button",
+            format!(
+                r#"[...document.querySelectorAll("{OPEN_DIALOG}")]
+                    .flatMap((dialog) => [...dialog.querySelectorAll("button")])
+                    .filter({ENABLED})
+                    .find((button) => /^send( invitation| now)?$/i
+                        .test((button.getAttribute("aria-label") || button.innerText).trim())) || null"#
+            ),
+        ),
+        Slot::Message | Slot::InMail => Locator::script(
+            "the message window's Send button",
+            in_message_form(&format!(
+                r#"[...form.querySelectorAll("button")]
+                    .filter({ENABLED})
+                    .find((button) => button.classList.contains("msg-form__send-button")
+                        || /^send$/i.test((button.getAttribute("aria-label") || button.innerText).trim())) || null"#
+            )),
+        ),
+    }
+}
+
+/// The start of a draft, with its spaces collapsed, which the page shows once the draft is sent.
+fn opening(text: &str) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    words.chars().take(60).collect()
+}
+
+/// A script that says `"sent"` once the page shows the draft as sent, `"limit"` when LinkedIn
+/// refuses more invitations, and `"waiting"` before either.
+fn sent_check(slot: Slot, text: &str) -> String {
+    const LIMIT: &str =
+        r#"/weekly invitation limit|reached the weekly limit|out of invitations/i.test(document.body.innerText)"#;
+    match slot {
+        Slot::Note => format!(
+            r#"(() => {{
+                if ({LIMIT}) return "limit";
+                return {NOTE_FIELD} ? "waiting" : "sent";
+            }})()"#
+        ),
+        Slot::Message | Slot::InMail => {
+            let opening = serde_json::to_string(&opening(text)).expect("a string is plain JSON");
+            format!(
+                r#"(() => {{
+                    const form = {MESSAGE_FORM};
+                    if (!form) return "waiting";
+                    const field = form.querySelector("[contenteditable='true']");
+                    if (field && field.innerText.trim() !== "") return "waiting";
+                    const root = form.getRootNode();
+                    const shown = (root === document ? document.body.innerText
+                        : [...root.children].map((part) => part.innerText || "").join(" ")).replace(/\s+/g, " ");
+                    return shown.includes({opening}) ? "sent" : "waiting";
+                }})()"#
+            )
+        }
+    }
+}
+
+async fn confirm_sent(page: &Page, slot: Slot, text: &str) -> Delivery {
+    let check = sent_check(slot, text);
+    let deadline = tokio::time::Instant::now() + SEND_WAIT;
+    loop {
+        match page.evaluate(&check).await.as_ref().map(|said| said.as_str()) {
+            Ok(Some("sent")) => return Delivery::Sent,
+            Ok(Some("limit")) => {
+                return Delivery::Unconfirmed("LinkedIn says the weekly invitation limit is reached".into());
+            }
+            Err(error) => return Delivery::Unconfirmed(format!("the page could not be read after Send: {error}")),
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Delivery::Unconfirmed(
+                "Send was pressed, but the page never showed the draft as sent; check the tab in Chrome".into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Puts the resume into the open message form. The message stays typed when this fails.

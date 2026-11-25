@@ -597,6 +597,24 @@ impl Board {
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
         });
+        if self.auto_reach() {
+            self.apply_approved(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether Maverick approves postings scored 75 or more and reaches their people by itself.
+    fn auto_reach(&self) -> bool {
+        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
+    }
+
+    fn set_auto_reach(&mut self, on: bool, cx: &mut Context<Self>) {
+        let Some(database) = self.database.as_deref() else {
+            return;
+        };
+        if let Err(error) = maverick_core::auto::set_on(database, on) {
+            self.problem = Some(format!("Could not save the auto-reach choice: {error}"));
+        }
         cx.notify();
     }
 
@@ -1136,6 +1154,25 @@ impl Board {
                 .into_any_element(),
             );
         }
+        let auto_reach = self.auto_reach();
+        let (word, tip) = match auto_reach {
+            true => (
+                "auto-reach on",
+                "Maverick approves each posting scored 75 or more and sends a draft to the best two people \
+                 its check found there, up to 20 sends a day. Click to turn this off.",
+            ),
+            false => (
+                "auto-reach off",
+                "Postings scored 75 or more wait for you, and nothing is sent on LinkedIn. Click to let Maverick \
+                 approve them and reach their people by itself.",
+            ),
+        };
+        controls.push(
+            ui::button("auto-reach", word, ui::quiet_face(word, palette))
+                .tip(tip)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_auto_reach(!auto_reach, cx)))
+                .into_any_element(),
+        );
         let auto_submit = browser.auto_submit();
         let (word, tip) = match auto_submit {
             true => (

@@ -663,6 +663,13 @@ impl OutreachView {
         };
         let bridge = self.bridge(cx);
         let profile = self.profile();
+        let auto_reach = maverick_core::auto::is_on(&database);
+        let typing = self.typing.clone();
+        let resume = self
+            .answers
+            .as_deref()
+            .and_then(|file| Answers::load(file).ok())
+            .map(|answers| answers.resume);
         let doing = if sweep {
             "checking postings and sweeping hiring posts"
         } else {
@@ -676,6 +683,12 @@ impl OutreachView {
                         .await?
                         .summary(),
                 ];
+                if auto_reach && let (Some(bridge), Ok(profile)) = (&bridge, &profile) {
+                    // Chrome has one active tab, so sends wait for any draft being typed.
+                    let _turn = typing.lock().await;
+                    let reached = maverick_core::auto::reach(&database, profile, bridge.clone(), resume.as_deref());
+                    lines.push(reached.await?.summary());
+                }
                 if sweep {
                     let bridge = bridge.ok_or("Chrome is not connected, so the hiring-post sweep did not run.")?;
                     lines.push(outreach::sweep(&database, &profile?, bridge).await?.summary());

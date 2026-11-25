@@ -1,4 +1,4 @@
-//! Runs the funnel every hour while the app is open: intake, then scoring. It never submits.
+//! Runs the funnel every hour while the app is open: intake, scoring, then the approvals auto-reach makes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,10 +77,16 @@ impl Funnel {
                 let profile = Profile::load(&answers)?;
                 let sheet = maverick_core::sheet::linked_session().await?;
                 let pass = funnel::run_once(&database, profile, sheet).await?;
+                let mut summary = pass.summary();
+                if maverick_core::auto::is_on(&database) {
+                    let approved = maverick_core::auto::approve(&database)
+                        .map_err(|error| format!("the database failed: {error}"))?;
+                    summary.push_str(&format!("; {approved} approved by auto-reach"));
+                }
                 let lists = tokio::task::spawn_blocking(move || stored_lists(Some(&database)))
                     .await
                     .map_err(|stopped| stopped.to_string())?;
-                Ok::<_, String>((pass.summary(), lists))
+                Ok::<_, String>((summary, lists))
             })
             .await;
         let at = now
