@@ -10,10 +10,13 @@ use gpui_kit::{
     Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
     Window, div, px,
 };
+use maverick_core::auto::{self, Scope};
 use maverick_core::bridge::BrowserState;
 use maverick_core::calendar::{self, Calendar};
 use maverick_core::credentials::Password;
 use maverick_core::google::{self, Account, Client, MOST_ACCOUNTS};
+use maverick_core::platform::Platform;
+use maverick_core::store::Store;
 use maverick_core::ticktick::{self, Project, Settings};
 use tokio::runtime::Handle;
 
@@ -61,6 +64,10 @@ pub struct Connections {
     problem: Option<String>,
     ticktick: TickTick,
     settings: Settings,
+    /// Which platforms and companies auto-apply covers.
+    scope: Scope,
+    /// The companies with postings scored 75 or more waiting, and how many each.
+    scope_companies: Vec<(String, usize)>,
     models: Entity<Models>,
     label: Entity<InputState>,
     token: Entity<InputState>,
@@ -105,6 +112,8 @@ impl Connections {
             problem: None,
             ticktick: TickTick::Reading,
             settings: Settings::current(),
+            scope: Scope::default(),
+            scope_companies: Vec::new(),
             models,
             label,
             token,
@@ -166,6 +175,7 @@ impl Connections {
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_accounts(window, cx);
         self.settings = Settings::current();
+        self.reload_scope(cx);
         self.models.update(cx, |models, cx| models.refresh(window, cx));
         let client = self.background.spawn(Client::stored());
         let lists = self.background.spawn(async {
@@ -191,6 +201,97 @@ impl Connections {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Reads the auto-apply scope and the companies it can cover.
+    fn reload_scope(&mut self, cx: &mut Context<Self>) {
+        let Some(database) = self.browser.read(cx).database() else {
+            return;
+        };
+        self.scope = Scope::load(&database);
+        let scope = self.scope.clone();
+        let read = self.background.spawn(async move {
+            let store = Store::open(&database).map_err(|error| error.to_string())?;
+            let postings = store.postings().map_err(|error| error.to_string())?;
+            let decisions = store.decisions().map_err(|error| error.to_string())?;
+            Ok::<_, String>(auto::companies(&postings, &decisions, &scope))
+        });
+        cx.spawn(async move |this, cx| {
+            let read = read.await.map_err(|error| error.to_string()).and_then(|read| read);
+            this.update(cx, |this, cx| {
+                match read {
+                    Ok(companies) => this.scope_companies = companies,
+                    Err(error) => this.problem = Some(format!("Could not read the companies for auto-apply: {error}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Changes the auto-apply scope and saves it.
+    fn change_scope(&mut self, change: impl FnOnce(&mut Scope), cx: &mut Context<Self>) {
+        let Some(database) = self.browser.read(cx).database() else {
+            return;
+        };
+        change(&mut self.scope);
+        if let Err(error) = self.scope.save(&database) {
+            self.problem = Some(format!("Could not save what auto-apply covers: {error}"));
+        }
+        cx.notify();
+    }
+
+    /// The platforms and companies auto-apply covers, each a chip to switch on or off.
+    fn auto_apply_scope(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
+        let color = |on: bool| if on { palette.ink } else { palette.faint };
+        let platforms = Platform::ALL.into_iter().map(|platform| {
+            let on = self.scope.platforms.contains(&platform);
+            ui::button(
+                SharedString::from(format!("auto-apply-platform-{}", platform.name())),
+                format!("auto-apply on {} {}", platform.name(), if on { "on" } else { "off" }),
+                ui::boxed(platform.name(), color(on)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.change_scope(|scope| scope.toggle_platform(platform), cx)))
+        });
+        let companies = self
+            .scope_companies
+            .iter()
+            .enumerate()
+            .map(|(index, (company, count))| {
+                let on = self.scope.includes_company(company);
+                let name = company.clone();
+                ui::button(
+                    ("auto-apply-company", index),
+                    format!("auto-apply at {company} {}", if on { "on" } else { "off" }),
+                    ui::boxed(format!("{company} {count}"), color(on)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.change_scope(|scope| scope.toggle_company(&name), cx)))
+            });
+        let no_companies = self
+            .scope_companies
+            .is_empty()
+            .then(|| ui::serif("No postings scored 75 or more are waiting.").text_color(palette.muted));
+        v_flex()
+            .gap(px(10.))
+            .child(ui::caps("platforms").text_color(palette.muted))
+            .child(h_flex().w_full().gap(px(4.)).flex_wrap().children(platforms))
+            .child(
+                ui::serif(
+                    "Maverick fills forms on Ashby, Greenhouse and Workday. On the others an approved posting \
+                     opens in a tab for you to finish.",
+                )
+                .text_color(palette.muted)
+                .max_w(px(620.)),
+            )
+            .child(ui::caps("companies").text_color(palette.muted))
+            .child(
+                ui::serif("Postings scored 75 or more still waiting, by company. Click one to leave it out.")
+                    .text_color(palette.muted)
+                    .max_w(px(620.)),
+            )
+            .child(h_flex().w_full().gap(px(4.)).flex_wrap().children(companies))
+            .children(no_companies)
     }
 
     fn reload_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -757,13 +858,14 @@ impl Connections {
         let on = database.as_deref().is_some_and(maverick_core::auto::is_on);
         let state = if on { "on" } else { "off" };
         let explained = if on {
-            "Maverick approves each posting scored 75 or more and queues its form. Each hour it sends a \
+            "Maverick approves each posting scored 75 or more on the platforms and at the companies below, and \
+             queues its form. Each hour it sends a \
              LinkedIn draft to the best two people found at those postings, and sends the waiting hiring-post \
              drafts, up to 20 a day in all, without your review. The auto-submit switch on the Jobs tab \
              decides whether a filled form is submitted."
         } else {
             "You approve each posting on the Jobs tab, and every LinkedIn draft waits for you. Turn this on to \
-             let Maverick approve postings scored 75 or more, message the best two people at each, and send \
+             let Maverick approve postings scored 75 or more on the platforms and at the companies below, message the best two people at each, and send \
              hiring-post drafts."
         };
         v_flex()
@@ -799,6 +901,7 @@ impl Connections {
                     })),
             )
             .child(ui::serif(explained).text_color(palette.muted).max_w(px(620.)))
+            .child(self.auto_apply_scope(palette, cx))
     }
 
     fn chrome(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
@@ -1064,7 +1167,14 @@ mod tests {
             })
         });
         let (window, _view) = cx.update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            let options = WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds::new(
+                    Default::default(),
+                    gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(3000.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| Connections::new(browser, window, cx))
             })
             .unwrap()
@@ -1080,6 +1190,21 @@ mod tests {
             window.click("auto-apply-switch", cx);
             window.render_frame(cx);
             assert!(!maverick_core::auto::is_on(&database));
+
+            assert_eq!(
+                window.find("auto-apply-platform-Lever").label(),
+                Some("auto-apply on Lever off")
+            );
+            window.click("auto-apply-platform-Lever", cx);
+            window.click("auto-apply-platform-Workday", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("auto-apply-platform-Lever").label(),
+                Some("auto-apply on Lever on")
+            );
+            let saved = maverick_core::auto::Scope::load(&database);
+            assert!(saved.platforms.contains(&maverick_core::platform::Platform::Lever));
+            assert!(!saved.platforms.contains(&maverick_core::platform::Platform::Workday));
         })
         .unwrap();
     }

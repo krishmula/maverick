@@ -25,11 +25,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
-use maverick_core::apply::{self, System};
-use maverick_core::jobs::{
-    Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage, posting_address,
-};
+use maverick_core::apply;
+use maverick_core::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
 use maverick_core::outreach::Check;
+use maverick_core::platform::{Platform, address_of};
 use maverick_core::score::APPLY_READY;
 use maverick_core::store::Store;
 use serde::{Deserialize, Serialize};
@@ -61,22 +60,13 @@ pub struct Entry {
 impl Entry {
     /// The application system the posting is on, as the user knows it.
     pub fn system(&self) -> &'static str {
-        system_label(&self.address)
+        Platform::of(&self.address).name()
     }
 
     /// The name an application is recorded under.
     pub fn role(&self) -> String {
         format!("{} at {}", self.title, self.company)
     }
-}
-
-/// The posting's own address when Maverick knows it, otherwise the link it was found by.
-pub fn address_of(posting: &Posting) -> String {
-    let address = posting
-        .address
-        .clone()
-        .unwrap_or_else(|| posting_address(&posting.link));
-    apply::posting_address(&address).unwrap_or(address)
 }
 
 /// Scoring found nothing that blocks an application. Muse worded the rest of that verdict differently.
@@ -128,37 +118,6 @@ impl BoardData {
         let mut seen = std::collections::HashSet::new();
         entries.retain(|entry| seen.insert(entry.address.clone()));
         Self { entries, applications }
-    }
-}
-
-/// The application system a posting is on, when Maverick can fill its form.
-pub fn system_name(address: &str) -> Option<&'static str> {
-    Some(match System::of(address)? {
-        System::Ashby => "Ashby",
-        System::Greenhouse => "Greenhouse",
-        System::Workday => "Workday",
-    })
-}
-
-/// The application system at `address`. Maverick fills the first three. The rest open for the user.
-pub fn system_label(address: &str) -> &'static str {
-    if let Some(name) = system_name(address) {
-        return name;
-    }
-    let host = host_of(address);
-    let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
-    if on("simplify.jobs") {
-        "Simplify"
-    } else if on("amazon.jobs") {
-        "Amazon Jobs"
-    } else if on("oraclecloud.com") {
-        "Oracle Cloud"
-    } else if on("lever.co") {
-        "Lever"
-    } else if on("linkedin.com") {
-        "LinkedIn"
-    } else {
-        "Company site"
     }
 }
 
@@ -1865,21 +1824,6 @@ mod tests {
         assert!(Search::new("example co, apple").finds_application(&sent));
         assert!(Search::new("lever.co").finds_application(&sent));
         assert!(!Search::new("apple").finds_application(&sent));
-    }
-
-    #[test]
-    fn each_posting_names_its_application_system() {
-        for (address, system) in [
-            (ASHBY, "Ashby"),
-            ("https://job-boards.greenhouse.io/example/jobs/123", "Greenhouse"),
-            ("https://www.amazon.jobs/en/jobs/123/engineer", "Amazon Jobs"),
-            ("https://example.fa.us2.oraclecloud.com/hcmUI/job/1", "Oracle Cloud"),
-            ("https://jobs.lever.co/example/1", "Lever"),
-            ("https://simplify.jobs/p/9", "Simplify"),
-            ("https://careers.example.com/jobs/1", "Company site"),
-        ] {
-            assert_eq!(system_label(address), system, "{address}");
-        }
     }
 
     #[test]

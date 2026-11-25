@@ -10,8 +10,8 @@ use gpui_kit::{
 };
 use maverick_core::jobs::{Posting, Stage};
 
-use crate::board::address_of;
 use crate::ui::{MONO, Palette, Signal};
+use maverick_core::platform::address_of;
 
 /// What a posting is to the funnel, which decides how its cell is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
