@@ -21,7 +21,7 @@ use maverick_core::answers::Answers;
 use maverick_core::bridge::{Bridge, BrowserState};
 use maverick_core::jobs::{HiringPost, Outreach, Posting};
 use maverick_core::linkedin::{Person, Slot};
-use maverick_core::outreach::{self, About, Check, Draft, Verdict};
+use maverick_core::outreach::{self, About, Check, Draft, ScorerPeople, Verdict};
 use maverick_core::score::Profile;
 use maverick_core::store::Store;
 use tokio::runtime::Handle;
@@ -154,9 +154,20 @@ pub fn rows(store: &Store) -> (Vec<Check>, Vec<DraftRow>, Vec<HiringPost>) {
 pub enum RowKey {
     /// One person a posting's check found: the posting's link and the person's profile address.
     Person(String, String),
+    /// One person a posting's scorer note names: the posting's link and the person's name.
+    Named(String, String),
     Draft(i64),
     /// A hiring post with no draft, by its link.
     Post(String),
+}
+
+/// Where a person at a posting came from, which says how a draft to them is made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Source {
+    /// The posting's outreach check, which always found a profile to draft to.
+    Check,
+    /// The scorer's outreach note. A person it gives no profile link for is looked up when drafted to.
+    Scorer,
 }
 
 /// What a row's own work is doing or did, shown on that row.
@@ -190,6 +201,10 @@ pub struct OutreachView {
     database: Option<PathBuf>,
     answers: Option<PathBuf>,
     checks: Vec<Check>,
+    /// The scorer notes read so far, by posting link.
+    scorer: HashMap<String, ScorerPeople>,
+    /// Scorer notes being read now, and why a read failed, by posting link.
+    scorer_reads: HashMap<String, Option<String>>,
     drafts: Vec<DraftRow>,
     /// The hiring posts worth a look that have no draft, newest first.
     found: Vec<HiringPost>,
@@ -225,6 +240,8 @@ impl OutreachView {
             database,
             answers,
             checks: Vec::new(),
+            scorer: HashMap::new(),
+            scorer_reads: HashMap::new(),
             drafts: Vec::new(),
             found: Vec::new(),
             editing: None,
@@ -253,13 +270,19 @@ impl OutreachView {
         self.checks.iter().find(|check| check.posting_link == link)
     }
 
-    /// The links of the postings with someone to reach.
+    /// The links of the postings with someone to reach, found by a check or named in a scorer note.
     pub fn reachable(&self) -> HashSet<String> {
-        self.checks
+        let checked = self
+            .checks
             .iter()
             .filter(|check| check.verdict.found_people())
-            .map(|check| check.posting_link.clone())
-            .collect()
+            .map(|check| &check.posting_link);
+        let named = self
+            .scorer
+            .values()
+            .filter(|read| !read.people.is_empty())
+            .map(|read| &read.posting_link);
+        checked.chain(named).cloned().collect()
     }
 
     /// Where the newest live draft for the posting at `link` stands. A skipped one counts only when it is the only one.
@@ -288,6 +311,12 @@ impl OutreachView {
             .and_then(|path| Store::open(path).ok());
         if let Some(store) = store {
             (self.checks, self.drafts, self.found) = rows(&store);
+            self.scorer = store
+                .scorer_people()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|read| (read.posting_link.clone(), read))
+                .collect();
         }
     }
 
@@ -590,6 +619,139 @@ impl OutreachView {
         );
     }
 
+    /// Drafts a note to one person a posting's scorer note names. Their profile is looked up first
+    /// when the note gives no link for them.
+    fn draft_for_named(&mut self, posting_link: String, person: Person, window: &mut Window, cx: &mut Context<Self>) {
+        let key = RowKey::Named(posting_link.clone(), person.name.clone());
+        let Some(database) = self.database_for(&key, cx) else {
+            return;
+        };
+        let Some(profile) = self.profile_for(&key, cx) else {
+            return;
+        };
+        let bridge = self.bridge(cx);
+        let doing = if person.profile_url.is_some() {
+            "drafting…"
+        } else {
+            "finding profile…"
+        };
+        self.run_row(
+            key,
+            doing,
+            async move {
+                let draft =
+                    outreach::draft_for_scorer(&database, &profile, bridge, &posting_link, &person.name).await?;
+                Ok(Finished {
+                    said: format!(
+                        "Drafted a {} to {}. It is below, outlined.",
+                        slot_name(draft.slot),
+                        draft.person
+                    ),
+                    draft: Some(draft.id),
+                })
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Reads the people in a posting's scorer note with the model, once per note, in the background.
+    fn read_scorer_note(&mut self, link: &str, note: String, cx: &mut Context<Self>) {
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        self.scorer_reads.insert(link.to_owned(), None);
+        let posting_link = link.to_owned();
+        let done = self
+            .background
+            .spawn(async move { outreach::scorer_people(&database, &posting_link, &note).await });
+        let link = link.to_owned();
+        cx.spawn(async move |this, cx| {
+            let outcome = done.await.unwrap_or_else(|stopped| Err(stopped.to_string()));
+            this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(_) => {
+                        this.scorer_reads.remove(&link);
+                        this.reload();
+                    }
+                    Err(why) => {
+                        this.scorer_reads.insert(link, Some(why));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the scorer wrote about whom to reach, with a row for each person it names, which can be
+    /// reached like the people a check finds. `None` when the scorer wrote nothing about it.
+    pub fn scorer_section(
+        &mut self,
+        link: &str,
+        note: &[String],
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if note.is_empty() {
+            return None;
+        }
+        let joined = note.join("; ");
+        let read = self.scorer.get(link).filter(|read| read.note == joined).cloned();
+        let reading = self.scorer_reads.get(link).cloned();
+        if read.is_none() && reading.is_none() {
+            self.read_scorer_note(link, joined, cx);
+        }
+        let drafts: Vec<&DraftRow> = self
+            .drafts
+            .iter()
+            .filter(|row| row.draft.about == About::Posting(link.to_owned()))
+            .collect();
+        let people: Vec<AnyElement> = read
+            .iter()
+            .flat_map(|read| &read.people)
+            .map(|person| self.person_row(link, person, &drafts, Signal::Done, Source::Scorer, palette, cx))
+            .collect();
+        let state = match (&read, reading) {
+            (Some(_), _) => None,
+            (None, Some(Some(why))) => Some(
+                div()
+                    .text_size(px(11.))
+                    .text_color(palette.signal(Signal::Failed))
+                    .child(SharedString::from(format!(
+                        "Could not read the people in this note: {why}"
+                    ))),
+            ),
+            (None, _) => Some(
+                div()
+                    .text_size(px(11.))
+                    .text_color(palette.signal(Signal::Model))
+                    .child("reading the people in this note…"),
+            ),
+        };
+        Some(
+            v_flex()
+                .id(SharedString::from(format!("scorer-{link}")))
+                .gap(px(6.))
+                .pb(px(12.))
+                .mb(px(12.))
+                .border_b_1()
+                .border_color(palette.line)
+                .child(ui::caps("scorer's outreach note").text_color(palette.muted))
+                .children(people)
+                .children(note.iter().enumerate().map(|(ix, item)| {
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(17.))
+                        .text_color(palette.faint)
+                        .child(ui::selectable(format!("scorer-outreach-{ix}"), item))
+                }))
+                .children(state)
+                .into_any_element(),
+        )
+    }
+
     /// Rewrites a waiting draft as an InMail, or an InMail back as a connection note.
     fn switch_form(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let key = RowKey::Draft(id);
@@ -755,7 +917,7 @@ impl OutreachView {
                 check
                     .people
                     .iter()
-                    .map(|person| self.person_row(link, person, &drafts, signal, palette, cx)),
+                    .map(|person| self.person_row(link, person, &drafts, signal, Source::Check, palette, cx)),
             )
             .children(check.note.as_ref().map(|note| {
                 div()
@@ -769,12 +931,14 @@ impl OutreachView {
 
     /// One person at a posting, with their own ways to reach them: a draft to them, or where their
     /// draft stands, and their LinkedIn profile.
+    #[expect(clippy::too_many_arguments, reason = "each is what one row shows")]
     fn person_row(
         &self,
         link: &str,
         person: &Person,
         drafts: &[&DraftRow],
         signal: Signal,
+        source: Source,
         palette: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -786,14 +950,25 @@ impl OutreachView {
                 .text_color(palette.muted)
                 .child(SharedString::from(person_line(person))),
         );
-        let Some(profile) = person.profile_url.clone() else {
-            return line
-                .child(ui::caps("no profile").flex_none().text_color(palette.faint))
-                .into_any_element();
+        let profile = person.profile_url.clone();
+        let key = match (source, &profile) {
+            (Source::Check, Some(profile)) => RowKey::Person(link.to_owned(), profile.clone()),
+            (Source::Scorer, _) => RowKey::Named(link.to_owned(), person.name.clone()),
+            (Source::Check, None) => {
+                return line
+                    .child(ui::caps("no profile").flex_none().text_color(palette.faint))
+                    .into_any_element();
+            }
         };
-        let id = |what: &str| SharedString::from(format!("{what}-{link}|{profile}"));
-        let key = RowKey::Person(link.to_owned(), profile.clone());
-        let draft = drafts.iter().find(|row| row.draft.profile_url == profile);
+        let id = |what: &str| {
+            SharedString::from(match &key {
+                RowKey::Named(_, name) => format!("{what}-{link}|named|{name}"),
+                _ => format!("{what}-{link}|{}", profile.as_deref().unwrap_or_default()),
+            })
+        };
+        let draft = drafts
+            .iter()
+            .find(|row| Some(&row.draft.profile_url) == profile.as_ref());
         let reach: AnyElement = match (self.row_states.get(&key), draft) {
             (Some(RowState::Working(doing)), _) => {
                 Self::pending(id("draft").to_string(), doing, palette).into_any_element()
@@ -814,32 +989,41 @@ impl OutreachView {
             }
             (_, None) => {
                 let first = person.degree.as_deref() == Some("1st");
-                let word = if first { "draft message" } else { "draft" };
+                let (word, tip) = match (&profile, first) {
+                    (None, _) => (
+                        "find + draft",
+                        "Look up their LinkedIn profile by name and company, one page load, then write a draft.",
+                    ),
+                    (Some(_), true) => ("draft message", "Write a message to this connection."),
+                    (Some(_), false) => (
+                        "draft",
+                        "Write an InMail while a credit is free, otherwise a connection note.",
+                    ),
+                };
                 let name = format!("Draft to {}", person.name);
-                let (posting, person) = (link.to_owned(), profile.clone());
+                let posting = link.to_owned();
+                let target = person.clone();
                 ui::button(id("draft"), name, ui::quiet_face(word, palette))
-                    .tip(if first {
-                        "Write a message to this connection."
-                    } else {
-                        "Write an InMail while a credit is free, otherwise a connection note."
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.draft_for(posting.clone(), person.clone(), window, cx)
+                    .tip(tip)
+                    .on_click(cx.listener(move |this, _, window, cx| match source {
+                        Source::Check => {
+                            let profile = target.profile_url.clone().unwrap_or_default();
+                            this.draft_for(posting.clone(), profile, window, cx)
+                        }
+                        Source::Scorer => this.draft_for_named(posting.clone(), target.clone(), window, cx),
                     }))
                     .into_any_element()
             }
         };
-        let open = profile.clone();
         let said = self.row_said(&key, id("said").to_string(), palette);
+        let open = profile.clone().map(|open| {
+            ui::button(id("profile"), "Open profile", ui::quiet_face("profile ↗", palette))
+                .tip("Open their LinkedIn profile in your browser.")
+                .on_click(move |_, _, cx| cx.open_url(&open))
+        });
         v_flex()
             .gap(px(4.))
-            .child(
-                line.child(reach).child(
-                    ui::button(id("profile"), "Open profile", ui::quiet_face("profile ↗", palette))
-                        .tip("Open their LinkedIn profile in your browser.")
-                        .on_click(move |_, _, cx| cx.open_url(&open)),
-                ),
-            )
+            .child(line.child(reach).children(open))
             .children(said)
             .into_any_element()
     }
@@ -1309,6 +1493,8 @@ mod tests {
     struct Cards {
         outreach: Entity<OutreachView>,
         links: Vec<String>,
+        /// The scorer's outreach note shown above each posting's section, in parts.
+        scorer_note: Vec<String>,
     }
 
     impl Render for Cards {
@@ -1317,9 +1503,14 @@ mod tests {
             let links = self.links.clone();
             let sections: Vec<AnyElement> = links
                 .iter()
-                .map(|link| {
-                    self.outreach
-                        .update(cx, |outreach, cx| outreach.posting_section(link, &palette, cx))
+                .flat_map(|link| {
+                    self.outreach.update(cx, |outreach, cx| {
+                        let scorer = outreach.scorer_section(link, &self.scorer_note, &palette, cx);
+                        scorer
+                            .into_iter()
+                            .chain([outreach.posting_section(link, &palette, cx)])
+                            .collect::<Vec<_>>()
+                    })
                 })
                 .collect();
             v_flex().children(sections)
@@ -1332,6 +1523,7 @@ mod tests {
         database: &std::path::Path,
         runtime: &tokio::runtime::Runtime,
         links: &[&str],
+        scorer_note: &[&str],
     ) -> (gpui_kit::AnyWindowHandle, Entity<OutreachView>) {
         cx.executor().allow_parking();
         cx.update(|cx| {
@@ -1344,12 +1536,17 @@ mod tests {
             cx.new(|cx| Browser::new(Bridge::new(), background, Ok("/x".into()), None, Some(database), cx))
         });
         let links: Vec<String> = links.iter().map(|link| (*link).to_owned()).collect();
+        let scorer_note: Vec<String> = scorer_note.iter().map(|part| (*part).to_owned()).collect();
         let (window, cards) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
                 let outreach = cx.new(|cx| OutreachView::new(browser, None, window, cx));
                 cx.new(|cx| {
                     cx.observe(&outreach, |_, _, cx| cx.notify()).detach();
-                    Cards { outreach, links }
+                    Cards {
+                        outreach,
+                        links,
+                        scorer_note,
+                    }
                 })
             })
             .unwrap()
@@ -1380,6 +1577,61 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn each_person_in_the_scorer_note_can_be_reached_like_a_checked_one(cx: &mut TestAppContext) {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        seeded(&database);
+        let note = "Team member found — Ann Named (SWE, linkedin.com/in/ann-named) and Cy Nolink (Recruiter)";
+        // Read before, so the section shows its rows without asking the model.
+        Store::open(&database)
+            .unwrap()
+            .save_scorer_people(
+                &ScorerPeople {
+                    posting_link: "https://simplify.jobs/p/1".into(),
+                    note: note.into(),
+                    people: vec![
+                        Person {
+                            name: "Ann Named".into(),
+                            title: "SWE".into(),
+                            profile_url: Some("https://www.linkedin.com/in/ann-named/".into()),
+                            degree: None,
+                        },
+                        Person {
+                            name: "Cy Nolink".into(),
+                            title: "Recruiter".into(),
+                            profile_url: None,
+                            degree: None,
+                        },
+                    ],
+                },
+                "2026-11-23T17:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+        let runtime = runtime();
+        let (window, view) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"], &[note]);
+        let id = |what: &str, name: &str| SharedString::from(format!("{what}-https://simplify.jobs/p/1|named|{name}"));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(id("draft", "Ann Named")).label(),
+                Some("Draft to Ann Named")
+            );
+            assert_eq!(window.find(id("profile", "Ann Named")).label(), Some("Open profile"));
+            // No link in the note: the draft looks the profile up first, and there is none to open yet.
+            assert_eq!(
+                window.find(id("draft", "Cy Nolink")).label(),
+                Some("Draft to Cy Nolink")
+            );
+            assert!(window.try_find(id("profile", "Cy Nolink")).is_none());
+        })
+        .unwrap();
+        assert!(
+            view.read_with(cx, |view, _| view.reachable())
+                .contains("https://simplify.jobs/p/1")
+        );
+    }
+
+    #[gpui_kit::test]
     fn each_person_at_a_posting_can_be_reached_on_their_own(cx: &mut TestAppContext) {
         let scratch = tempfile::tempdir().unwrap();
         let database = scratch.path().join("maverick.db");
@@ -1407,7 +1659,7 @@ mod tests {
             })
             .unwrap();
         let runtime = runtime();
-        let (window, _) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"]);
+        let (window, _) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"], &[]);
         let id = |what: &str, profile: &str| {
             SharedString::from(format!(
                 "{what}-https://simplify.jobs/p/1|https://www.linkedin.com/in/{profile}/"
@@ -1452,6 +1704,7 @@ mod tests {
             &database,
             &runtime,
             &["https://simplify.jobs/p/1", "https://simplify.jobs/p/2"],
+            &[],
         );
         let posting = RowKey::Person(
             "https://simplify.jobs/p/2".into(),
@@ -1556,7 +1809,7 @@ mod tests {
         let database = scratch.path().join("maverick.db");
         let id = seeded(&database);
         let runtime = runtime();
-        let (window, view) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"]);
+        let (window, view) = opened(cx, &database, &runtime, &["https://simplify.jobs/p/1"], &[]);
         let checks = || Store::open(&database).unwrap().checks().unwrap();
         let before = checks();
         let at: Timestamp = "2026-11-23T18:00:00Z".parse().unwrap();
@@ -1614,6 +1867,7 @@ mod tests {
             &database,
             &runtime,
             &["https://simplify.jobs/p/1", "https://simplify.jobs/p/2"],
+            &[],
         );
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
