@@ -25,11 +25,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
-use maverick_core::apply::{self, System};
-use maverick_core::jobs::{
-    Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage, posting_address,
-};
+use maverick_core::apply;
+use maverick_core::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
 use maverick_core::outreach::Check;
+use maverick_core::platform::{Platform, address_of};
 use maverick_core::score::APPLY_READY;
 use maverick_core::store::Store;
 use serde::{Deserialize, Serialize};
@@ -61,22 +60,13 @@ pub struct Entry {
 impl Entry {
     /// The application system the posting is on, as the user knows it.
     pub fn system(&self) -> &'static str {
-        system_label(&self.address)
+        Platform::of(&self.address).name()
     }
 
     /// The name an application is recorded under.
     pub fn role(&self) -> String {
         format!("{} at {}", self.title, self.company)
     }
-}
-
-/// The posting's own address when Maverick knows it, otherwise the link it was found by.
-pub fn address_of(posting: &Posting) -> String {
-    let address = posting
-        .address
-        .clone()
-        .unwrap_or_else(|| posting_address(&posting.link));
-    apply::posting_address(&address).unwrap_or(address)
 }
 
 /// Scoring found nothing that blocks an application. Muse worded the rest of that verdict differently.
@@ -128,33 +118,6 @@ impl BoardData {
         let mut seen = std::collections::HashSet::new();
         entries.retain(|entry| seen.insert(entry.address.clone()));
         Self { entries, applications }
-    }
-}
-
-/// The application system a posting is on, when Maverick can fill its form.
-pub fn system_name(address: &str) -> Option<&'static str> {
-    System::of(address).map(System::name)
-}
-
-/// The application system at `address`. Maverick fills the first three. The rest open for the user.
-pub fn system_label(address: &str) -> &'static str {
-    if let Some(name) = system_name(address) {
-        return name;
-    }
-    let host = host_of(address);
-    let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
-    if on("simplify.jobs") {
-        "Simplify"
-    } else if on("amazon.jobs") {
-        "Amazon Jobs"
-    } else if on("oraclecloud.com") {
-        "Oracle Cloud"
-    } else if on("lever.co") {
-        "Lever"
-    } else if on("linkedin.com") {
-        "LinkedIn"
-    } else {
-        "Company site"
     }
 }
 
@@ -298,7 +261,7 @@ impl Search {
         self.0.is_empty()
     }
 
-    fn finds(&self, text: &str) -> bool {
+    pub fn finds(&self, text: &str) -> bool {
         let text = text.to_lowercase();
         self.is_empty() || self.0.iter().any(|words| words.iter().all(|word| text.contains(word)))
     }
@@ -341,6 +304,8 @@ pub struct Rows {
     submitted_out: Vec<Application>,
     search: Search,
     selected: Option<IndexPath>,
+    /// The postings marked to decide together, by link.
+    marked: BTreeSet<String>,
 }
 
 impl Rows {
@@ -368,6 +333,16 @@ impl Rows {
         match self.section {
             Section::Pending => self.entries.len(),
             Section::Submitted => self.submitted.len(),
+        }
+    }
+
+    /// Marks the selected posting, or unmarks it when it was marked.
+    fn toggle_mark(&mut self) {
+        let Some(link) = self.selected_entry().map(|entry| entry.link.clone()) else {
+            return;
+        };
+        if !self.marked.remove(&link) {
+            self.marked.insert(link);
         }
     }
 
@@ -473,8 +448,15 @@ impl ListDelegate for Rows {
                     let word = if status == Outreach::Typed { "typed" } else { word };
                     ui::chip(signal, format!("note {word}"), &palette)
                 });
+                let marked = self.marked.contains(&entry.link);
                 h_flex()
                     .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(6.))
+                            .children(marked.then(|| ui::square(palette.signal(Signal::Yours)))),
+                    )
                     .child(ui::score(entry.score, 19.).w(px(30.)).text_color(tone))
                     .child(
                         v_flex()
@@ -560,6 +542,14 @@ impl ListDelegate for Rows {
         self.selected = ix;
         cx.notify();
     }
+
+    /// Command-click marks or unmarks a posting.
+    fn confirm(&mut self, secondary: bool, _: &mut Window, cx: &mut Context<ListState<Self>>) {
+        if secondary {
+            self.toggle_mark();
+            cx.notify();
+        }
+    }
 }
 
 pub struct Board {
@@ -574,8 +564,8 @@ pub struct Board {
     search: Entity<InputState>,
     /// Where the hidden companies are saved.
     filter_file: Option<PathBuf>,
-    /// Each decision made in this run, newest last, with the decision it replaced.
-    made: Vec<(String, Option<Decision>)>,
+    /// Each batch of decisions made in this run, newest last, with the decision each replaced.
+    made: Vec<Vec<(String, Option<Decision>)>>,
     /// Why the last decision could not be saved.
     problem: Option<String>,
     focus: FocusHandle,
@@ -605,6 +595,7 @@ impl Board {
             submitted_out: Vec::new(),
             search: Search::default(),
             selected: None,
+            marked: BTreeSet::new(),
         };
         let list = cx.new(|cx| ListState::new(rows, window, cx));
         let search = cx.new(|cx| {
@@ -686,7 +677,7 @@ impl Board {
         cx.notify();
     }
 
-    /// Whether Maverick approves postings scored 75 or more and reaches their people by itself.
+    /// Whether Maverick submits approved postings and reaches their people by itself.
     fn auto_apply(&self) -> bool {
         self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
@@ -816,29 +807,75 @@ impl Board {
         self.set_filter(filter, 0, window, cx);
     }
 
-    /// Decides the selected posting. The selection stays in place, so it lands on the next pending one.
+    /// Decides the marked postings, or the selected one when none is marked. The selection stays
+    /// in place, so it lands on the next pending one.
     pub fn decide(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.order;
         let reachable = self.outreach.read(cx).reachable();
         let decided = self.list.update(cx, |list, cx| {
-            let row = list.selected_index()?.row;
+            let row = list.selected_index().map_or(0, |ix| ix.row);
             let rows = list.delegate_mut();
-            if rows.section != Section::Pending {
-                return None;
+            let mut links: Vec<String> = std::mem::take(&mut rows.marked).into_iter().collect();
+            if links.is_empty() {
+                links.extend(rows.selected_entry().map(|entry| entry.link.clone()));
             }
-            let entry = rows.entries.get_mut(row)?;
-            let before = entry.decision.replace(decision);
-            let link = entry.link.clone();
+            let mut made = Vec::new();
+            for entry in rows.entries.iter_mut().chain(&mut rows.filtered_out) {
+                if links.contains(&entry.link) {
+                    made.push((entry.link.clone(), entry.decision.replace(decision)));
+                }
+            }
             sort(&mut rows.entries, order, &reachable);
             select_row(list, row, window, cx);
-            Some((link, before))
+            made
         });
-        if let Some((link, before)) = decided {
-            self.save(link.clone(), Some(decision), cx);
-            self.sync_queue(&link, Some(decision), cx);
-            self.made.push((link, before));
+        if !decided.is_empty() {
+            let saves = decided.iter().map(|(link, _)| (link.clone(), Some(decision))).collect();
+            self.save(saves, cx);
+            for (link, _) in &decided {
+                self.sync_queue(link, Some(decision), cx);
+            }
+            self.made.push(decided);
         }
         cx.notify();
+    }
+
+    /// Marks the selected posting, or unmarks it, and moves to the next one.
+    fn toggle_mark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.list.update(cx, |list, cx| {
+            let row = list.selected_index().map_or(0, |ix| ix.row);
+            list.delegate_mut().toggle_mark();
+            select_row(list, row + 1, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Marks every posting the list shows that waits on a decision.
+    fn mark_all(&mut self, cx: &mut Context<Self>) {
+        self.list.update(cx, |list, cx| {
+            let rows = list.delegate_mut();
+            let pending: Vec<String> = rows
+                .entries
+                .iter()
+                .filter(|entry| entry.decision.is_none())
+                .map(|entry| entry.link.clone())
+                .collect();
+            rows.marked.extend(pending);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn clear_marks(&mut self, cx: &mut Context<Self>) {
+        self.list.update(cx, |list, cx| {
+            list.delegate_mut().marked.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn marked(&self, cx: &App) -> usize {
+        self.list.read(cx).delegate().marked.len()
     }
 
     /// Puts an approved posting in the apply queue, and takes any other out while it waits.
@@ -908,9 +945,9 @@ impl Board {
         cx.notify();
     }
 
-    /// Takes back the last decision and selects its posting again.
+    /// Takes back the last batch of decisions and selects its first posting again.
     pub fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((link, before)) = self.made.pop() else {
+        let Some(batch) = self.made.pop() else {
             return;
         };
         let order = self.order;
@@ -918,27 +955,37 @@ impl Board {
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
             rows.section = Section::Pending;
-            let all = rows.entries.iter_mut().chain(&mut rows.filtered_out);
-            if let Some(entry) = all.into_iter().find(|entry| entry.link == link) {
-                entry.decision = before;
+            for entry in rows.entries.iter_mut().chain(&mut rows.filtered_out) {
+                if let Some((_, before)) = batch.iter().find(|(link, _)| *link == entry.link) {
+                    entry.decision = *before;
+                }
             }
             sort(&mut rows.entries, order, &reachable);
-            let row = rows.entries.iter().position(|entry| entry.link == link).unwrap_or(0);
+            let first = batch.first().map(|(link, _)| link);
+            let row = rows
+                .entries
+                .iter()
+                .position(|entry| Some(&entry.link) == first)
+                .unwrap_or(0);
             select_row(list, row, window, cx);
         });
-        self.save(link.clone(), before, cx);
-        self.sync_queue(&link, before, cx);
+        self.save(batch.clone(), cx);
+        for (link, before) in &batch {
+            self.sync_queue(link, *before, cx);
+        }
         cx.notify();
     }
 
-    /// Writes a decision to the database off the main thread. A failure shows on the board.
-    fn save(&mut self, link: String, decision: Option<Decision>, cx: &mut Context<Self>) {
+    /// Writes decisions to the database off the main thread. A failure shows on the board.
+    fn save(&mut self, decisions: Vec<(String, Option<Decision>)>, cx: &mut Context<Self>) {
         let database = self.database.clone();
         let saved = self.browser.read(cx).background().spawn_blocking(move || {
             let database = database.ok_or("this system has no application data directory")?;
-            Store::open(&database)
-                .and_then(|mut store| store.decide(&link, decision))
-                .map_err(|error| error.to_string())
+            let mut store = Store::open(&database).map_err(|error| error.to_string())?;
+            for (link, decision) in decisions {
+                store.decide(&link, decision).map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>(())
         });
         cx.spawn(async move |this, cx| {
             let problem = match saved.await {
@@ -1041,7 +1088,10 @@ impl Board {
         match event.keystroke.key.as_str() {
             "z" if modifiers.platform => self.undo(window, cx),
             "f" if modifiers.platform => self.focus_search(window, cx),
+            "a" if modifiers.platform => self.mark_all(cx),
             _ if modifiers.modified() => return,
+            "escape" if self.marked(cx) > 0 => self.clear_marks(cx),
+            "x" => self.toggle_mark(window, cx),
             "/" => self.focus_search(window, cx),
             "a" => self.decide(Decision::Approved, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
@@ -1130,6 +1180,55 @@ impl Board {
                 ui::button("undo-decision", "Undo", ui::quiet_face("undo ⌘z", palette))
                     .on_click(cx.listener(|this, _, window, cx| this.undo(window, cx)))
             }))
+    }
+
+    /// How many postings are marked, with ways to decide them together.
+    fn marked_strip(&self, palette: &Palette, cx: &mut Context<Self>) -> Option<Div> {
+        let marked = self.marked(cx);
+        if marked == 0 {
+            return None;
+        }
+        let said = format!("{marked} marked");
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_3()
+                .px(px(14.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(palette.line)
+                .child(ui::square(palette.signal(Signal::Yours)))
+                .child(
+                    ui::caps(said.clone())
+                        .id("marked-count")
+                        .test_support()
+                        .role(gpui_kit::Role::Label)
+                        .aria_label(said)
+                        .text_color(palette.ink),
+                )
+                .child(
+                    ui::button(
+                        "approve-marked",
+                        format!("Approve {marked} marked"),
+                        ui::primary_face(format!("approve {marked}"), Some("a"), palette),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Approved, window, cx))),
+                )
+                .child(
+                    ui::button(
+                        "skip-marked",
+                        format!("Skip {marked} marked"),
+                        ui::quiet_face("skip  s", palette),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Skipped, window, cx))),
+                )
+                .child(div().flex_1())
+                .child(ui::caps("x marks · ⌘a marks all").text_color(palette.faint))
+                .child(
+                    ui::button("clear-marks", "Clear marks", ui::quiet_face("clear  esc", palette))
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx))),
+                ),
+        )
     }
 
     /// The company filter in force, with a way to take back each part of it.
@@ -1256,26 +1355,6 @@ impl Board {
                 .into_any_element(),
             );
         }
-        let auto_submit = browser.auto_submit();
-        let (word, tip) = match auto_submit {
-            true => (
-                "auto-submit on",
-                "Maverick submits a form when every answer in it is yours or follows from your facts. Click to turn this off.",
-            ),
-            false => (
-                "auto-submit off",
-                "Maverick fills each form and leaves the Submit to you. Click to let it submit complete forms.",
-            ),
-        };
-        controls.push(
-            ui::button("auto-submit", word, ui::quiet_face(word, palette))
-                .tip(tip)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.browser
-                        .update(cx, |browser, cx| browser.set_auto_submit(!auto_submit, cx));
-                }))
-                .into_any_element(),
-        );
         let step = |id: &'static str, name: &'static str, word: &'static str, to: usize| {
             ui::button(id, name, ui::quiet_face(word, palette))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1341,7 +1420,7 @@ impl Board {
         };
         let auto_submit = self.browser.read(cx).auto_submit();
         let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
-            (None, _) if auto_submit => "approve queues it. maverick submits it when nothing is left for you.",
+            (None, _) if auto_submit => "approve queues it. maverick submits it if it can and messages its people.",
             (None, _) => "approve queues it. nothing gets submitted.",
             (Some(Decision::Skipped), _) => "skipped.",
             (Some(Decision::Approved), None) => "approve again to queue it.",
@@ -1354,11 +1433,13 @@ impl Board {
             (_, Some(Step::Applied)) => "applied.",
             (_, Some(Step::Failed(_))) => "nothing was submitted.",
         };
+        let marked = rows.marked.len();
         let (word, name) = match run.as_ref().map(|run| &run.step) {
-            None if entry.decision == Some(Decision::Approved) => ("apply", "Apply"),
-            None => ("approve", "Approve"),
-            Some(Step::Failed(_)) => ("try again", "Try again"),
-            Some(_) => ("", ""),
+            _ if marked > 0 => (format!("approve {marked}"), format!("Approve {marked} marked")),
+            None if entry.decision == Some(Decision::Approved) => ("apply".into(), "Apply".into()),
+            None => ("approve".into(), "Approve".into()),
+            Some(Step::Failed(_)) => ("try again".into(), "Try again".into()),
+            Some(_) => (String::new(), String::new()),
         };
         let link = entry.link.clone();
         let reported = run.as_ref().is_some_and(|run| run.report.is_some());
@@ -1369,9 +1450,10 @@ impl Board {
                 .flatten();
             (scorer, outreach.posting_section(&link, palette, cx))
         });
-        let reviewable = run
-            .as_ref()
-            .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
+        let reviewable = marked == 0
+            && run
+                .as_ref()
+                .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
         let primary = if reviewable {
             Some(
                 ui::button(
@@ -1621,6 +1703,7 @@ impl Render for Board {
             .on_key_down(cx.listener(Self::on_key))
             .child(self.toolbar(&palette, cx))
             .children(self.filter_strip(&palette, cx))
+            .children(self.marked_strip(&palette, cx))
             .children(self.problem.clone().map(|problem| {
                 h_flex()
                     .gap(px(9.))
@@ -1864,21 +1947,6 @@ mod tests {
     }
 
     #[test]
-    fn each_posting_names_its_application_system() {
-        for (address, system) in [
-            (ASHBY, "Ashby"),
-            ("https://job-boards.greenhouse.io/example/jobs/123", "Greenhouse"),
-            ("https://www.amazon.jobs/en/jobs/123/engineer", "Amazon Jobs"),
-            ("https://example.fa.us2.oraclecloud.com/hcmUI/job/1", "Oracle Cloud"),
-            ("https://jobs.lever.co/example/1", "Lever"),
-            ("https://simplify.jobs/p/9", "Simplify"),
-            ("https://careers.example.com/jobs/1", "Company site"),
-        ] {
-            assert_eq!(system_label(address), system, "{address}");
-        }
-    }
-
-    #[test]
     fn applications_sort_by_date_or_by_company() {
         let sent = |row: Option<u32>, role: &str, day: i8| Application {
             sheet_row: row,
@@ -2038,6 +2106,84 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("board-submitted").label(), Some("Submitted · 1"));
             assert!(window.try_find("approve").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn marked_postings_are_approved_together_and_undone_together(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let (postings, applications) = sample();
+        Store::open(&database).unwrap().add_found(&postings).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let data = BoardData::new(&postings, applications, &HashMap::new());
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                let bridge = maverick_core::bridge::Bridge::new();
+                Browser::new(bridge, background, Err("none".into()), None, None, cx)
+            })
+        });
+        let (window, board) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1000.), px(640.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                let outreach = cx.new(|cx| OutreachView::new(browser.clone(), None, window, cx));
+                cx.new(|cx| Board::new(browser.clone(), outreach, data, Some(database.clone()), window, cx))
+            })
+            .expect("the test window opens")
+        });
+        let decisions = || Store::open(&database).unwrap().decisions().unwrap();
+        let queued =
+            |cx: &mut TestAppContext| -> usize { browser.read_with(cx, |browser, _| browser.queue().runs().len()) };
+
+        // x marks the selected posting and moves on, so two presses mark Ready and the one after it.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("x", cx);
+            window.press("x", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("marked-count").label(), Some("2 marked"));
+            window.click("approve-marked", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("marked-count").is_none());
+        })
+        .unwrap();
+        wait_until("both approvals are saved", || decisions().len() == 2);
+        assert!(decisions().values().all(|decision| *decision == Decision::Approved));
+        assert_eq!(queued(cx), 2);
+
+        // Undo takes back the whole batch.
+        cx.update_window(window, |_, window, cx| {
+            window.press("cmd-z", cx);
+        })
+        .unwrap();
+        wait_until("the undo is saved", || decisions().is_empty());
+
+        // Command-A marks every pending posting shown; escape clears the marks.
+        cx.update_window(window, |_, window, cx| {
+            window.press("cmd-a", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("marked-count").label(), Some("4 marked"));
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("marked-count").is_none());
         })
         .unwrap();
     }

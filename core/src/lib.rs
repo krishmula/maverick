@@ -24,6 +24,7 @@ pub mod mav;
 pub mod model;
 pub mod outreach;
 pub mod page;
+pub mod platform;
 pub mod providers;
 pub mod relay;
 pub mod rules;

@@ -286,8 +286,10 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (post_link, role) DO UPDATE SET
                      found_at = excluded.found_at, poster = excluded.poster, company = excluded.company,
-                     score = excluded.score, variant = excluded.variant, outreach = excluded.outreach,
-                     notes = excluded.notes",
+                     score = excluded.score, variant = excluded.variant, notes = excluded.notes,
+                     -- A sheet row saying not started never undoes what the user did in Maverick, such as a rejection.
+                     outreach = CASE WHEN excluded.outreach = 'not_started' THEN hiring_posts.outreach
+                                     ELSE excluded.outreach END",
             )?;
             for post in &tracker.hiring_posts {
                 hiring_post.execute(params![

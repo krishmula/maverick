@@ -12,12 +12,13 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     canvas, div, fill, img, point, px, size,
 };
+use maverick_core::apply::System;
 use maverick_core::bridge::{BrowserState, Tab};
 
 use gpui_kit::TestSupportExt as _;
 
 use crate::band::{Band, Mark};
-use crate::board::{Board, Entry, system_name};
+use crate::board::{Board, Entry};
 use crate::browser::{Browser, Fill, Latency, Subject};
 use crate::connections::Connections;
 use crate::connections::OpenSetup;
@@ -30,6 +31,7 @@ use crate::schedule::{BETWEEN_PASSES, FIRST_PASS, Funnel, Lists, Refreshed};
 use crate::setup::{Finished, Setup};
 use crate::tabs::{TabList, host_of};
 use crate::ui::{self, Palette, Signal};
+use maverick_core::platform::Platform;
 
 /// How often the band redraws while the window is in front.
 const FRAME: Duration = Duration::from_millis(66);
@@ -540,9 +542,11 @@ impl MainView {
             .fill_of(&Subject::Tab(tab.connection, tab.tab.id))
             .cloned();
         let host = host_of(&tab.tab.url);
-        let tag = match system_name(&tab.tab.url) {
-            Some(system) => format!("{host} / {system}"),
-            None => host.to_owned(),
+        let platform = Platform::of(&tab.tab.url);
+        let tag = if System::of(&tab.tab.url).is_some() {
+            format!("{host} / {}", platform.name())
+        } else {
+            host.to_owned()
         };
         let title = if tab.tab.title.is_empty() {
             &tab.tab.url
