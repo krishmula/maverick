@@ -182,13 +182,39 @@
     }, 300);
   });
 
-  // A date box holds its number without a leading zero, and the text beside it shows the zero.
+  // A date box, as on a live page. The date reads key presses, and text that arrives changes
+  // nothing. The date itself knows which of its boxes takes the keys: the one whose text was
+  // clicked, or the next one after a full number, or the first one when the focus comes from
+  // outside the date. A script that puts the focus in a later box does not change that, so its
+  // keys go to the first box. A box holds its number without a leading zero, and the text beside
+  // it shows the zero.
   const dateBox = (box) => {
-    const width = box.getAttribute("data-automation-id").includes("Year") ? 4 : 2;
-    box.addEventListener("input", () => {
-      const number = Number(box.value.replace(/\D/g, ""));
-      box.value = number ? String(number) : "";
-      box.previousElementSibling.textContent = number ? String(number).padStart(width, "0") : "";
+    const date = box.parentElement;
+    const boxes = () => [...date.querySelectorAll('[role="spinbutton"]')];
+    const width = (box) => (box.getAttribute("data-automation-id").includes("Year") ? 4 : 2);
+    const take = (box) => {
+      date.taking = box;
+      date.typed = "";
+    };
+    box.previousElementSibling.addEventListener("click", () => {
+      take(box);
+      box.focus();
+    });
+    box.addEventListener("focus", (event) => {
+      if (!date.contains(event.relatedTarget) && date.taking !== box) take(boxes()[0]);
+    });
+    box.addEventListener("beforeinput", (event) => event.preventDefault());
+    box.addEventListener("keydown", (event) => {
+      if (!/^\d$/.test(event.key)) return;
+      event.preventDefault();
+      const taking = date.taking ?? boxes()[0];
+      date.typed = (date.typed ?? "") + event.key;
+      taking.value = String(Number(date.typed));
+      taking.previousElementSibling.textContent = date.typed.padStart(width(taking), "0");
+      if (date.typed.length < width(taking)) return;
+      const next = boxes()[boxes().indexOf(taking) + 1];
+      take(next ?? taking);
+      next?.focus();
     });
   };
   document.querySelectorAll('[data-automation-id$="-input"][role="spinbutton"]').forEach(dateBox);

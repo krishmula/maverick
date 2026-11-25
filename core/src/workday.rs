@@ -50,6 +50,8 @@ use crate::page::{Key, Locator, Page, PageError};
 pub const SIGN_IN_SERVICE: &str = "dev.maverick.workday";
 
 const PAGE_WAIT: Duration = Duration::from_secs(30);
+/// How long a press of "Save and Continue" may show nothing before Maverick presses once more.
+const PRESS_WAIT: Duration = Duration::from_secs(10);
 /// How long Workday gets to answer a press of Sign In or Create Account.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(30);
 /// How long the wall gets to change from one of its forms to another.
@@ -954,7 +956,17 @@ async fn fill_pages(page: &Page, answers: &Answers, job: &Job, captures: Option<
         page.click(&marked("pageFooterNextButton"))
             .await
             .map_err(during(format!("pressing \"{NEXT}\" on \"{}\"", at.step)))?;
-        match after_next(page, &at).await? {
+        let mut moved = after_next(page, &at, PRESS_WAIT).await?;
+        if matches!(moved, Moved::Nowhere) && place(page).await? == at {
+            // Workday can draw the page anew while the button is pressed, and that press does
+            // nothing. On a live page a second press moved on. The page is the same one, and
+            // its button still says "Save and Continue".
+            page.click(&marked("pageFooterNextButton"))
+                .await
+                .map_err(during(format!("pressing \"{NEXT}\" on \"{}\" again", at.step)))?;
+            moved = after_next(page, &at, PAGE_WAIT).await?;
+        }
+        match moved {
             Moved::On => {}
             Moved::Refused(errors) => {
                 break End::Stopped(format!(
@@ -1044,8 +1056,8 @@ enum Moved {
 ///
 /// A page that was refused before can still list its old errors for a moment, so errors count
 /// only once the page has looked the same `ANSWER_LOOKS` times in a row.
-async fn after_next(page: &Page, before: &Place) -> Result<Moved, FillError> {
-    let deadline = Instant::now() + PAGE_WAIT;
+async fn after_next(page: &Page, before: &Place, limit: Duration) -> Result<Moved, FillError> {
+    let deadline = Instant::now() + limit;
     let (mut last, mut steady) = (None, 0);
     loop {
         tokio::time::sleep(ANSWER_GAP).await;
@@ -1668,29 +1680,38 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
                 ("Day", i32::from(date.day()), 2),
                 ("Year", i32::from(date.year()), 4),
             ];
-            let mut typed = Vec::new();
+            let mut boxes = Vec::new();
             for (part, number, width) in parts {
                 let input = within(id, &format!("[data-automation-id=\"dateSection{part}-input\"]"));
-                if page.evaluate(&format!("!!({})", input.as_script())).await? != true {
-                    continue;
+                if page.evaluate(&format!("!!({})", input.as_script())).await? == true {
+                    // The box holds the number without its leading zero.
+                    boxes.push((part, input, number.to_string(), format!("{number:0width$}")));
                 }
-                // The box holds the number without its leading zero.
-                let wanted = number.to_string();
-                let shows = format!("({})?.value === {}", input.as_script(), quoted(&wanted));
-                if page.evaluate(&shows).await? != true {
-                    // A date box reads key presses. On a live page, text put into a box that
-                    // held a date changed the month and left a wrong day.
-                    let focus = format!("((box) => {{ box.focus(); box.select?.(); }})({})", input.as_script());
-                    page.evaluate(&focus).await?;
-                    page.press_digits(&format!("{number:0width$}")).await?;
-                    expect_value(page, &input, &wanted).await?;
-                }
-                typed.push(format!("{number:0width$}"));
             }
-            if typed.is_empty() {
+            let Some((first, ..)) = boxes.first() else {
                 return Err(Problem::Mismatch("the date field has no box to type in"));
+            };
+            let mut shown = true;
+            for (_, input, wanted, _) in &boxes {
+                let shows = format!("({})?.value === {}", input.as_script(), quoted(wanted));
+                shown = shown && page.evaluate(&shows).await? == true;
             }
-            page.press(Key::Tab).await?;
+            if !shown {
+                // A date reads key presses, and a full number in one box moves the keyboard on
+                // to the next box. So the whole date is typed from its first box, as a person
+                // types it. On a live page, text put into a box that held a date changed the
+                // month, and keys meant for the day box alone went to the month box. The text
+                // beside a box covers it, so the click goes to that text.
+                let display = within(id, &format!("[data-automation-id=\"dateSection{first}-display\"]"));
+                page.click(&display).await?;
+                let digits: String = boxes.iter().map(|(.., typed)| typed.as_str()).collect();
+                page.press_digits(&digits).await?;
+                for (_, input, wanted, _) in &boxes {
+                    expect_value(page, input, wanted).await?;
+                }
+                page.press(Key::Tab).await?;
+            }
+            let typed: Vec<&str> = boxes.iter().map(|(.., typed)| typed.as_str()).collect();
             Ok(typed.join("/"))
         }
     }

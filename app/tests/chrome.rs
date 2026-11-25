@@ -856,6 +856,16 @@ async fn a_reconstructed_workday_application_is_filled_page_by_page_and_never_su
     assert_eq!(told(&again.outcomes), in_place);
     assert_eq!(page.evaluate("window.advanced === true").await.unwrap(), false);
 
+    // A date that holds another day of the same month is typed anew, from its first box. On a
+    // live page, keys meant for the day box alone went to the month box.
+    let day = "document.getElementById('primaryQuestionnaire--q3-dateSectionDay-input')";
+    page.evaluate(&format!("{day}.value = '31'")).await.unwrap();
+    let changed = workday::fill_page(&page, &answers, job.clone(), None).await.unwrap();
+    assert_eq!(told(&changed.outcomes), in_place);
+    let date = "['Month', 'Day', 'Year'].map((part) => \
+        document.getElementById(`primaryQuestionnaire--q3-dateSection${part}-input`).value)";
+    assert_eq!(page.evaluate(date).await.unwrap(), json!(["1", "18", "2027"]));
+
     // The whole fill goes on from there. Workday does not take this page, so the fill stops on it
     // and says what Workday said.
     page.navigate(&format!("{form}?refuse")).await.unwrap();
