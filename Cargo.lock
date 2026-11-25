@@ -4328,7 +4328,7 @@ dependencies = [
 
 [[package]]
 name = "maverick"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "block2 0.6.2",
  "gpui-kit",
@@ -4346,7 +4346,7 @@ dependencies = [
 
 [[package]]
 name = "maverick-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.23.1",
  "dirs 7.0.0",
