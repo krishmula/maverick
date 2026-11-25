@@ -54,6 +54,20 @@ fn posting_path(address: &str) -> Option<(&str, bool)> {
     })
 }
 
+/// Asks Ashby for the form of the posting at `address`, without a browser.
+pub async fn read_form(address: &str) -> Result<Form, String> {
+    let (path, _) = posting_path(address).ok_or("not an Ashby posting")?;
+    let (organization, posting) = path.split_once('/').ok_or("not an Ashby posting")?;
+    let body = json!({
+        "operationName": "ApiJobPosting",
+        "query": FORM_QUERY,
+        "variables": { "organizationHostedJobsPageName": organization, "jobPostingId": posting },
+    });
+    let api = format!("{HOST}api/non-user-graphql?op=ApiJobPosting");
+    let reply = crate::http::post("Ashby", &api, &[], &body).await?;
+    form(&reply).map_err(|error| error.to_string())
+}
+
 /// Reads the form out of Ashby's reply to `FORM_QUERY`.
 pub fn form(reply: &Value) -> Result<Form, FillError> {
     #[derive(Deserialize)]

@@ -292,7 +292,7 @@ fn sponsorship_chip(sponsorship: Sponsorship, palette: &Palette) -> Div {
 /// Where a queued posting is, in the signal that says whose move it is.
 fn step_chip(step: &Step, palette: &Palette) -> Div {
     match step {
-        Step::Queued | Step::Opening | Step::Filling => ui::boxed(step.word(), palette.muted),
+        Step::Queued | Step::Opening | Step::Filling | Step::Submitting => ui::boxed(step.word(), palette.muted),
         Step::NeedsYou(_) | Step::Ready => ui::chip(Signal::Yours, step.word(), palette),
         Step::Applied => ui::chip(Signal::Done, step.word(), palette),
         Step::Failed(_) => ui::chip(Signal::Failed, step.word(), palette),
@@ -940,6 +940,26 @@ impl Board {
                 .into_any_element(),
             );
         }
+        let auto_submit = browser.auto_submit();
+        let (word, tip) = match auto_submit {
+            true => (
+                "auto-submit on",
+                "Maverick submits a form when every answer in it is yours or follows from your facts. Click to turn this off.",
+            ),
+            false => (
+                "auto-submit off",
+                "Maverick fills each form and leaves the Submit to you. Click to let it submit complete forms.",
+            ),
+        };
+        controls.push(
+            ui::button("auto-submit", word, ui::quiet_face(word, palette))
+                .tip(tip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.browser
+                        .update(cx, |browser, cx| browser.set_auto_submit(!auto_submit, cx));
+                }))
+                .into_any_element(),
+        );
         let step = |id: &'static str, name: &'static str, word: &'static str, to: usize| {
             ui::button(id, name, ui::quiet_face(word, palette))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1003,11 +1023,17 @@ impl Board {
             Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
             _ => None,
         };
+        let auto_submit = self.browser.read(cx).auto_submit();
         let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
+            (None, _) if auto_submit => "approve queues it. maverick submits it when nothing is left for you.",
             (None, _) => "approve queues it. nothing gets submitted.",
             (Some(Decision::Skipped), _) => "skipped.",
             (Some(Decision::Approved), None) => "approve again to queue it.",
+            (_, Some(Step::Queued | Step::Opening | Step::Filling)) if auto_submit => {
+                "filling. maverick submits it when nothing is left for you."
+            }
             (_, Some(Step::Queued | Step::Opening | Step::Filling)) => "filling. nothing gets submitted.",
+            (_, Some(Step::Submitting)) => "submitting.",
             (_, Some(Step::NeedsYou(_) | Step::Ready)) => "you click submit.",
             (_, Some(Step::Applied)) => "applied.",
             (_, Some(Step::Failed(_))) => "nothing was submitted.",
@@ -1200,10 +1226,18 @@ fn run_status(run: &Run, palette: &Palette) -> impl IntoElement + use<> {
         Step::Queued => (None, "Queued. It starts when a slot is free.".to_owned()),
         Step::Opening => (None, "Opening the form in a background tab.".to_owned()),
         Step::Filling => (Some(Signal::Model), "Filling the form in a background tab.".to_owned()),
+        Step::Submitting => (
+            Some(Signal::Model),
+            "Nothing was left for you, so Maverick pressed Submit.".to_owned(),
+        ),
         Step::NeedsYou(why) => (Some(Signal::Yours), why.clone()),
+        // The report says why Maverick would not submit this form itself, such as a draft to read.
         Step::Ready => (
             Some(Signal::Yours),
-            "Every required field is answered. Review it and click Submit.".to_owned(),
+            match run.report.as_ref().and_then(|report| report.held_for_the_user()) {
+                Some(why) => format!("Every required field is answered. {why} Review it and click Submit."),
+                None => "Every required field is answered. Review it and click Submit.".to_owned(),
+            },
         ),
         Step::Applied => (Some(Signal::Done), "Submitted and recorded.".to_owned()),
         Step::Failed(why) => (Some(Signal::Failed), why.clone()),

@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::answers::{Kind, Question};
+use crate::answers::{Kind, Pay, Question, Standing};
 use crate::providers::{self, Job};
 
 const INSTRUCTIONS: &str = "You fill in a job application for the applicant described in the facts. \
@@ -16,8 +16,7 @@ Never guess, and never invent experience, skills, dates or numbers. \
 The job description says only what the job itself requires. Use it for a question that asks whether \
 the applicant meets a requirement of the job, such as its minimum years of experience: \
 compare the requirement with the facts. Such a question is not a certification. \
-Always answer null for: pay or salary expectations, open-ended essay questions, \
-and agreements, acknowledgments, certifications or signatures. \
+Always answer null for open-ended essay questions and for a signature the applicant types. \
 Answer a question about gender, race or ethnicity, veteran status or disability only when a fact says \
 what the applicant chooses to disclose about it. Otherwise the answer is null. \
 A yes or no question takes exactly yes or no. A date takes YYYY-MM-DD. \
@@ -25,6 +24,47 @@ A question with options takes the exact text of one option. \
 A location takes a city and state as a person would type them into a search box. \
 Any other question takes the shortest direct answer, with no explanation. \
 In basis, name the fact you used in one short sentence.";
+
+const REQUIRED: &str = "The request says which questions the form requires. Every other question is \
+optional. Where a fact says to give something only when it is required, an optional question about it \
+takes null.";
+
+const NO_TERMS: &str = "Always answer null for agreements, acknowledgments and certifications.";
+const AGREES_TO_TERMS: &str = "The applicant agrees to every form's terms. Where a question only asks the \
+applicant to agree to or acknowledge terms and conditions, a privacy notice, the handling of the \
+application's data, or a statement that the application is true and complete, give the answer that agrees, \
+and write 'standing yes to terms' as the basis. \
+This does not cover a statement about the applicant's own circumstances, such as having no agreement \
+with a former employer or no relative at the company, and it does not cover an offer to join a \
+talent community or a mailing list: only the facts settle those.";
+
+const NO_PAY: &str = "Always answer null for pay or salary expectations.";
+const PAY_IS_POSTED_MIDPOINT: &str = "For a question about expected pay or salary, find the pay range the job \
+description states for this job and answer its midpoint: half of the sum of its two ends, as a plain \
+whole number without a currency sign, in the unit the range uses, such as 150000 for a range per year \
+and 55 for a range per hour. Where the question has options, pick the option that holds the midpoint. \
+In basis, quote the range.";
+const NO_RANGE: &str = "If the description states no pay range, or states several and does not say \
+which one applies to this applicant,";
+
+/// The instructions for factual questions, with what the user decided once for every form.
+fn instructions(standing: Standing) -> String {
+    let terms = if standing.agrees_to_terms {
+        AGREES_TO_TERMS
+    } else {
+        NO_TERMS
+    };
+    let pay = match (standing.pay, standing.pay_without_a_range) {
+        (Some(Pay::PostedMidpoint), Some(yearly)) => format!(
+            "{PAY_IS_POSTED_MIDPOINT} {NO_RANGE} a required question takes {yearly} US dollars per year, with \
+             'pay without a posted range' as the basis. An optional question takes null, and so does a \
+             question that asks for the pay in another currency."
+        ),
+        (Some(Pay::PostedMidpoint), None) => format!("{PAY_IS_POSTED_MIDPOINT} {NO_RANGE} the answer is null."),
+        (None, _) => NO_PAY.to_owned(),
+    };
+    format!("{INSTRUCTIONS} {REQUIRED} {terms} {pay}")
+}
 
 /// What the model said about one question.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,18 +86,22 @@ or when the field asks no specific question, such as 'Additional information' or
 In basis, name the part of the resume you used in one short sentence.";
 
 /// Answers factual `questions` in order, from the user's facts. `job` says which posting the form
-/// belongs to, and `description` what that job requires.
+/// belongs to, and `description` what that job requires. `required` says of each question whether
+/// the form requires it.
 pub async fn answer(
     facts: &[String],
+    standing: Standing,
     job: &str,
     description: &str,
     questions: &[&Question],
+    required: &[bool],
 ) -> Result<Vec<ModelAnswer>, String> {
     let mut asked = request(facts, job, questions);
+    asked.push_str(&required_line(required));
     if !description.is_empty() {
         let _ = write!(asked, "\nThe job description:\n{description}\n");
     }
-    ask(INSTRUCTIONS, asked, questions.len()).await
+    ask(&instructions(standing), asked, questions.len()).await
 }
 
 /// Drafts answers to essay `questions` in order, from the user's resume.
@@ -103,6 +147,19 @@ fn request(facts: &[String], job: &str, questions: &[&Question]) -> String {
         let _ = writeln!(request, "{}. ({kind}) {}", index + 1, question.title);
     }
     request
+}
+
+/// The line that tells the model which of the numbered questions the form requires.
+fn required_line(required: &[bool]) -> String {
+    let numbers: Vec<String> = (1..)
+        .zip(required)
+        .filter(|(_, required)| **required)
+        .map(|(number, _)| number.to_string())
+        .collect();
+    match numbers.is_empty() {
+        true => "\nThe form requires none of these questions.\n".to_owned(),
+        false => format!("\nThe form requires these questions: {}.\n", numbers.join(", ")),
+    }
 }
 
 fn reply_schema() -> Value {
@@ -196,6 +253,33 @@ mod tests {
              1. (yes or no) Are you in a US timezone?\n\
              2. (one of [\"Citizen\",\"Needs \\\"sponsorship\\\"\"]) Work status?\n\
              3. (text) What country are you based in?\n"
+        );
+    }
+
+    #[test]
+    fn the_instructions_hold_back_terms_and_pay_until_the_user_decides_them() {
+        let unset = instructions(Standing::default());
+        assert!(unset.contains(NO_TERMS) && unset.contains(NO_PAY));
+        let set = instructions(Standing {
+            agrees_to_terms: true,
+            pay: Some(Pay::PostedMidpoint),
+            pay_without_a_range: None,
+        });
+        assert!(set.contains(AGREES_TO_TERMS) && set.contains(PAY_IS_POSTED_MIDPOINT));
+        assert!(!set.contains(NO_TERMS) && !set.contains(NO_PAY));
+        assert!(set.ends_with("the answer is null."));
+        let with_fallback = instructions(Standing {
+            pay_without_a_range: Some(90_000),
+            ..Standing {
+                agrees_to_terms: true,
+                pay: Some(Pay::PostedMidpoint),
+                pay_without_a_range: None,
+            }
+        });
+        assert!(with_fallback.contains("a required question takes 90000 US dollars per year"));
+        assert_eq!(
+            required_line(&[true, false, true]),
+            "\nThe form requires these questions: 1, 3.\n"
         );
     }
 

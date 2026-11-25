@@ -1388,9 +1388,12 @@ pub fn fields(seen: &Value, disclose: bool) -> Result<Vec<Field>, FillError> {
 /// What a field is for, where Workday's own id for the field says it.
 fn role_of(id: &str) -> Option<Role> {
     Some(match id {
-        "name--legalName--firstName" => Role::FirstName,
+        "name--legalName--firstName" => Role::LegalFirstName,
         "name--legalName--middleName" => Role::MiddleName,
-        "name--legalName--lastName" => Role::LastName,
+        "name--legalName--lastName" => Role::LegalLastName,
+        "name--preferredCheck" => Role::HasPreferredName,
+        "name--preferredName--firstName" => Role::FirstName,
+        "name--preferredName--lastName" => Role::LastName,
         "address--addressLine1" => Role::Street,
         "address--city" => Role::City,
         "address--countryRegion" => Role::Region,
@@ -2105,7 +2108,7 @@ mod tests {
         assert_eq!(fields[7].question.role, Some(Role::Resume));
         assert_eq!(fields[8].question.role, None);
         // Workday's own ids say what these are for, so no rule about a phone or a name answers them.
-        assert_eq!(fields[0].question.role, Some(Role::FirstName));
+        assert_eq!(fields[0].question.role, Some(Role::LegalFirstName));
         assert_eq!(fields[4].question.role, Some(Role::Region));
         assert!(fields.iter().all(|field| field.path != "phoneNumber--extension"));
     }

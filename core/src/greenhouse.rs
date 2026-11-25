@@ -113,6 +113,27 @@ fn says_closed(address: &str) -> bool {
     on_a_board && marked
 }
 
+/// Reads the form of the posting at `address` from the page Greenhouse serves, without a browser.
+pub async fn read_form(address: &str) -> Result<Form, String> {
+    let page_address = posting_address(address).ok_or("not a Greenhouse posting")?;
+    let (status, page) = crate::description::get(&page_address).await?;
+    if status == 404 {
+        return Err(FillError::Closed.to_string());
+    }
+    let job_post = job_post_in(&page).ok_or(format!("the page holds no form (status {status})"))?;
+    form(&job_post).map_err(|error| error.to_string())
+}
+
+/// The posting a served page draws itself from, as `FORM_DATA` gives it in a browser.
+fn job_post_in(page: &str) -> Option<Value> {
+    let (_, context) = page.split_once("window.__remixContext = ")?;
+    let context: Value = serde_json::Deserializer::from_str(context).into_iter().next()?.ok()?;
+    context["state"]["loaderData"]
+        .as_object()?
+        .values()
+        .find_map(|data| data.get("jobPost").filter(|post| post.is_object()).cloned())
+}
+
 /// Reads the form out of the posting that `FORM_DATA` gives.
 pub fn form(job_post: &Value) -> Result<Form, FillError> {
     #[derive(Deserialize)]
