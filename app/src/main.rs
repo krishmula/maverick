@@ -55,6 +55,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             return cli::import_tracker(Path::new(&file));
         }
         Some("check-rules") => return cli::check_rules(),
+        Some("gaps") => {
+            const USAGE: &str = "usage: maverick gaps [--limit <count>] [--answers]";
+            let (mut limit, mut show_answers) = (usize::MAX, false);
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--answers" => show_answers = true,
+                    "--limit" => limit = arguments.next().and_then(|count| count.parse().ok()).ok_or(USAGE)?,
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            return cli::gaps(limit, show_answers);
+        }
         Some("run") => return cli::run(),
         Some("tracker") => return cli::tracker(&arguments.collect::<Vec<_>>()),
         Some("google") => return cli::google(&arguments.collect::<Vec<_>>()),

@@ -1,34 +1,30 @@
-//! Fills the page of a Workday application that is on screen and stops. It never moves to the
-//! next page and never submits.
+//! Fills a Workday application page after page, with "Save and Continue" between them, and stops
+//! at the page that asks to submit. It never submits.
 //!
 //! Most employers show a Workday application only to an account on their own Workday site. When
 //! the user has stored one Workday sign-in in the Keychain, this code signs in with it, and
 //! creates the account at an employer where the sign-in is refused. See `pass_wall`.
 //!
-//! This code was written without a Workday account. So its parts stand on different ground:
+//! The parts of this code stand on different ground:
 //!
-//! - Checked against live sites: the address shapes, the job's public data, the choice between
-//!   "Autofill with Resume", "Apply Manually" and "Use My Last Application", and the sign-in wall.
+//! - Checked against live applications of two employers, signed in, in November 2026: the sign-in
+//!   with a stored sign-in, the page "My Information", the search lists, "Save and Continue", and
+//!   the list of errors Workday shows when it does not take a page.
+//! - Checked against one of them: the page "My Experience" with its list of jobs, its month and
+//!   year boxes, the school, the degree, the field of study and the resume, and the page
+//!   "Application Questions" with its drop-down lists, the questions that appear after an answer,
+//!   and a date with a day.
 //! - Checked against the sign-in walls of 19 employers, with made-up values and WITHOUT pressing
 //!   Sign In or Create Account: the markup of the sign-in form, the create-account form and the
 //!   chooser, moving between them, typing into them and reading the text back, ticking the
 //!   consent box, and which element a click on a submit button lands on.
-//! - NOT checked against a live site: everything after a press of Sign In or Create Account. No
-//!   sign-in was tried and no account was created while writing this. What the wall shows after a
-//!   press (`errorMessage`, `alertMessage`, `inputAlert`, `informationalBlurbText`, and the move
-//!   to the site's `/login` page when the email address must be verified) is read from Workday's
-//!   public page script named below. The tests run it against a reconstruction of the wall.
-//! - Checked against the two live sites found that ask for no account, on their first page only
-//!   ("My Information"), with made-up answers and without saving the page: reading the fields,
-//!   typing text, an email and a phone number, a radio group, a single check box, and reading and
-//!   picking from a drop-down list.
-//! - NOT checked against a live page: every later page of an application, a signed-in session,
-//!   file uploads, groups of check boxes, long text, and `SUBMITTED`. These rest on two sources:
-//!   Workday's own public page scripts (`candidate-experience-jobs/cx-jobs.min.js` and
-//!   `candidate-experience-apply-flow/candidate-experience-apply-flow.min.js`, release 2026.47.19),
-//!   which name the `data-automation-id` values and draw the controls, and the atsfill project's
-//!   notes on the wizard as it saw it signed in (<https://shbernal.github.io/atsfill/adapters/workday/>).
-//!   The tests run these parts against a reconstruction of that markup, not against Workday.
+//! - NOT checked against a live site: creating an account, what the wall shows after a refused
+//!   press, the pages "Voluntary Disclosures" and "Self Identify", the last page, a search list
+//!   whose options open lists of their own, groups of check boxes, and `SUBMITTED`. These rest
+//!   on Workday's own public page scripts (`candidate-experience-jobs/cx-jobs.min.js` and
+//!   `candidate-experience-apply-flow/candidate-experience-apply-flow.min.js`, release 2026.47.19)
+//!   and the atsfill project's notes (<https://shbernal.github.io/atsfill/adapters/workday/>).
+//!   The tests run every part against a reconstruction of the markup, not against Workday.
 //!
 //! Each fill of an application page saves the page's structure to a file, so the next version of
 //! this code can be built on real markup. See `capture`.
@@ -41,9 +37,10 @@ use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::answers::{Answer, Answers, Kind, Question, Role};
+use crate::answers::{Answer, Answers, Kind, Question, Role, SchoolPart, WorkPart};
 use crate::apply::{
-    self, Enter, Field, FillError, Form, Problem, Report, during, expect_value, plain_text, quoted, settles, text_of,
+    self, End, Enter, Field, FieldResult, FillError, Form, Outcome, Problem, Report, during, expect_value, plain_text,
+    quoted, settles, text_of,
 };
 use crate::bridge::BridgeError;
 use crate::credentials::{Keychain, SignIn, SignIns};
@@ -269,13 +266,13 @@ async fn address_of(page: &Page) -> Result<String, FillError> {
     Ok(address.as_str().unwrap_or_default().to_owned())
 }
 
-/// Fills the page of the application that is on screen and reports on each of its fields.
+/// Fills the application from the page on screen to its last page, and reports on each field.
 /// The tab must be on a Workday posting, on the choice of how to apply, or inside the application.
 ///
 /// From a posting it opens the application and chooses "Apply Manually". When Workday then asks
 /// for an account, it signs in with the sign-in in the user's Keychain, or stops with
 /// `FillError::SignInNeeded` when there is none. See `pass_wall`.
-/// It never clicks "Save and Continue".
+/// See `fill_pages` for when it stops.
 pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
     let captures = crate::data_dir().map(|dir| dir.join("captures"));
     fill_with(page, answers, captures.as_deref(), &Keychain).await
@@ -330,7 +327,7 @@ async fn fill_from(
     screen: Screen,
 ) -> Result<Report, FillError> {
     if screen != Screen::Wall {
-        return fill_page(page, answers, job, captures).await;
+        return fill_pages(page, answers, &job, captures).await;
     }
     let entry = pass_wall(page, sign_ins).await?;
     // The user must learn what was done under their name, also when the fill then fails.
@@ -338,7 +335,7 @@ async fn fill_from(
     shown(page, &[Screen::Wall, Screen::Choice])
         .await
         .map_err(after_entry)?;
-    let mut report = fill_page(page, answers, job, captures).await.map_err(after_entry)?;
+    let mut report = fill_pages(page, answers, &job, captures).await.map_err(after_entry)?;
     report.note = Some(match report.note {
         Some(note) => format!("{} {note}", entry.note()),
         None => entry.note().to_owned(),
@@ -866,32 +863,272 @@ async fn press(page: &Page, button: &str, typed: &Typed<'_>, doing: &'static str
     }
 }
 
-/// Fills the application page on screen: reads its fields from the page itself, saves a capture
-/// of its structure under `captures`, then enters the answers. It never leaves the page.
+/// The most pages one fill goes through. An application has fewer.
+const MOST_PAGES: usize = 12;
+/// The most looks one fill takes at a page.
+const MOST_LOOKS: usize = 4;
+/// The only text on the button at the foot of a page that Maverick presses.
+const NEXT: &str = "Save and Continue";
+/// How often in a row the page must look the same after a press of the button, before what it
+/// shows counts as its answer.
+const ANSWER_LOOKS: u32 = 4;
+const ANSWER_GAP: Duration = Duration::from_millis(500);
+
+const UNVERIFIED: &str = "Check every answer: most of Maverick's Workday filling is not verified on live pages yet.";
+
+/// Fills the page on screen, presses "Save and Continue", and does the same on each next page.
+///
+/// It stops, and says why, when an answer could not be entered, when Workday refuses the page,
+/// and when the button at the foot of the page says anything other than "Save and Continue".
+/// The last page's button says "Submit", so the fill ends there with `End::Review`.
+async fn fill_pages(page: &Page, answers: &Answers, job: &Job, captures: Option<&Path>) -> Result<Report, FillError> {
+    let mut whole = Report {
+        outcomes: Vec::new(),
+        model_problem: None,
+        note: None,
+        end: End::Review,
+    };
+    let mut steps: Vec<String> = Vec::new();
+    whole.end = loop {
+        let at = place(page).await?;
+        if !at.next.eq_ignore_ascii_case(NEXT) {
+            break match at.next.eq_ignore_ascii_case("Submit") {
+                true => End::Review,
+                false => End::Stopped(format!(
+                    "Maverick stopped on \"{}\": the button at the foot of the page says {:?}, and Maverick only \
+                     presses \"{NEXT}\".",
+                    at.step, at.next
+                )),
+            };
+        }
+        if steps.len() == MOST_PAGES {
+            break End::Stopped(format!("Maverick stopped on \"{}\" after {MOST_PAGES} pages.", at.step));
+        }
+        steps.push(at.step.clone());
+        // An answer can bring up questions the page did not show before. Each look at the page
+        // fills the fields that no earlier look saw, and the fields that lost their answer.
+        let mut done = Vec::new();
+        let mut entered: Vec<(String, Outcome)> = Vec::new();
+        for look in 1..=MOST_LOOKS {
+            let before = done.len();
+            let report = fill_one(page, answers, job, captures, &mut done).await?;
+            whole.model_problem = whole.model_problem.or(report.model_problem);
+            if report.outcomes.is_empty() {
+                break;
+            }
+            entered.extend(done[before..].iter().cloned().zip(report.outcomes));
+            tokio::time::sleep(ANSWER_GAP).await;
+            // Workday can draw the page anew a moment after an answer, and an answer entered in
+            // that moment is gone. On a live page a ticked box was lost right after a date.
+            let empty = empty_fields(page).await?;
+            let lost = |name: &String, outcome: &Outcome| {
+                matches!(outcome.result, FieldResult::Filled { .. }) && empty.contains(name)
+            };
+            if look < MOST_LOOKS {
+                done.retain(|name| {
+                    !entered
+                        .iter()
+                        .any(|(entered, outcome)| entered == name && lost(name, outcome))
+                });
+                entered.retain(|(name, outcome)| !lost(name, outcome));
+            } else {
+                for (name, outcome) in &mut entered {
+                    if lost(name, outcome) {
+                        outcome.result = FieldResult::Failed("the page did not keep the answer".into());
+                    }
+                }
+            }
+        }
+        let failed = entered
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome.result, FieldResult::Failed(_)))
+            .count();
+        whole.outcomes.extend(entered.into_iter().map(|(_, outcome)| outcome));
+        if failed > 0 {
+            break End::Stopped(format!(
+                "Maverick stopped on \"{}\": it could not enter {failed} of its answers there. \
+                 Fix them in the tab, then click Fill form again.",
+                at.step
+            ));
+        }
+        page.click(&marked("pageFooterNextButton"))
+            .await
+            .map_err(during(format!("pressing \"{NEXT}\" on \"{}\"", at.step)))?;
+        match after_next(page, &at).await? {
+            Moved::On => {}
+            Moved::Refused(errors) => {
+                break End::Stopped(format!(
+                    "Workday did not take \"{}\": {} Fix this in the tab, then click Fill form again.",
+                    at.step,
+                    errors.join(" ")
+                ));
+            }
+            Moved::Nowhere => {
+                break End::Stopped(format!(
+                    "Maverick pressed \"{NEXT}\" on \"{}\", and the page did not change in {} seconds. \
+                     Look at the tab before you click Fill form again.",
+                    at.step,
+                    PAGE_WAIT.as_secs()
+                ));
+            }
+        }
+    };
+    let pages = match steps.len() {
+        0 => "It filled no page.".to_owned(),
+        _ => format!("It filled: {}.", steps.join(", ")),
+    };
+    let saved = captures.map_or_else(String::new, |folder| {
+        format!(
+            " The structure of each page, without your answers, is saved in {}.",
+            folder.display()
+        )
+    });
+    let review = match whole.end {
+        End::Review => " It stopped at the last page. Read it, then click Submit yourself.",
+        _ => "",
+    };
+    whole.note = Some(format!("{UNVERIFIED} {pages}{review}{saved}"));
+    Ok(whole)
+}
+
+/// Where the application is: the step the progress bar marks, and the text of the button at the
+/// foot of the page.
+#[derive(Debug, PartialEq)]
+struct Place {
+    step: String,
+    next: String,
+    errors: Vec<String>,
+}
+
+/// Reads `Place`. Workday lists what it refuses about a page in `errorHeading`, one entry per
+/// field, and the entry's button names its message in `aria-describedby`.
+const PLACE: &str = r#"(() => {
+    const text = (element) => (element?.textContent ?? "").replace(/\s+/g, " ").trim();
+    const marked = (id) => document.querySelector(`[data-automation-id="${id}"]`);
+    const listed = [...document.querySelectorAll('[data-automation-id="errorHeading"] li')].map((entry) => {
+        const button = entry.querySelector("button");
+        const message = text(document.getElementById(button?.getAttribute("aria-describedby") ?? ""));
+        return message || text(entry);
+    });
+    const beside = [...document.querySelectorAll('[data-automation-id="inputAlert"]')].map(text);
+    return {
+        step: text(marked("progressBarActiveStep")).replace(/^.*\bstep \d+ of \d+\s*/i, ""),
+        next: text(marked("pageFooterNextButton")),
+        errors: listed.length > 0 ? listed : beside,
+    };
+})()"#;
+
+async fn place(page: &Page) -> Result<Place, FillError> {
+    let seen = page
+        .evaluate(PLACE)
+        .await
+        .map_err(during("reading where the application is"))?;
+    let text = |key: &str| seen[key].as_str().unwrap_or_default().to_owned();
+    Ok(Place {
+        step: text("step"),
+        next: text("next"),
+        errors: serde_json::from_value(seen["errors"].clone()).unwrap_or_default(),
+    })
+}
+
+/// What a press of "Save and Continue" led to.
+enum Moved {
+    /// The application shows another page.
+    On,
+    /// Workday kept the page and says what is wrong with it.
+    Refused(Vec<String>),
+    Nowhere,
+}
+
+/// Waits for Workday's answer to a press of "Save and Continue" on the page at `before`.
+///
+/// A page that was refused before can still list its old errors for a moment, so errors count
+/// only once the page has looked the same `ANSWER_LOOKS` times in a row.
+async fn after_next(page: &Page, before: &Place) -> Result<Moved, FillError> {
+    let deadline = Instant::now() + PAGE_WAIT;
+    let (mut last, mut steady) = (None, 0);
+    loop {
+        tokio::time::sleep(ANSWER_GAP).await;
+        let now = place(page).await?;
+        if !now.step.is_empty() && now.step != before.step {
+            // The next page draws piece by piece.
+            shown(page, &[]).await?;
+            return Ok(Moved::On);
+        }
+        steady = if last.as_ref() == Some(&now) { steady + 1 } else { 1 };
+        if steady >= ANSWER_LOOKS && !now.errors.is_empty() {
+            return Ok(Moved::Refused(now.errors));
+        }
+        last = Some(now);
+        if Instant::now() >= deadline {
+            return Ok(Moved::Nowhere);
+        }
+    }
+}
+
+/// Fills the application page on screen and stays on it. See `fill_one`.
 ///
 /// Only partly verified against live Workday pages. See the top of this module.
 pub async fn fill_page(page: &Page, answers: &Answers, job: Job, captures: Option<&Path>) -> Result<Report, FillError> {
+    fill_one(page, answers, &job, captures, &mut Vec::new()).await
+}
+
+/// Fills the application page on screen: reads its fields from the page itself, saves a capture
+/// of its structure under `captures`, then enters the answers. It never leaves the page.
+///
+/// `done` names the fields an earlier look at this page filled. This look leaves them alone and
+/// adds its own. With no field left, it saves no capture.
+async fn fill_one(
+    page: &Page,
+    answers: &Answers,
+    job: &Job,
+    captures: Option<&Path>,
+    done: &mut Vec<String>,
+) -> Result<Report, FillError> {
+    add_entries(page, "Work-Experience-section", answers.work.len()).await?;
+    add_entries(page, "Education-section", answers.education.len()).await?;
     let seen = page.evaluate(READ).await.map_err(during("reading the page's fields"))?;
-    let read = match fields(&seen) {
-        Ok(fields) => with_options(page, fields).await,
+    // Any page can ask about military service or the like, so the model reads the user's
+    // disclosures on every page. Its instructions keep them to the questions that ask.
+    let disclose = !answers.disclosures.is_empty();
+    let disclosing;
+    let answers = match disclose {
+        true => {
+            disclosing = Answers {
+                facts: [answers.disclosures.as_slice(), answers.facts.as_slice()].concat(),
+                ..answers.clone()
+            };
+            &disclosing
+        }
+        false => answers,
+    };
+    let read = match fields(&seen, disclose) {
+        Ok(mut fields) => {
+            fields.retain(|field| !done.contains(&name_of(field)));
+            done.extend(fields.iter().map(name_of));
+            with_options(page, fields).await
+        }
         Err(error) => Err(error),
     };
-    let unverified = "Check every answer: most of Maverick's Workday filling is not verified on live pages yet.";
-    let note = match captures.map(|folder| capture(folder, &seen, &read)) {
+    let nothing_new = matches!(&read, Ok(fields) if fields.is_empty());
+    let note = match captures
+        .filter(|_| !nothing_new)
+        .map(|folder| capture(folder, &seen, &read))
+    {
         Some(Ok(file)) => format!(
-            "{unverified} The structure of this page, without your answers, is saved in {}.",
+            "{UNVERIFIED} The structure of this page, without your answers, is saved in {}.",
             file.display()
         ),
-        Some(Err(problem)) => format!("{unverified} The structure of this page could not be saved: {problem}."),
-        None => unverified.to_owned(),
+        Some(Err(problem)) => format!("{UNVERIFIED} The structure of this page could not be saved: {problem}."),
+        None => UNVERIFIED.to_owned(),
     };
     let fields = read.map_err(|error| match error {
         FillError::UnexpectedForm(problem) => FillError::UnexpectedForm(format!("{problem}. {note}")),
         other => other,
     })?;
     let form = Form {
-        job: job.job,
-        description: job.description,
+        job: job.job.clone(),
+        description: job.description.clone(),
         fields,
     };
     let mut report = apply::fill_form(page, answers, form, &Workday).await?;
@@ -899,8 +1136,63 @@ pub async fn fill_page(page: &Page, answers: &Answers, job: Job, captures: Optio
     Ok(report)
 }
 
+/// The name a fill knows a field by. A field without an id of its own is known by its question.
+fn name_of(field: &Field) -> String {
+    match field.path.is_empty() {
+        true => field.question.title.clone(),
+        false => field.path.clone(),
+    }
+}
+
+/// The names of the fields on the page that hold no answer, among the kinds whose answer shows.
+/// A box that is not ticked and a date say nothing here: the page reads the same with and
+/// without an answer.
+async fn empty_fields(page: &Page) -> Result<Vec<String>, FillError> {
+    let seen = page.evaluate(READ).await.map_err(during("reading the page's fields"))?;
+    let shows = |kind: &Kind| !matches!(kind, Kind::YesNo | Kind::Date | Kind::Unsupported(_));
+    Ok(fields(&seen, true)?
+        .iter()
+        .filter(|field| !field.held && shows(&field.question.kind))
+        .map(name_of)
+        .collect())
+}
+
+/// How many entries a list on the page has, such as the jobs. Null when the page has no such
+/// list. A list is a group named by its heading, and each entry is a group named by a `-panel`.
+const ENTRIES: &str = r#"((heading) => {
+    const list = document.querySelector(`[role="group"][aria-labelledby="${heading}"]`);
+    return list ? list.querySelectorAll('[role="group"][aria-labelledby$="-panel"]').length : null;
+})"#;
+
+/// Presses a list's Add button until the list has `wanted` entries. A list that will not grow is
+/// left as it is: the fill then reports the fields it has.
+async fn add_entries(page: &Page, heading: &str, wanted: usize) -> Result<(), FillError> {
+    let adding = || during(format!("adding entries to {heading}"));
+    let count = format!("{ENTRIES}({})", quoted(heading));
+    let add = Locator::script(
+        format!("the Add button of {heading}"),
+        format!(
+            "document.querySelector('[role=\"group\"][aria-labelledby=\"{heading}\"] [data-automation-id=\"add-button\"]')"
+        ),
+    );
+    loop {
+        let shown = page.evaluate(&count).await.map_err(adding())?.as_u64();
+        let Some(shown) = shown.filter(|&shown| (shown as usize) < wanted) else {
+            return Ok(());
+        };
+        match page.click(&add).await {
+            Ok(()) => {}
+            Err(error) if error.ends_the_work() => return Err(adding()(error)),
+            Err(_) => return Ok(()),
+        }
+        if !settles(page, &format!("{count} > {shown}")).await.map_err(adding())? {
+            return Ok(());
+        }
+    }
+}
+
 /// Reads the page in one pass: the fields as this module understands them, and the page's
-/// structure for a capture. It reads no field's value and no text the user typed.
+/// structure for a capture. It reads whether a field holds an answer, and never the answer itself.
 ///
 /// A field is a `formField-` container. Workday's script gives it the field's id as `data-fkit-id`
 /// and puts the question in a `label`, or in a `legend` when the field is a group.
@@ -916,6 +1208,16 @@ const READ: &str = r#"(() => {
             !field.querySelector('input[type="password"]') &&
             !field.parentElement?.closest('[data-automation-id^="formField-"]'),
     );
+    // A list of entries, such as the jobs, numbers its entries as it likes: `workExperience-19`.
+    // The place of an entry is its place on the page.
+    const lists = {};
+    const place = (id) => {
+        const [, list, number] = (id ?? "").split("--")[0].match(/^(.*)-(\d+)$/) ?? [];
+        if (!list) return null;
+        const entries = (lists[list] ??= []);
+        if (!entries.includes(number)) entries.push(number);
+        return entries.indexOf(number);
+    };
     const fields = containers.map((field) => {
         const heading = field.querySelector("legend, label")?.cloneNode(true);
         const starred = heading?.querySelector("abbr") != null;
@@ -933,8 +1235,18 @@ const READ: &str = r#"(() => {
         else if (boxes.length > 1) [control, options] = ["checkboxes", labels(boxes)];
         else if (boxes.length === 1) control = "checkbox";
         else if (texts.length === 1) control = texts[0].tagName === "TEXTAREA" ? "textarea" : "text";
+        const held =
+            control === "file" ? field.querySelector('[data-automation-id="file-upload-item"]') !== null
+            : control === "prompt" ? field.querySelector('[data-automation-id="selectedItem"]') !== null
+            : control === "dropdown" ? field.querySelector('button[aria-haspopup="listbox"]').value !== ""
+            : control === "radio" ? radios.some((radio) => radio.checked)
+            : control === "checkboxes" ? boxes.some((box) => box.checked)
+            : control === "text" || control === "textarea" ? texts[0].value !== ""
+            : false;
         return {
             id,
+            entry: place(id),
+            held,
             unique: ids.filter((other) => other === id).length === 1,
             title: text(heading).replace(/\*$/, "").trim() || attribute(field, "data-automation-id"),
             required: starred || field.querySelector('[aria-required="true"]') !== null,
@@ -995,7 +1307,9 @@ const READ: &str = r#"(() => {
 /// by a plain id, becomes a field that is left for the user.
 ///
 /// A drop-down list comes back as a choice with no options. `with_options` reads them.
-pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
+///
+/// On a page of voluntary disclosures, every field is left for the user unless `disclose` is set.
+pub fn fields(seen: &Value, disclose: bool) -> Result<Vec<Field>, FillError> {
     #[derive(Deserialize)]
     struct Seen {
         page: String,
@@ -1005,6 +1319,10 @@ pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
     #[derive(Deserialize)]
     struct SeenField {
         id: Option<String>,
+        #[serde(default)]
+        entry: Option<usize>,
+        #[serde(default)]
+        held: bool,
         unique: bool,
         title: String,
         required: bool,
@@ -1015,7 +1333,12 @@ pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
 
     let seen = Seen::deserialize(seen).map_err(|error| FillError::UnexpectedForm(error.to_string()))?;
     let voluntary = is_voluntary(&seen.page, &seen.step);
-    let fields = seen.fields.into_iter().map(|field| {
+    // The user has a phone number without an extension, and a rule about the phone would fill it.
+    let asked = seen
+        .fields
+        .into_iter()
+        .filter(|field| field.id.as_deref() != Some("phoneNumber--extension"));
+    let fields = asked.map(|field| {
         // The id goes into CSS selectors, so it must be plain, and it must find one field.
         let plain = |id: &String| {
             !id.is_empty()
@@ -1027,10 +1350,10 @@ pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
         let unsupported = |kind: &str| Kind::Unsupported(kind.to_owned());
         let named = !field.options.is_empty() && field.options.iter().all(|option| !option.is_empty());
         let kind = match field.control.as_str() {
-            _ if voluntary => unsupported("voluntary disclosure"),
+            _ if voluntary && !disclose => unsupported("voluntary disclosure"),
             _ if id.is_empty() => unsupported("unidentified"),
             // The same question repeats for each job and each school, and each needs its own answer.
-            _ if in_a_list(&id) => unsupported("repeated entry"),
+            _ if in_a_list(&id) && entry_role(&id, field.entry).is_none() => unsupported("repeated entry"),
             "text" => text_kind(&id, &field.title, field.input.as_deref()),
             "textarea" => Kind::LongText,
             "dropdown" => Kind::Choice { options: Vec::new() },
@@ -1038,18 +1361,20 @@ pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
             "checkboxes" if named => Kind::Choices { options: field.options },
             "checkbox" => Kind::YesNo,
             "file" => Kind::File,
-            "date" => unsupported("date"),
-            "prompt" => unsupported("search list"),
+            "date" => Kind::Date,
+            "prompt" => Kind::Search,
             _ => unsupported("unrecognized"),
         };
         let about_resume = |text: &str| {
             let text = text.to_lowercase();
             text.contains("resume") || text.contains("cv")
         };
-        let role = (kind == Kind::File && (about_resume(&id) || about_resume(&field.title))).then_some(Role::Resume);
+        let resume = (kind == Kind::File && (about_resume(&id) || about_resume(&field.title))).then_some(Role::Resume);
+        let role = resume.or_else(|| role_of(&id)).or_else(|| entry_role(&id, field.entry));
         Field {
             path: id,
             required: field.required,
+            held: field.held,
             question: Question {
                 title: field.title,
                 kind,
@@ -1060,8 +1385,54 @@ pub fn fields(seen: &Value) -> Result<Vec<Field>, FillError> {
     Ok(fields.collect())
 }
 
+/// What a field is for, where Workday's own id for the field says it.
+fn role_of(id: &str) -> Option<Role> {
+    Some(match id {
+        "name--legalName--firstName" => Role::LegalFirstName,
+        "name--legalName--middleName" => Role::MiddleName,
+        "name--legalName--lastName" => Role::LegalLastName,
+        "name--preferredCheck" => Role::HasPreferredName,
+        "name--preferredName--firstName" => Role::FirstName,
+        "name--preferredName--lastName" => Role::LastName,
+        "address--addressLine1" => Role::Street,
+        "address--city" => Role::City,
+        "address--countryRegion" => Role::Region,
+        "address--postalCode" => Role::PostalCode,
+        "country--country" => Role::Country,
+        "phoneNumber--phoneType" => Role::PhoneKind,
+        "phoneNumber--countryPhoneCode" => Role::PhoneCode,
+        "selfIdentifiedDisabilityData--name" => Role::Name,
+        "selfIdentifiedDisabilityData--dateSignedOn" => Role::Today,
+        _ => return None,
+    })
+}
+
+/// What a field of a job or of a school is for. `place` is the entry's place on the page, which
+/// is also its place in the user's list.
+fn entry_role(id: &str, place: Option<usize>) -> Option<Role> {
+    let (entry, part) = id.split_once("--")?;
+    let (list, _) = entry.rsplit_once('-')?;
+    let place = place?;
+    Some(match (list, part) {
+        ("workExperience", "jobTitle") => Role::Work(place, WorkPart::Title),
+        ("workExperience", "companyName") => Role::Work(place, WorkPart::Company),
+        ("workExperience", "location") => Role::Work(place, WorkPart::Location),
+        ("workExperience", "currentlyWorkHere") => Role::Work(place, WorkPart::Current),
+        ("workExperience", "startDate") => Role::Work(place, WorkPart::From),
+        ("workExperience", "endDate") => Role::Work(place, WorkPart::To),
+        ("workExperience", "roleDescription") => Role::Work(place, WorkPart::Description),
+        ("education", "schoolName" | "school") => Role::School(place, SchoolPart::Name),
+        ("education", "degree") => Role::School(place, SchoolPart::Degree),
+        ("education", "fieldOfStudy") => Role::School(place, SchoolPart::Field),
+        ("education", "gradeAverage") => Role::School(place, SchoolPart::Grade),
+        ("education", "firstYearAttended") => Role::School(place, SchoolPart::From),
+        ("education", "lastYearAttended") => Role::School(place, SchoolPart::To),
+        _ => return None,
+    })
+}
+
 /// True for the pages that ask about gender, ethnicity, veteran status or disability.
-/// Maverick leaves every field on them.
+/// Maverick leaves every field on them, unless the user's answers hold disclosures.
 fn is_voluntary(page: &str, step: &str) -> bool {
     let step = step.to_lowercase();
     matches!(page, "applyFlowVoluntaryDisclosuresPage" | "applyFlowSelfIdentifyPage")
@@ -1101,9 +1472,9 @@ async fn with_options(page: &Page, mut fields: Vec<Field>) -> Result<Vec<Field>,
         field.question.kind = match options(page, &field.path).await {
             Ok(options) if !options.is_empty() => Kind::Choice { options },
             Ok(_) | Err(Problem::Shows(_) | Problem::Mismatch(_)) => Kind::Unsupported("list that did not open".into()),
-            Err(Problem::Page(PageError::Bridge(error))) => {
+            Err(Problem::Page(error)) if error.ends_the_work() => {
                 return Err(during(format!("reading the options of {:?}", field.question.title))(
-                    PageError::Bridge(error),
+                    error,
                 ));
             }
             Err(Problem::Page(_)) => Kind::Unsupported("list that did not open".into()),
@@ -1207,6 +1578,7 @@ const TYPED: &str = "textarea, input:not([type]), input[type=\"text\"], input[ty
 async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Problem> {
     let id = &field.path;
     match (answer, &field.question.kind) {
+        (Answer::Text(text), Kind::Search) => search(page, id, text).await,
         (Answer::Text(text), kind) => {
             let text = match kind {
                 Kind::Phone => national_number(text, shown_country_code(page).await?.as_deref())?,
@@ -1229,19 +1601,30 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
                 tick(page, &option_input(id, "radio", option), true).await?;
                 return Ok(option.clone());
             }
-            let shows = format!("({})?.textContent.trim() === {}", button.as_script(), quoted(option));
+            // The button can hold a no-break space where the list's row holds a plain one.
+            let shows = format!(
+                "({})?.textContent.replace(/\\s+/g, ' ').trim() === {}",
+                button.as_script(),
+                quoted(option)
+            );
             if page.evaluate(&shows).await? == true {
                 return Ok(option.clone());
             }
-            open(page, &button).await?;
-            choose(page, &button, option).await?;
-            // A list still counts as open for a moment after a pick. On a live page, lists stayed
-            // open when the fill moved on before that moment had passed.
-            if settles(page, &format!("{shows} && !({})", expanded(&button))).await? {
-                Ok(option.clone())
-            } else {
-                Err(Problem::Shows(text_of(page, &button).await?))
+            // An earlier answer can make the page draw new questions, and a list that is open at
+            // that moment loses its pick. On a live page the second try went through.
+            for last in [false, true] {
+                open(page, &button).await?;
+                match choose(page, &button, option).await {
+                    Err(Problem::Mismatch(_)) if !last => continue,
+                    chosen => chosen?,
+                }
+                // A list still counts as open for a moment after a pick. On a live page, lists
+                // stayed open when the fill moved on before that moment had passed.
+                if settles(page, &format!("{shows} && !({})", expanded(&button))).await? {
+                    return Ok(option.clone());
+                }
             }
+            Err(Problem::Shows(text_of(page, &button).await?))
         }
         (Answer::Choices(options), _) => {
             for option in options {
@@ -1278,8 +1661,138 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
             page.wait_for(&listed, UPLOAD_WAIT).await?;
             Ok(name)
         }
-        // No date field is offered for an answer yet. See `fields`.
-        (Answer::Date(_), _) => Err(Problem::Mismatch("Maverick cannot enter a date on Workday yet")),
+        (Answer::Date(date), _) => {
+            // A date field has a box for each part it asks for. A job's month has no day.
+            let parts = [
+                ("Month", i32::from(date.month()), 2),
+                ("Day", i32::from(date.day()), 2),
+                ("Year", i32::from(date.year()), 4),
+            ];
+            let mut typed = Vec::new();
+            for (part, number, width) in parts {
+                let input = within(id, &format!("[data-automation-id=\"dateSection{part}-input\"]"));
+                if page.evaluate(&format!("!!({})", input.as_script())).await? != true {
+                    continue;
+                }
+                // The box holds the number without its leading zero.
+                let wanted = number.to_string();
+                let shows = format!("({})?.value === {}", input.as_script(), quoted(&wanted));
+                if page.evaluate(&shows).await? != true {
+                    // A date box reads key presses. On a live page, text put into a box that
+                    // held a date changed the month and left a wrong day.
+                    let focus = format!("((box) => {{ box.focus(); box.select?.(); }})({})", input.as_script());
+                    page.evaluate(&focus).await?;
+                    page.press_digits(&format!("{number:0width$}")).await?;
+                    expect_value(page, &input, &wanted).await?;
+                }
+                typed.push(format!("{number:0width$}"));
+            }
+            if typed.is_empty() {
+                return Err(Problem::Mismatch("the date field has no box to type in"));
+            }
+            page.press(Key::Tab).await?;
+            Ok(typed.join("/"))
+        }
+    }
+}
+
+/// The labels of the items a search list holds as picked.
+const PICKED: &str = r#"((field) => [...(field?.querySelectorAll('[data-automation-id="selectedItem"]') ?? [])].map((item) => {
+    const option = item.querySelector('[data-automation-id="promptOption"]');
+    return (option?.getAttribute("data-automation-label") ?? (option ?? item).textContent).replace(/\s+/g, " ").trim();
+}))"#;
+
+/// The rows of the search list that is open. A row that is not a leaf opens a list of its own.
+const ROWS: &str = r#"[...document.querySelectorAll('[data-automation-id="activeListContainer"] [data-automation-id="menuItem"]')].map((row) => {
+    const option = row.querySelector('[data-automation-id="promptOption"]');
+    return {
+        label: (option?.getAttribute("data-automation-label") ?? option?.textContent ?? "").replace(/\s+/g, " ").trim(),
+        leaf: row.querySelector('[data-automation-id="promptLeafNode"]') !== null,
+    };
+})"#;
+
+/// Picks an option of a search list: types the answer into the list's search box and presses
+/// Enter. Returns the label of the picked option.
+///
+/// Workday picks the option itself when the search finds one. When the search finds several, the
+/// list opens, and this clicks the row spelled like the answer. When the search finds none, the
+/// list opens with every option. With no row spelled like the answer, nothing is picked.
+async fn search(page: &Page, id: &str, wanted: &str) -> Result<String, Problem> {
+    #[derive(Deserialize, PartialEq)]
+    struct Row {
+        label: String,
+        leaf: bool,
+    }
+    #[derive(Deserialize, PartialEq)]
+    struct Seen {
+        picked: Vec<String>,
+        rows: Vec<Row>,
+        /// What the search box holds. Workday empties it once it has picked an option.
+        typed: String,
+    }
+    let same = |label: &str| label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let picked = format!("{PICKED}({})", container(id));
+    let input = within(id, "input");
+    let look = format!(
+        "({{ picked: {picked}, rows: {ROWS}, typed: ({})?.value ?? '' }})",
+        input.as_script()
+    );
+    let seen = |value: Value| {
+        serde_json::from_value::<Seen>(value).unwrap_or(Seen {
+            picked: Vec::new(),
+            rows: Vec::new(),
+            typed: String::new(),
+        })
+    };
+    let before = seen(page.evaluate(&look).await?).picked;
+    if let Some(label) = before.iter().find(|label| same(label) == same(wanted)) {
+        return Ok(label.clone());
+    }
+    page.fill(&input, wanted).await?;
+    page.press(Key::Enter).await?;
+
+    // The answer comes from the server, and the list draws its rows piece by piece.
+    let deadline = Instant::now() + FORM_WAIT;
+    let (mut now, mut steady) = (seen(Value::Null), 0);
+    while steady < STEADY_LOOKS && Instant::now() < deadline {
+        tokio::time::sleep(PAGE_GAP).await;
+        let next = seen(page.evaluate(&look).await?);
+        if let Some(label) = next.picked.iter().find(|label| !before.contains(label)) {
+            // Workday picked the one option the search found.
+            return Ok(label.clone());
+        }
+        // No rows and an empty search box: Workday picked the option that was picked already.
+        let answered = !next.rows.is_empty() || next.typed.is_empty();
+        steady = if next == now && answered { steady + 1 } else { 1 };
+        now = next;
+    }
+    if let (true, [label]) = (now.rows.is_empty() && now.typed.is_empty(), now.picked.as_slice()) {
+        return Ok(label.clone());
+    }
+    let spelled = (0..now.rows.len()).find(|&row| now.rows[row].leaf && same(&now.rows[row].label) == same(wanted));
+    let Some(row) = spelled else {
+        // Tab closes the list and leaves the field as it was.
+        page.press(Key::Tab).await?;
+        return Err(Problem::Mismatch(
+            "the search found no option, or several options and none of them spelled like the answer",
+        ));
+    };
+    let option = Locator::script(
+        format!("the option {:?}", now.rows[row].label),
+        format!(
+            "document.querySelectorAll('[data-automation-id=\"activeListContainer\"] [data-automation-id=\"menuItem\"]')[{row}]\
+             ?.querySelector('[data-automation-id=\"promptOption\"]') ?? null"
+        ),
+    );
+    page.click(&option).await?;
+    let label = &now.rows[row].label;
+    let held = settles(page, &format!("{picked}.includes({})", quoted(label))).await?;
+    page.press(Key::Tab).await?;
+    if held {
+        Ok(label.clone())
+    } else {
+        let shown = seen(page.evaluate(&look).await?).picked;
+        Err(Problem::Shows(shown.join(", ")))
     }
 }
 
@@ -1537,7 +2050,7 @@ mod tests {
 
     fn kinds(page: &str, step: &str, seen: Vec<Value>) -> Vec<Kind> {
         let seen = json!({ "page": page, "step": step, "fields": seen });
-        fields(&seen)
+        fields(&seen, false)
             .unwrap()
             .into_iter()
             .map(|field| field.question.kind)
@@ -1571,14 +2084,13 @@ mod tests {
             seen_field("resumeAttachments--attachments", "Upload a file", "file"),
             seen_field("otherAttachments--attachments", "Cover letter", "file"),
         ] });
-        let fields = fields(&seen).unwrap();
+        let fields = fields(&seen, false).unwrap();
         let kinds: Vec<&Kind> = fields.iter().map(|field| &field.question.kind).collect();
         assert_eq!(
             kinds,
             [
                 &Kind::Text,
                 &Kind::Phone,
-                &Kind::Text,
                 &Kind::Email,
                 &Kind::LongText,
                 &Kind::Choice { options: vec![] },
@@ -1592,9 +2104,49 @@ mod tests {
         );
         assert_eq!(fields[0].path, "name--legalName--firstName");
         assert_eq!(fields[0].question.title, "First Name");
-        assert!(fields[6].required && !fields[0].required);
-        assert_eq!(fields[8].question.role, Some(Role::Resume));
-        assert_eq!(fields[9].question.role, None);
+        assert!(fields[5].required && !fields[0].required);
+        assert_eq!(fields[7].question.role, Some(Role::Resume));
+        assert_eq!(fields[8].question.role, None);
+        // Workday's own ids say what these are for, so no rule about a phone or a name answers them.
+        assert_eq!(fields[0].question.role, Some(Role::LegalFirstName));
+        assert_eq!(fields[4].question.role, Some(Role::Region));
+        assert!(fields.iter().all(|field| field.path != "phoneNumber--extension"));
+    }
+
+    #[test]
+    fn a_field_of_a_job_or_a_school_knows_its_place_in_the_list() {
+        let entry = |id: &str, title: &str, control: &str, place: usize| {
+            let mut field = seen_field(id, title, control);
+            field["entry"] = json!(place);
+            field
+        };
+        let seen = json!({ "page": "applyFlowMyExpPage", "step": "My Experience", "fields": [
+            entry("workExperience-19--jobTitle", "Job Title", "text", 0),
+            entry("workExperience-19--startDate", "From", "date", 0),
+            entry("workExperience-23--currentlyWorkHere", "I currently work here", "checkbox", 1),
+            entry("education-20--degree", "Degree", "dropdown", 0),
+            entry("education-20--fieldOfStudy", "Field of Study", "prompt", 0),
+            entry("language-4--language", "Language", "dropdown", 0),
+        ] });
+        let read: Vec<(Kind, Option<Role>)> = fields(&seen, false)
+            .unwrap()
+            .into_iter()
+            .map(|field| (field.question.kind, field.question.role))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (Kind::Text, Some(Role::Work(0, WorkPart::Title))),
+                (Kind::Date, Some(Role::Work(0, WorkPart::From))),
+                (Kind::YesNo, Some(Role::Work(1, WorkPart::Current))),
+                (
+                    Kind::Choice { options: vec![] },
+                    Some(Role::School(0, SchoolPart::Degree))
+                ),
+                (Kind::Search, Some(Role::School(0, SchoolPart::Field))),
+                (unsupported("repeated entry"), None),
+            ]
+        );
     }
 
     #[test]
@@ -1621,8 +2173,8 @@ mod tests {
                 ]
             ),
             [
-                unsupported("date"),
-                unsupported("search list"),
+                Kind::Date,
+                Kind::Search,
                 unsupported("unrecognized"),
                 unsupported("repeated entry"),
                 unsupported("unidentified"),
@@ -1632,7 +2184,7 @@ mod tests {
             ]
         );
         assert!(matches!(
-            fields(&json!({ "fields": [] })),
+            fields(&json!({ "fields": [] }), false),
             Err(FillError::UnexpectedForm(_))
         ));
     }
@@ -1651,6 +2203,18 @@ mod tests {
         assert_eq!(kinds("", "Voluntary Disclosures", page()), left);
         assert_eq!(kinds("", "Self Identify", page()), left);
         assert_ne!(kinds("applyFlowMyInfoPage", "My Information", page()), left);
+
+        // A user who wrote down what to disclose gets these pages filled like any other.
+        let seen = json!({ "page": "applyFlowSelfIdentifyPage", "step": "Self Identify", "fields": page() });
+        let disclosed: Vec<(Kind, Option<Role>)> = fields(&seen, true)
+            .unwrap()
+            .into_iter()
+            .map(|field| (field.question.kind, field.question.role))
+            .collect();
+        assert_eq!(
+            disclosed,
+            [(Kind::Choice { options: vec![] }, None), (Kind::Text, Some(Role::Name))]
+        );
     }
 
     #[test]
@@ -1674,6 +2238,7 @@ mod tests {
             "structure": { "fields": [{ "automationId": "formField-firstName" }], "other": [] },
         });
         let read = Ok(vec![Field {
+            held: false,
             path: "address--countryRegion".into(),
             required: true,
             question: Question {

@@ -887,3 +887,134 @@ pub fn linkedin(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+/// `maverick gaps [--limit <count>] [--answers]`: rehearses the form of every open posting on a
+/// system whose form is public, and lists the required questions the answers do not cover.
+/// Nothing is opened in Chrome and nothing is written. `--answers` also prints what the model
+/// answered, which holds the user's details.
+pub fn gaps(limit: usize, show_answers: bool) -> Result<(), Box<dyn Error>> {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use maverick_core::apply::{self, FieldResult, Report, Source as By, System};
+    use maverick_core::jobs::Decision;
+    use maverick_core::{ashby, greenhouse};
+
+    const AT_ONCE: usize = 4;
+    let store = open_store()?;
+    let file = maverick_core::answers_path().ok_or("this system has no application data directory")?;
+    let mut answers = Answers::load(&file)?;
+    answers.facts.extend(apply::applied_before(&store.applications()?));
+    let answers = Arc::new(answers);
+    let board = crate::board::BoardData::new(&store.postings()?, store.applications()?, &store.decisions()?);
+    let mut open: Vec<(System, String, String)> = board
+        .entries
+        .iter()
+        .filter(|entry| entry.decision != Some(Decision::Skipped))
+        .filter_map(|entry| {
+            let system = System::of(&entry.address).filter(|system| *system != System::Workday)?;
+            Some((
+                system,
+                format!("{} | {}", entry.company, entry.title),
+                entry.address.clone(),
+            ))
+        })
+        .collect();
+    open.dedup_by(|a, b| a.2 == b.2);
+    let workday = board
+        .entries
+        .iter()
+        .filter(|entry| System::of(&entry.address) == Some(System::Workday))
+        .count();
+    println!(
+        "{} open postings on Ashby and Greenhouse, {} rehearsed now. {workday} on Workday are left out: \
+         Workday shows its questions only to a signed-in tab.",
+        open.len(),
+        open.len().min(limit)
+    );
+    open.truncate(limit);
+
+    let rehearsed: Vec<(String, Result<Report, String>)> = runtime()?.block_on(async {
+        let slots = Arc::new(tokio::sync::Semaphore::new(AT_ONCE));
+        let runs: Vec<_> = open
+            .into_iter()
+            .map(|(system, title, address)| {
+                let (slots, answers) = (slots.clone(), answers.clone());
+                tokio::spawn(async move {
+                    let _slot = slots.acquire().await;
+                    let form = match system {
+                        System::Ashby => ashby::read_form(&address).await,
+                        _ => greenhouse::read_form(&address).await,
+                    };
+                    let report = match form {
+                        Ok(form) => Ok(apply::rehearse(&answers, form).await),
+                        Err(problem) => Err(problem),
+                    };
+                    (title, report)
+                })
+            })
+            .collect();
+        let mut done = Vec::new();
+        for run in runs {
+            if let Ok(one) = run.await {
+                done.push(one);
+            }
+        }
+        done
+    });
+
+    let (mut submits, mut drafts, mut gaps, mut unread) = (0, 0, 0, 0);
+    // Each open question, with the forms that ask it and why it got no answer.
+    let mut asked: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for (title, report) in &rehearsed {
+        let report = match report {
+            Ok(report) => report,
+            Err(problem) => {
+                unread += 1;
+                println!("  unread   {title}: {problem}");
+                continue;
+            }
+        };
+        let open: Vec<_> = report.outcomes.iter().filter(|outcome| outcome.is_open()).collect();
+        for outcome in &open {
+            let why = match &outcome.result {
+                FieldResult::Left(why) => why.to_string(),
+                _ => String::new(),
+            };
+            let question = outcome.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            asked.entry(question).or_insert((0, why)).0 += 1;
+        }
+        let held = report.held_for_the_user();
+        match (&held, open.is_empty()) {
+            (None, _) => submits += 1,
+            (Some(_), true) => drafts += 1,
+            (Some(_), false) => gaps += 1,
+        }
+        println!(
+            "  {:8} {title}{}",
+            if held.is_none() { "submits" } else { "waits" },
+            held.map_or_else(String::new, |why| format!(": {why}"))
+        );
+        if show_answers {
+            for outcome in &report.outcomes {
+                if let FieldResult::Filled {
+                    shown,
+                    by: By::Model { basis },
+                } = &outcome.result
+                {
+                    println!("             {:?} -> {shown:?} ({basis})", outcome.title);
+                }
+            }
+        }
+    }
+    println!(
+        "\n{submits} would be submitted, {drafts} wait only for a draft or a model problem, {gaps} have open required questions, {unread} could not be read."
+    );
+    let mut asked: Vec<_> = asked.into_iter().collect();
+    asked.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+    println!("\nOpen required questions, most asked first:");
+    for (question, (count, why)) in asked {
+        println!("  {count:>3}x {question}  [{why}]");
+    }
+    Ok(())
+}

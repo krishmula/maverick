@@ -4,13 +4,13 @@
 //! `MAVERICK_E2E_CHROME=/path/to/chrome cargo test -p maverick --test chrome -- --ignored --nocapture`
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};
 use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::apply::{FieldResult, FillError, Outcome, Report, Source, System};
+use maverick_core::apply::{End, FieldResult, FillError, Outcome, Report, Sent, Source, System};
 use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::credentials::{Password, SignIn};
@@ -86,6 +86,11 @@ struct Running {
 
 /// Starts the bridge and a Chrome that runs the extension, with the app binary as the relay.
 fn launch(start_page: &str) -> Running {
+    launch_beside(start_page, |_| Vec::new())
+}
+
+/// `launch`, in a Chrome that also runs the extensions `others` writes under the folder it is given.
+fn launch_beside(start_page: &str, others: impl Fn(&Path) -> Vec<PathBuf>) -> Running {
     let chrome = std::env::var("MAVERICK_E2E_CHROME").expect("MAVERICK_E2E_CHROME");
     let scratch = tempfile::tempdir().unwrap();
     let socket = scratch.path().join("bridge.sock");
@@ -105,13 +110,16 @@ fn launch(start_page: &str) -> Running {
     )
     .unwrap();
 
-    let extension = Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension");
+    let mut extensions = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension")];
+    extensions.extend(others(scratch.path()));
+    let extensions: Vec<String> = extensions.iter().map(|folder| folder.display().to_string()).collect();
     let browser = Browser(
         Process::new(chrome)
             .arg(format!("--user-data-dir={}", profile.display()))
-            .arg(format!("--load-extension={}", extension.display()))
+            .arg(format!("--load-extension={}", extensions.join(",")))
+            // A headless Chrome draws every tab. Only a Chrome with a window hides its background tabs.
+            .args((!headed()).then_some("--headless=new"))
             .args([
-                "--headless=new",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-popup-blocking",
@@ -129,6 +137,11 @@ fn launch(start_page: &str) -> Running {
         scratch,
         _browser: browser,
     }
+}
+
+/// True when `MAVERICK_E2E_HEADED` asks for a Chrome with a window, as the user runs it.
+fn headed() -> bool {
+    std::env::var_os("MAVERICK_E2E_HEADED").is_some()
 }
 
 fn titled(tabs: &[Tab], title: &str) -> Option<Tab> {
@@ -375,6 +388,110 @@ async fn several_background_tabs_are_driven_at_the_same_time() {
     }
 }
 
+/// Writes an extension that does what Bitwarden does: when a field takes the focus, it shows a
+/// page of its own in a frame, as a menu next to the field. With `keeps_the_setter`, it holds on
+/// to the browser's own way to point a frame at a page from the moment it starts, which no
+/// script that arrives later can take away.
+fn menu_extension(under: &Path, keeps_the_setter: bool) -> PathBuf {
+    let folder = under.join("menu-extension");
+    fs::create_dir_all(&folder).unwrap();
+    let manifest = json!({
+        "manifest_version": 3,
+        "name": "Menu on fields",
+        "version": "1.0",
+        "content_scripts": [{ "matches": ["<all_urls>"], "js": ["menu.js"], "run_at": "document_start" }],
+        "web_accessible_resources": [{ "resources": ["menu.html"], "matches": ["<all_urls>"] }],
+    });
+    fs::write(folder.join("manifest.json"), manifest.to_string()).unwrap();
+    fs::write(folder.join("menu.html"), "<p>Suggestions</p>").unwrap();
+    let script = r#"const keepsTheSetter = KEEPS_THE_SETTER;
+        const point = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src").set;
+        document.addEventListener("focusin", () => {
+            const menu = document.createElement("iframe");
+            const url = chrome.runtime.getURL("menu.html");
+            if (keepsTheSetter) point.call(menu, url);
+            else menu.setAttribute("src", url);
+            document.body.append(menu);
+        });"#;
+    fs::write(
+        folder.join("menu.js"),
+        script.replace("KEEPS_THE_SETTER", &keeps_the_setter.to_string()),
+    )
+    .unwrap();
+    folder
+}
+
+/// Opens the form in a background tab of a Chrome that also runs the menu extension.
+async fn form_beside_a_menu_extension(keeps_the_setter: bool) -> (Running, Page) {
+    let mut running = launch_beside("data:text/html,<title>Start</title>", |under| {
+        vec![menu_extension(under, keeps_the_setter)]
+    });
+    let form = serve(FORM).await;
+    let tabs = wait_for(&mut running.states, "the start tab listed", |tabs| {
+        titled(tabs, "Start").is_some()
+    })
+    .await;
+    let tab = background_tab(&running.bridge, tabs[0].connection).await;
+    let page = Page::attach(running.bridge.clone(), &tab).await.unwrap();
+    page.navigate(&form).await.unwrap();
+    (running, page)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_tab_that_another_extension_draws_in_says_so() {
+    let (_running, page) = form_beside_a_menu_extension(true).await;
+    // No field has taken the focus yet, so the other extension has drawn nothing.
+    assert_eq!(page.evaluate("document.title").await.unwrap(), "Form");
+
+    // Typing gives a field the focus. Chrome takes the debugger away once the menu's frame
+    // starts to load, which is a moment later, so the typing itself may still go through.
+    let typed = page.fill(&Locator::css("#name"), "Ada Lovelace").await;
+    let stopped = match typed {
+        Ok(()) => timeout(Duration::from_secs(10), async {
+            loop {
+                if let Err(error) = page.evaluate("document.title").await {
+                    return error;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Chrome takes the debugger away"),
+        Err(error) => error,
+    };
+    assert_eq!(stopped, PageError::OtherExtension);
+    assert!(stopped.ends_the_work());
+    assert!(stopped.to_string().contains("another extension"), "{stopped}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn another_extensions_menu_stays_out_of_a_tab_maverick_fills() {
+    let (_running, page) = form_beside_a_menu_extension(false).await;
+    for (field, text) in [("#name", "Ada Lovelace"), ("#why", "Line one")] {
+        page.fill(&Locator::css(field), text).await.unwrap();
+        // A menu's page would cost the debugger a moment after the focus.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let read = page
+        .evaluate(
+            r#"({
+                name: document.getElementById("name").value,
+                why: document.getElementById("why").value,
+                menus: document.querySelectorAll("iframe").length > 0,
+                pages: [...document.querySelectorAll("iframe")].filter((menu) => menu.hasAttribute("src")).length,
+            })"#,
+        )
+        .await
+        .unwrap();
+    // The other extension still draws its frames, and none of them holds a page.
+    assert_eq!(
+        read,
+        json!({ "name": "Ada Lovelace", "why": "Line one", "menus": true, "pages": 0 })
+    );
+}
+
 /// Fills a live Ashby form with made-up answers and prints what happened to each field.
 /// It uploads a blank PDF and never submits. Set `MAVERICK_E2E_ASHBY` to a posting's address.
 #[tokio::test(flavor = "multi_thread")]
@@ -462,6 +579,7 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
     };
     assert_eq!(has(".ashby-application-form-submit-button").await, true);
     assert_eq!(has(ashby::SUBMITTED).await, false);
+    assert!(System::Ashby.shows_submit(&page).await.unwrap(), "one Submit button");
 
     // A second run finds the standard answers already in place and changes none of them.
     let again = ashby::fill(&page, &answers).await.unwrap().outcomes;
@@ -498,7 +616,7 @@ const WORKDAY_PAGE: &str = include_str!("workday_page.html");
 /// sources describe, not against Workday.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
-async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
+async fn a_reconstructed_workday_application_is_filled_page_by_page_and_never_submitted() {
     let Running {
         bridge,
         mut states,
@@ -526,6 +644,11 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
             { "any": ["anything else"], "answer": "Nothing to add." },
             { "any": ["when can you start"], "answer": "2027-01-18" },
             { "any": ["legally able"], "answer": "yes" },
+            { "any": ["how did you hear"], "answer": "linkedin" },
+        ],
+        "work": [
+            { "title": "Engineer", "company": "Example Robotics", "location": "Springfield", "from": "2023-06" },
+            { "title": "Intern", "company": "Example Labs", "location": "Chicago", "from": "2022-01", "to": "2022-08" },
         ],
     }))
     .unwrap();
@@ -538,7 +661,6 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
         .await
         .unwrap();
 
-    let left = |kind: &str| format!("left: Maverick cannot fill a {kind} field yet");
     let told = |outcomes: &[Outcome]| -> Vec<(String, String)> {
         let result = |outcome: &Outcome| match &outcome.result {
             FieldResult::Filled { shown, .. } => format!("filled: {shown}"),
@@ -552,17 +674,30 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
     };
     let expected: Vec<(String, String)> = [
         ("First Name", "filled: Ada".to_owned()),
-        ("Country Phone Code", left("search list")),
+        (
+            "Country Phone Code",
+            "left: the form already held an answer, and Maverick kept it".to_owned(),
+        ),
         ("Phone Number", "filled: 415 555 0100".to_owned()),
         ("State", "filled: Illinois".to_owned()),
         ("Have you worked for Example Co before?", "filled: No".to_owned()),
         ("I have a preferred name", "filled: No".to_owned()),
         ("Which offices could you work from?", "filled: Remote".to_owned()),
         ("Anything else we should know?", "filled: Nothing to add.".to_owned()),
-        ("When can you start?", left("date")),
+        ("When can you start?", "filled: 01/18/2027".to_owned()),
         ("Resume/CV", "filled: Ada-Example-Resume.pdf".to_owned()),
-        ("How Did You Hear About Us?", left("search list")),
-        ("Job Title", left("repeated entry")),
+        // The search finds two options, and the one spelled like the answer is picked.
+        ("How Did You Hear About Us?", "filled: LinkedIn".to_owned()),
+        // The page showed one job. The second one was added for the user's second job.
+        ("Job Title", "filled: Engineer".to_owned()),
+        ("I currently work here", "filled: Yes".to_owned()),
+        (
+            "To",
+            "left: another answer on this page makes this one unnecessary".to_owned(),
+        ),
+        ("Job Title", "filled: Intern".to_owned()),
+        ("I currently work here", "filled: No".to_owned()),
+        ("To", "filled: 08/2022".to_owned()),
         (
             "Are you legally able to work in this country?",
             "filled: Yes".to_owned(),
@@ -576,7 +711,8 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
     assert_eq!(
         required,
         [
-            true, true, true, true, true, false, false, false, false, true, true, true, false
+            true, true, true, true, true, false, false, false, false, true, true, true, false, true, true, false, true,
+            false
         ]
     );
 
@@ -593,10 +729,12 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
                     ticked,
                     more: value("primaryQuestionnaire--q2"),
                     month: value("primaryQuestionnaire--q3-dateSectionMonth-input"),
+                    heard: document.querySelector('[data-automation-id="formField-source"] [data-automation-id="selectedItem"]').textContent.trim(),
                     title: value("workExperience-2--jobTitle"),
+                    second: [value("workExperience-7--jobTitle"), value("workExperience-7--endDate-dateSectionMonth-input")],
                     file: document.querySelector('input[type="file"]').files[0].name,
                     opened: window.opened,
-                    lists: document.querySelectorAll('ul[role="listbox"]').length,
+                    lists: document.querySelectorAll('ul[role="listbox"]:not([data-automation-id]), [data-automation-id="activeListContainer"]').length,
                     advanced: window.advanced === true,
                 };
             })()"#,
@@ -609,10 +747,12 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
             "first": "Ada",
             "phone": "415 555 0100",
             "state": "Illinois",
-            "ticked": ["No", "Remote"],
+            "ticked": ["No", "Remote", "I currently work here"],
             "more": "Nothing to add.",
-            "month": "",
-            "title": "",
+            "month": "1",
+            "heard": "LinkedIn",
+            "title": "Engineer",
+            "second": ["Intern", "8"],
             "file": "Ada-Example-Resume.pdf",
             "opened": ["address--countryRegion", "primaryQuestionnaire--q4", "address--countryRegion"],
             "lists": 0,
@@ -635,7 +775,7 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
     let capture: serde_json::Value = serde_json::from_str(&capture).unwrap();
     assert_eq!(capture["page"], "applyFlowMyInfoPage");
     assert_eq!(capture["step"], "My Information");
-    assert_eq!(capture["structure"]["fields"].as_array().unwrap().len(), 13);
+    assert_eq!(capture["structure"]["fields"].as_array().unwrap().len(), 18);
     assert_eq!(capture["structure"]["fields"][3]["label"], "State*");
     assert_eq!(
         capture["structure"]["fields"][3]["controls"][0],
@@ -662,10 +802,48 @@ async fn a_reconstructed_workday_page_is_read_and_filled_without_leaving_it() {
             .any(|control| control["automationId"] == "pageFooterNextButton")
     );
 
-    // A second run finds every answer in place and changes none of them.
-    let again = workday::fill_page(&page, &answers, job, None).await.unwrap();
-    assert_eq!(told(&again.outcomes), expected);
+    // A second run finds every answer in place and changes none of them. The last month of the
+    // job the user holds now is no longer on the page.
+    let again = workday::fill_page(&page, &answers, job.clone(), None).await.unwrap();
+    let mut in_place = expected.clone();
+    in_place.remove(13);
+    assert_eq!(told(&again.outcomes), in_place);
     assert_eq!(page.evaluate("window.advanced === true").await.unwrap(), false);
+
+    // The whole fill goes on from there. Workday does not take this page, so the fill stops on it
+    // and says what Workday said.
+    page.navigate(&format!("{form}?refuse")).await.unwrap();
+    let refused = workday::fill_application(&page, &answers, job.clone(), None, &NO_SIGN_IN)
+        .await
+        .unwrap();
+    let End::Stopped(why) = &refused.end else {
+        panic!("the fill ended with {:?}", refused.end);
+    };
+    assert!(
+        why.contains(
+            "Workday did not take \"My Information\": The field Postal Code is required and must have a value."
+        ),
+        "{why}"
+    );
+    assert_eq!(told(&refused.outcomes), expected);
+    assert_eq!(page.evaluate("window.advanced === true").await.unwrap(), false);
+
+    // Workday takes this page. The next page is the last one, and the fill presses nothing on it.
+    page.navigate(&form).await.unwrap();
+    let whole = workday::fill_application(&page, &answers, job, None, &NO_SIGN_IN)
+        .await
+        .unwrap();
+    assert_eq!(whole.end, End::Review);
+    assert_eq!(told(&whole.outcomes), expected);
+    let note = whole.note.unwrap();
+    assert!(note.contains("It filled: My Information."), "{note}");
+    assert!(note.contains("click Submit yourself"), "{note}");
+    assert_eq!(
+        page.evaluate("[window.advanced === true, window.submitted === true]")
+            .await
+            .unwrap(),
+        json!([true, false])
+    );
 }
 
 /// Proves the part of Workday that needs no account, on a live posting: the job is read, the
@@ -777,14 +955,21 @@ async fn fill_behind_the_reconstructed_wall(
                 path: location.pathname,
                 hidden: document.querySelector('[data-automation-id="beecatcher"]').value,
                 typed: [...document.querySelectorAll('[data-automation-id="signInContent"] input')].map((input) => input.value).join(""),
-                first: document.getElementById("name--legalName--firstName")?.value ?? null,
+                first: window.saved ?? document.getElementById("name--legalName--firstName")?.value ?? null,
                 advanced: window.advanced === true,
+                submitted: window.submitted === true,
             })"#,
         )
         .await
         .unwrap();
     assert_eq!(seen["hidden"], "", "nothing was typed into the field for robots");
-    assert_eq!(seen["advanced"], false, "the application was not moved on");
+    // A fill that got past the wall goes through the application to its last page.
+    assert_eq!(
+        seen["advanced"],
+        result.is_ok(),
+        "the application moved on only after a fill"
+    );
+    assert_eq!(seen["submitted"], false, "nothing was submitted");
     (result, seen)
 }
 
@@ -1160,28 +1345,15 @@ async fn a_live_greenhouse_form_is_filled_and_not_submitted() {
     }))
     .unwrap();
 
-    let tab = titled(&tabs, "First").unwrap();
+    // The app fills an approved posting in a tab it opens in the background.
+    let tab = background_tab(&bridge, tabs[0].connection).await;
     let page = Page::attach(bridge.clone(), &tab).await.unwrap();
     // The app opens the form's address, whatever shape the posting's link had.
     page.navigate(&system.form_address(&posting).unwrap()).await.unwrap();
     let report = system.fill(&page, &answers).await.unwrap();
     assert_eq!(report.model_problem, None);
     let outcomes = report.outcomes;
-    for outcome in &outcomes {
-        let required = if outcome.required { "required" } else { "optional" };
-        match &outcome.result {
-            FieldResult::Filled { shown, by } => {
-                let by = match by {
-                    Source::StandardAnswer => "filled ".to_owned(),
-                    Source::Model { basis } => format!("model   [{basis}]"),
-                    Source::Draft { basis } => format!("draft   [{basis}]"),
-                };
-                println!("{by} ({required}) {}: {shown}", outcome.title)
-            }
-            FieldResult::Left(why) => println!("left    ({required}) {}: {why}", outcome.title),
-            FieldResult::Failed(problem) => println!("FAILED  ({required}) {}: {problem}", outcome.title),
-        }
-    }
+    print_outcomes(&outcomes);
     let failed = outcomes
         .iter()
         .filter(|outcome| matches!(outcome.result, FieldResult::Failed(_)))
@@ -1242,7 +1414,47 @@ async fn a_live_greenhouse_form_is_filled_and_not_submitted() {
         system.form_address(&posting),
         "the tab is still on the form"
     );
+    assert!(system.shows_submit(&page).await.unwrap(), "one Submit button");
     assert_eq!(has(system.submitted()).await, false, "the form was not submitted");
+}
+
+/// Opens an empty tab behind the one on screen, as the app does for an approved posting.
+async fn background_tab(bridge: &Bridge, connection: bridge::ConnectionId) -> Tab {
+    let blank = Command::OpenTab {
+        url: "about:blank".into(),
+        active: false,
+    };
+    let opened = bridge.request(connection, &blank).await.unwrap();
+    let number = |key: &str| i32::try_from(opened[key].as_i64().unwrap()).unwrap();
+    Tab {
+        connection,
+        tab: bridge::BrowserTab {
+            id: number("id"),
+            window_id: number("windowId"),
+            title: String::new(),
+            url: String::new(),
+            active: false,
+        },
+    }
+}
+
+/// Prints what a fill did to each field.
+fn print_outcomes(outcomes: &[Outcome]) {
+    for outcome in outcomes {
+        let required = if outcome.required { "required" } else { "optional" };
+        match &outcome.result {
+            FieldResult::Filled { shown, by } => {
+                let by = match by {
+                    Source::StandardAnswer => "filled ".to_owned(),
+                    Source::Model { basis } => format!("model   [{basis}]"),
+                    Source::Draft { basis } => format!("draft   [{basis}]"),
+                };
+                println!("{by} ({required}) {}: {shown}", outcome.title)
+            }
+            FieldResult::Left(why) => println!("left    ({required}) {}: {why}", outcome.title),
+            FieldResult::Failed(problem) => println!("FAILED  ({required}) {}: {problem}", outcome.title),
+        }
+    }
 }
 
 /// A one-page PDF with nothing on it.
@@ -1302,4 +1514,63 @@ async fn a_search_page_in_a_background_tab_is_scrolled_three_times_for_more_post
     assert_eq!(scrolled.len(), 16);
     assert_eq!(scrolled[15].poster, "Person 16");
     assert_eq!(scrolled[15].text, "We are hiring engineer number 16.");
+}
+
+/// A form in the shape of Ashby's and Greenhouse's: one button submits it. `?code` makes the
+/// page ask for an emailed code instead of confirming, and `?two` shows a second submit button.
+const SUBMIT_FORM: &str = r#"<!doctype html><title>Apply</title>
+<form id="form"><input id="name"><button type="button" id="submit">Submit Application</button></form>
+<script>
+  window.presses = 0;
+  if (location.search === "?two") {
+    document.body.insertAdjacentHTML("beforeend", '<button type="button" id="other">Submit</button>');
+  }
+  for (const button of document.querySelectorAll("button")) {
+    button.addEventListener("click", () => {
+      window.presses += 1;
+      setTimeout(() => {
+        document.getElementById("form").outerHTML = location.search === "?code"
+          ? '<p>Enter the security code we sent to your email.</p>'
+          : '<div class="ashby-application-form-success-container">Thanks for applying.</div>';
+      }, 700);
+    });
+  }
+</script>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_complete_form_is_submitted_with_one_press_and_the_page_decides_the_outcome() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let form = serve(SUBMIT_FORM).await;
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let page = Page::attach(bridge.clone(), &titled(&tabs, "First").unwrap())
+        .await
+        .unwrap();
+    let presses = async |page: &Page| page.evaluate("window.presses").await.unwrap();
+
+    page.navigate(&form).await.unwrap();
+    assert!(System::Ashby.shows_submit(&page).await.unwrap());
+    assert_eq!(System::Ashby.submit(&page).await.unwrap(), Sent::Confirmed);
+
+    // A code sent by email is the user's to enter, and Maverick does not press again.
+    page.navigate(&format!("{form}?code")).await.unwrap();
+    match System::Greenhouse.submit(&page).await.unwrap() {
+        Sent::Unconfirmed(why) => assert!(why.contains("asks for a code"), "{why}"),
+        Sent::Confirmed => panic!("a page that asks for a code is not a confirmation"),
+    }
+
+    // With two buttons that could submit, Maverick presses neither.
+    page.navigate(&format!("{form}?two")).await.unwrap();
+    assert!(!System::Ashby.shows_submit(&page).await.unwrap());
+    match System::Ashby.submit(&page).await.unwrap() {
+        Sent::Unconfirmed(why) => assert!(why.contains("did not find one Submit button"), "{why}"),
+        Sent::Confirmed => panic!("nothing was pressed"),
+    }
+    assert_eq!(presses(&page).await, 0);
+    page.detach().await.unwrap();
 }

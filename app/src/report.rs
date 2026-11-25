@@ -235,6 +235,7 @@ mod tests {
             ],
             model_problem: None,
             note: None,
+            end: maverick_core::apply::End::Page,
         };
         assert_eq!(
             Tally::of(&report),

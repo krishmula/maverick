@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
-use maverick_core::apply::{self, FillError, Report, System};
+use maverick_core::apply::{self, FillError, Report, Sent, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
 use maverick_core::jobs::{Application, posting_address};
 use maverick_core::page::Page;
@@ -65,6 +65,8 @@ pub struct Browser {
     fill: Fill,
     subject: Option<Subject>,
     queue: Queue,
+    /// True when Maverick submits a form itself once nothing in it is left for the user.
+    auto_submit: bool,
     /// The tab the last finished fill left its form in.
     filled_tab: Option<Tab>,
     state: BrowserState,
@@ -92,6 +94,7 @@ impl Browser {
             }
         });
         let queue = Queue::new(saved_parallel(database.as_deref()));
+        let auto_submit = saved_auto_submit(database.as_deref());
         let mut browser = Self {
             state: bridge.state(),
             bridge,
@@ -106,6 +109,7 @@ impl Browser {
             fill: Fill::Idle,
             subject: None,
             queue,
+            auto_submit,
             filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
@@ -246,6 +250,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
+            self.auto_submit,
             |_| {},
         ));
         cx.spawn(async move |this, cx| {
@@ -276,7 +281,10 @@ impl Browser {
                 this.fill = fill;
                 if let Some(filled) = filled {
                     this.filled_tab = Some(filled.tab.clone());
-                    this.watch_for_submit(filled.system, filled.tab, filled.title, filled.address, cx);
+                    match filled.sent {
+                        Some(Sent::Confirmed) => this.record_sent(filled.title, filled.address, cx),
+                        _ => this.watch_for_submit(filled.system, filled.tab, filled.title, filled.address, cx),
+                    }
                 }
                 cx.notify();
             })
@@ -302,29 +310,31 @@ impl Browser {
             {
                 return None;
             }
-            let (role, link) = (title.clone(), address.clone());
-            let saved = tokio::task::spawn_blocking(move || record_applied(database.as_deref(), &role, &link)).await;
-            let not_saved = match saved {
-                Ok(Ok(())) => None,
-                Ok(Err(reason)) => Some(reason),
-                Err(stopped) => Some(stopped.to_string()),
-            };
-            Some(Applied {
-                title,
-                address,
-                not_saved,
-            })
+            Some(applied(database, title, address).await)
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Some(applied)) = recorded.await {
-                this.update(cx, |this, cx| {
-                    if let Some(run) = this.queue.get_mut(&applied.address) {
-                        run.step = Step::Applied;
-                    }
-                    this.applied.push(applied);
-                    cx.notify();
-                })
-                .ok();
+                this.update(cx, |this, cx| this.note_applied(applied, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn note_applied(&mut self, applied: Applied, cx: &mut Context<Self>) {
+        if let Some(run) = self.queue.get_mut(&applied.address) {
+            run.step = Step::Applied;
+        }
+        self.applied.push(applied);
+        self.pump(cx);
+        cx.notify();
+    }
+
+    /// Records an application Maverick submitted itself and the system confirmed.
+    fn record_sent(&mut self, title: String, address: String, cx: &mut Context<Self>) {
+        let recorded = self.background.spawn(applied(self.database.clone(), title, address));
+        cx.spawn(async move |this, cx| {
+            if let Ok(applied) = recorded.await {
+                this.update(cx, |this, cx| this.note_applied(applied, cx)).ok();
             }
         })
         .detach();
@@ -345,6 +355,23 @@ impl Browser {
     /// Takes a posting out of the queue if it has not started.
     pub fn withdraw(&mut self, address: &str, cx: &mut Context<Self>) {
         self.queue.withdraw(address);
+        cx.notify();
+    }
+
+    /// True when Maverick submits a form itself once nothing in it is left for the user.
+    pub fn auto_submit(&self) -> bool {
+        self.auto_submit
+    }
+
+    /// Turns auto-submit on or off for the fills that start from now on. The choice is kept
+    /// next to the database.
+    pub fn set_auto_submit(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.auto_submit = on;
+        if let Some(file) = auto_submit_file(self.database.as_deref())
+            && let Err(error) = std::fs::write(&file, if on { "on" } else { "off" })
+        {
+            eprintln!("maverick: could not save {}: {error}", file.display());
+        }
         cx.notify();
     }
 
@@ -393,6 +420,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
+            self.auto_submit,
             move |step| {
                 // The receiver goes away only with the window.
                 let _ = sender.send(step);
@@ -406,6 +434,7 @@ impl Browser {
                         match step {
                             Progress::Opened(tab) => run.tab = Some(tab),
                             Progress::Filling => run.step = Step::Filling,
+                            Progress::Submitting => run.step = Step::Submitting,
                         }
                     }
                     cx.notify();
@@ -419,8 +448,11 @@ impl Browser {
                 let watch = match ended {
                     Ok(Ok(filled)) => {
                         if let Some(run) = this.queue.get_mut(&address) {
-                            run.step = queue::after_fill(&filled.report);
+                            run.step = queue::after_fill(&filled.report, filled.sent.as_ref());
                             run.report = Some(filled.report);
+                        }
+                        if filled.sent == Some(Sent::Confirmed) {
+                            this.record_sent(title.clone(), address.clone(), cx);
                         }
                         Some((filled.system, filled.tab))
                     }
@@ -499,6 +531,8 @@ enum Target {
 /// A form that was filled and now waits for the user to submit it.
 struct Filled {
     report: Report,
+    /// What a press of Submit led to, when Maverick pressed it.
+    sent: Option<Sent>,
     system: System,
     tab: Tab,
     title: String,
@@ -531,6 +565,41 @@ async fn submitted(
         }
     }
     false
+}
+
+/// Where the auto-submit choice is kept.
+fn auto_submit_file(database: Option<&Path>) -> Option<PathBuf> {
+    Some(database?.parent()?.join("auto-submit"))
+}
+
+/// The auto-submit choice the user made. It is off until the user turns it on.
+fn saved_auto_submit(database: Option<&Path>) -> bool {
+    auto_submit_file(database)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .is_some_and(|text| text.trim() == "on")
+}
+
+/// The fact that says where the user applied before, read from the database beside the answers.
+async fn applied_before(answers_file: &Path) -> Option<String> {
+    let database = answers_file.with_file_name("maverick.db");
+    let read = move || apply::applied_before(&Store::open(&database).ok()?.applications().ok()?);
+    tokio::task::spawn_blocking(read).await.ok().flatten()
+}
+
+/// Records an application the system confirmed.
+async fn applied(database: Option<PathBuf>, title: String, address: String) -> Applied {
+    let (role, link) = (title.clone(), address.clone());
+    let saved = tokio::task::spawn_blocking(move || record_applied(database.as_deref(), &role, &link)).await;
+    let not_saved = match saved {
+        Ok(Ok(())) => None,
+        Ok(Err(reason)) => Some(reason),
+        Err(stopped) => Some(stopped.to_string()),
+    };
+    Applied {
+        title,
+        address,
+        not_saved,
+    }
 }
 
 /// Where the number of parallel fills is kept.
@@ -570,6 +639,8 @@ enum Progress {
     Opened(Tab),
     /// The form loaded and the answers are going in.
     Filling,
+    /// Nothing in the form is left for the user, and Maverick pressed Submit.
+    Submitting,
 }
 
 /// Why a fill ended without filling the form.
@@ -600,6 +671,7 @@ async fn fill_form(
     title: String,
     target: Target,
     answers_file: Option<PathBuf>,
+    auto_submit: bool,
     progress: impl Fn(Progress),
 ) -> Result<Filled, Stopped> {
     let said = |error: BridgeError| error.to_string();
@@ -626,7 +698,7 @@ async fn fill_form(
     }
     let answers_file = answers_file.ok_or("This system has no application data directory.")?;
     // Read on every run, so an edit to the file counts at once.
-    let answers = Answers::load(&answers_file)?;
+    let mut answers = Answers::load(&answers_file)?;
     // A tab the user picked comes forward, so the user can watch the form fill and then review it.
     let (tab, form) = match target {
         Target::Tab(tab) => {
@@ -673,6 +745,7 @@ async fn fill_form(
     let system = System::of(on).ok_or(not_fillable)?;
     let address = system.posting_address(on).ok_or(not_fillable)?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
+    answers.facts.extend(applied_before(&answers_file).await);
     let report = match form {
         Some(form) => match page.navigate(&form).await {
             Ok(()) => {
@@ -686,15 +759,31 @@ async fn fill_form(
             system.fill(&page, &answers).await
         }
     };
+    // Maverick submits only a form in which nothing is left for the user.
+    let sent = match &report {
+        Ok(report) if auto_submit && report.held_for_the_user().is_none() => {
+            progress(Progress::Submitting);
+            Some(system.submit(&page).await.unwrap_or_else(|error| {
+                Sent::Unconfirmed(format!(
+                    "{error} Look at the tab before you do anything else: the application may have gone through."
+                ))
+            }))
+        }
+        _ => None,
+    };
     // Chrome's debugging bar goes away with the detach, whether or not the fill worked.
     let detached = page.detach().await;
     let report = report.map_err(|error| Stopped {
         needs_you: matches!(error, FillError::SignInNeeded { .. } | FillError::SignIn(_)),
         reason: error.to_string(),
     })?;
-    detached.map_err(|error| error.to_string())?;
+    // A form that was submitted is done, whatever the detach said.
+    if sent.is_none() {
+        detached.map_err(|error| error.to_string())?;
+    }
     Ok(Filled {
         report,
+        sent,
         system,
         tab,
         title,

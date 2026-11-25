@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::answers::{Answer, Answers, Kind, Question, Role, Unanswered};
 use crate::ashby;
 use crate::greenhouse;
+use crate::jobs::Application;
 use crate::model;
 use crate::page::{Locator, Page, PageError};
 use crate::workday;
@@ -58,6 +59,113 @@ impl System {
             Self::Greenhouse => greenhouse::SUBMITTED,
             Self::Workday => workday::SUBMITTED,
         }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ashby => "Ashby",
+            Self::Greenhouse => "Greenhouse",
+            Self::Workday => "Workday",
+        }
+    }
+
+    /// A script that gives the button that submits the form on screen, or null when the page
+    /// does not show exactly one.
+    fn submit_button(self) -> Locator {
+        let script = match self {
+            Self::Workday => {
+                r#"(() => {
+                    const button = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+                    return button?.textContent.trim().toLowerCase() === "submit" && !button.disabled ? button : null;
+                })()"#
+            }
+            Self::Ashby | Self::Greenhouse => {
+                r#"(() => {
+                    const found = [...document.querySelectorAll("button")].filter((button) =>
+                        /^submit( application)?$/i.test(button.textContent.trim())
+                        && button.getClientRects().length > 0 && !button.disabled);
+                    return found.length === 1 ? found[0] : null;
+                })()"#
+            }
+        };
+        Locator::script("the Submit button", script)
+    }
+
+    /// True when the page shows exactly one button that submits the form.
+    pub async fn shows_submit(self, page: &Page) -> Result<bool, PageError> {
+        let shown = page
+            .evaluate(&format!("!!({})", self.submit_button().as_script()))
+            .await?;
+        Ok(shown == true)
+    }
+
+    /// Presses the form's submit button once and waits for the system to confirm.
+    ///
+    /// Call this only for a report that `Report::held_for_the_user` lets through. It never
+    /// presses twice: a press that is not confirmed is left for the user to look at.
+    pub async fn submit(self, page: &Page) -> Result<Sent, FillError> {
+        let button = self.submit_button();
+        if !self
+            .shows_submit(page)
+            .await
+            .map_err(during("looking for the Submit button"))?
+        {
+            let missing = "The form is complete, and Maverick did not find one Submit button on the page. \
+                           Submit it in the tab yourself.";
+            return Ok(Sent::Unconfirmed(missing.to_owned()));
+        }
+        page.click(&button).await.map_err(during("pressing Submit"))?;
+        let look = format!(
+            r#"(() => {{
+                if (document.querySelector({confirmation}) || location.pathname.includes("/jobTasks/completed/")) return "confirmed";
+                const text = document.body?.innerText ?? "";
+                if (/(security|verification) code/i.test(text)) return "code";
+                const challenges = 'iframe[src*="/recaptcha/"][src*="bframe"], iframe[src*="hcaptcha.com"], iframe[src*="challenges.cloudflare.com"]';
+                const asked = [...document.querySelectorAll(challenges)].some((frame) => {{
+                    const box = frame.getBoundingClientRect();
+                    return box.width > 100 && box.height > 100 && getComputedStyle(frame).visibility !== "hidden";
+                }});
+                return asked ? "challenge" : "waiting";
+            }})()"#,
+            confirmation = quoted(self.submitted()),
+        );
+        let name = self.name();
+        let deadline = Instant::now() + CONFIRM_WAIT;
+        let mut last = String::from("waiting");
+        while Instant::now() < deadline {
+            tokio::time::sleep(CONFIRM_GAP).await;
+            match page.evaluate(&look).await {
+                Ok(state) => last = state.as_str().unwrap_or("waiting").to_owned(),
+                Err(error) if error.ends_the_work() => return Err(during("waiting for the confirmation")(error)),
+                // The page is between two documents right after a submission.
+                Err(_) => continue,
+            }
+            match last.as_str() {
+                "confirmed" => return Ok(Sent::Confirmed),
+                "code" => {
+                    return Ok(Sent::Unconfirmed(format!(
+                        "Maverick pressed Submit, and {name} asks for a code it sent to your email. Enter it in the tab."
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let headline = page
+            .evaluate(r#"(document.querySelector("h1, h2")?.textContent ?? document.title).replace(/\s+/g, " ").trim().slice(0, 120)"#)
+            .await
+            .ok()
+            .and_then(|text| text.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        Ok(Sent::Unconfirmed(match last.as_str() {
+            "challenge" => {
+                format!("Maverick pressed Submit, and {name} shows a check that you are human. Solve it in the tab.")
+            }
+            _ => format!(
+                "Maverick pressed Submit, and {name} did not confirm within {} seconds. The page says {headline:?}. \
+                 Look at the tab before you do anything else: the application may have gone through.",
+                CONFIRM_WAIT.as_secs()
+            ),
+        }))
     }
 
     /// Fills the form in a tab that is on a posting of this system or on its form.
@@ -147,6 +255,8 @@ pub struct Field {
     /// The application system's own name for the field, which its code uses to find the field in the page.
     pub path: String,
     pub required: bool,
+    /// True when the form already holds an answer in this field.
+    pub held: bool,
     pub question: Question,
 }
 
@@ -166,6 +276,94 @@ pub struct Report {
     pub model_problem: Option<String>,
     /// What else the user should know about this fill, when an application system has something to say.
     pub note: Option<String>,
+    pub end: End,
+}
+
+impl Outcome {
+    /// True for a required field that still needs the user's answer.
+    pub fn is_open(&self) -> bool {
+        let answered = matches!(
+            self.result,
+            FieldResult::Filled { .. } | FieldResult::Left(Unanswered::Held | Unanswered::NotNeeded)
+        );
+        self.required && !answered
+    }
+}
+
+impl Report {
+    /// Why the submit is left to the user, or `None` when Maverick may submit the form itself.
+    ///
+    /// Maverick submits a form only when every answer in it is the user's own or follows from
+    /// the user's facts. A draft, an answer that did not go in and an open required field each
+    /// leave the form for the user.
+    pub fn held_for_the_user(&self) -> Option<String> {
+        let count = |holds: fn(&Outcome) -> bool| self.outcomes.iter().filter(|outcome| holds(outcome)).count();
+        let fields = |count: usize, one: &str, many: &str| match count {
+            1 => format!("1 {one}"),
+            count => format!("{count} {many}"),
+        };
+        if let End::Stopped(why) = &self.end {
+            return Some(why.clone());
+        }
+        if let Some(problem) = &self.model_problem {
+            return Some(format!("The model could not be asked: {problem}"));
+        }
+        let failed = count(|outcome| matches!(outcome.result, FieldResult::Failed(_)));
+        if failed > 0 {
+            return Some(format!("{} could not be entered.", fields(failed, "answer", "answers")));
+        }
+        // A form of several pages checked its own required fields on the way to its last page.
+        let open = match self.end {
+            End::Review => 0,
+            _ => count(Outcome::is_open),
+        };
+        if open > 0 {
+            let needs = if open == 1 { "needs" } else { "need" };
+            return Some(format!(
+                "{} {needs} your answer.",
+                fields(open, "required field", "required fields")
+            ));
+        }
+        let drafts = count(|outcome| {
+            matches!(
+                outcome.result,
+                FieldResult::Filled {
+                    by: Source::Draft { .. },
+                    ..
+                }
+            )
+        });
+        if drafts > 0 {
+            let is = if drafts == 1 { "is a draft" } else { "are drafts" };
+            return Some(format!("{} {is} for you to read.", fields(drafts, "answer", "answers")));
+        }
+        None
+    }
+}
+
+/// What happened after Maverick pressed a form's submit button.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sent {
+    /// The application system showed that the application went through.
+    Confirmed,
+    /// The button was pressed and the system did not confirm. The text says what the page showed
+    /// and what the user does next.
+    Unconfirmed(String),
+}
+
+/// How long an application system gets to confirm a submission.
+const CONFIRM_WAIT: Duration = Duration::from_secs(60);
+const CONFIRM_GAP: Duration = Duration::from_millis(500);
+
+/// Where a fill ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum End {
+    /// The form is one page, and the fill went through it.
+    Page,
+    /// The form has several pages, and the fill stopped before the last one. The text says why.
+    Stopped(String),
+    /// The form has several pages, and the fill reached the last one, which only asks to submit.
+    Review,
 }
 
 /// Where an answer came from.
@@ -216,19 +414,11 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
         fields,
     } = form;
     let planned: Vec<Result<Answer, Unanswered>> = fields.iter().map(|field| answers.answer(&field.question)).collect();
-    // Questions the standard answers left. Essays go to their own model call.
-    let open = |essays: bool| -> Vec<usize> {
-        (0..fields.len())
-            .filter(|&index| {
-                let kind = &fields[index].question.kind;
-                let supported = !matches!(kind, Kind::File | Kind::Unsupported(_));
-                planned[index].is_err() && supported && matches!(kind, Kind::LongText) == essays
-            })
-            .collect()
-    };
+    let open = |essays: bool| open_for_a_model(&fields, &planned, essays);
     let (factual, essays) = (open(false), open(true));
     let mut results: Vec<Option<FieldResult>> = vec![None; fields.len()];
 
+    let requirements = description.clone();
     // Drafting takes the model longest, so it starts first and runs beside everything else.
     let drafting = (!answers.background.is_empty() && !essays.is_empty()).then(|| {
         let (background, facts, job) = (answers.background.clone(), answers.facts.clone(), job.clone());
@@ -244,7 +434,17 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
             return None;
         }
         let questions: Vec<&Question> = factual.iter().map(|&index| &fields[index].question).collect();
-        Some(model::answer(&answers.facts, &job, &questions).await)
+        Some(
+            model::answer(
+                &facts_for_a_model(answers),
+                answers.standing,
+                &job,
+                &requirements,
+                &questions,
+                &factual.iter().map(|&index| fields[index].required).collect::<Vec<_>>(),
+            )
+            .await,
+        )
     };
     let entering = async {
         // The resume goes first, because Ashby can fill other fields from it.
@@ -294,6 +494,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
             required: field.required,
             result: match (result, planned) {
                 (Some(result), _) => result,
+                (None, Err(_)) if field.held => FieldResult::Left(Unanswered::Held),
                 (None, Err(why)) => FieldResult::Left(why),
                 (None, Ok(_)) => unreachable!("every planned answer was entered above"),
             },
@@ -303,7 +504,117 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
         outcomes,
         model_problem,
         note: None,
+        end: End::Page,
     })
+}
+
+/// The user's facts, with the address a form can ask for in words of its own, such as "ZIP code".
+fn facts_for_a_model(answers: &Answers) -> Vec<String> {
+    let address = answers.address.as_ref().map(|at| {
+        format!(
+            "Mailing address: {}, {}, {} {}, {}.",
+            at.street, at.city, at.region, at.postal_code, at.country
+        )
+    });
+    answers.facts.iter().cloned().chain(address).collect()
+}
+
+/// The fact that says where the user applied before, from the applications on record. A model
+/// answers "have you applied here before" from it.
+pub fn applied_before(applications: &[Application]) -> Option<String> {
+    let mut sent: Vec<&str> = applications.iter().filter_map(|sent| sent.role.as_deref()).collect();
+    sent.sort_unstable();
+    sent.dedup();
+    (!sent.is_empty()).then(|| {
+        format!(
+            "Applications already sent, each as company and role: {}. Has applied to no other company.",
+            sent.join("; ")
+        )
+    })
+}
+
+/// The places of the questions the standard answers left for a model: the essays, or the rest.
+/// Essays go to their own model call.
+fn open_for_a_model(fields: &[Field], planned: &[Result<Answer, Unanswered>], essays: bool) -> Vec<usize> {
+    (0..fields.len())
+        .filter(|&index| {
+            let kind = &fields[index].question.kind;
+            let supported = !matches!(kind, Kind::File | Kind::Unsupported(_));
+            // An answer the form holds came from the user, so no model replaces it.
+            let for_a_model = fields[index].question.role.is_none_or(Role::takes_a_model_answer);
+            let open = planned[index].is_err() && !fields[index].held && for_a_model;
+            open && supported && matches!(kind, Kind::LongText) == essays
+        })
+        .collect()
+}
+
+/// What a fill of `form` would do, worked out without a page. Nothing is entered anywhere.
+///
+/// The model answers the factual questions as it would in a fill. An essay is reported as a
+/// draft and is not written.
+pub async fn rehearse(answers: &Answers, form: Form) -> Report {
+    let Form {
+        job,
+        description,
+        fields,
+    } = form;
+    let planned: Vec<Result<Answer, Unanswered>> = fields.iter().map(|field| answers.answer(&field.question)).collect();
+    let factual = open_for_a_model(&fields, &planned, false);
+    let essays = match answers.background.is_empty() {
+        true => Vec::new(),
+        false => open_for_a_model(&fields, &planned, true),
+    };
+    let would = |shown: String, by| FieldResult::Filled { shown, by };
+    let mut results: Vec<Option<FieldResult>> = vec![None; fields.len()];
+    for &index in &essays {
+        let basis = "not written in a rehearsal".to_owned();
+        results[index] = Some(would(String::new(), Source::Draft { basis }));
+    }
+    let mut model_problem = None;
+    if !answers.facts.is_empty() && !factual.is_empty() {
+        let questions: Vec<&Question> = factual.iter().map(|&index| &fields[index].question).collect();
+        match model::answer(
+            &facts_for_a_model(answers),
+            answers.standing,
+            &job,
+            &description,
+            &questions,
+            &factual.iter().map(|&index| fields[index].required).collect::<Vec<_>>(),
+        )
+        .await
+        {
+            Err(problem) => model_problem = Some(problem),
+            Ok(said) => {
+                for (&index, said) in factual.iter().zip(said) {
+                    let Some(stated) = said.answer else { continue };
+                    results[index] = Some(match fields[index].question.kind.answer_from(&stated) {
+                        Ok(_) => would(stated, Source::Model { basis: said.basis }),
+                        Err(why) => FieldResult::Left(why),
+                    });
+                }
+            }
+        }
+    }
+    let outcomes = fields
+        .into_iter()
+        .zip(results)
+        .zip(planned)
+        .map(|((field, result), planned)| Outcome {
+            title: field.question.title,
+            required: field.required,
+            result: match (result, planned) {
+                (Some(result), _) => result,
+                (None, Ok(_)) => would(String::new(), Source::StandardAnswer),
+                (None, Err(why)) => FieldResult::Left(why),
+            },
+        })
+        .collect();
+    Report {
+        outcomes,
+        model_problem,
+        note: None,
+        end: End::Page,
+    }
 }
 
 /// The fields a model call was asked about, what it said, and how to label its answers.
@@ -323,9 +634,9 @@ async fn entered(
 ) -> Result<FieldResult, FillError> {
     match system.enter(page, field, answer).await {
         Ok(shown) => Ok(FieldResult::Filled { shown, by }),
-        Err(Problem::Page(PageError::Bridge(error))) => Err(during(format!("filling {:?}", field.question.title))(
-            PageError::Bridge(error),
-        )),
+        Err(Problem::Page(error)) if error.ends_the_work() => {
+            Err(during(format!("filling {:?}", field.question.title))(error))
+        }
         Err(problem) => Ok(FieldResult::Failed(problem.to_string())),
     }
 }
@@ -421,4 +732,117 @@ pub fn plain_text(html: &str) -> String {
 /// A string as a JavaScript literal.
 pub fn quoted(text: &str) -> String {
     serde_json::to_string(text).expect("a string is plain JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_applications_on_record_say_where_the_user_applied_before() {
+        assert_eq!(applied_before(&[]), None);
+        let sent = |role: Option<&str>| Application {
+            role: role.map(str::to_owned),
+            ..Application::submitted_today("", "https://jobs.example/1")
+        };
+        assert_eq!(
+            applied_before(&[
+                sent(Some("Example Co, Backend Engineer")),
+                sent(None),
+                sent(Some("Acme, SRE"))
+            ]),
+            Some(
+                "Applications already sent, each as company and role: Acme, SRE; Example Co, Backend Engineer. \
+                 Has applied to no other company."
+                    .into()
+            )
+        );
+    }
+
+    fn outcome(required: bool, result: FieldResult) -> Outcome {
+        Outcome {
+            title: "Field".into(),
+            required,
+            result,
+        }
+    }
+
+    fn filled(by: Source) -> FieldResult {
+        FieldResult::Filled {
+            shown: "shown".into(),
+            by,
+        }
+    }
+
+    fn report(outcomes: Vec<Outcome>, end: End) -> Report {
+        Report {
+            outcomes,
+            model_problem: None,
+            note: None,
+            end,
+        }
+    }
+
+    #[test]
+    fn maverick_submits_only_a_form_with_nothing_left_for_the_user() {
+        let own = || outcome(true, filled(Source::StandardAnswer));
+        let from_facts = || outcome(true, filled(Source::Model { basis: "a fact".into() }));
+        let draft = |required| {
+            outcome(
+                required,
+                filled(Source::Draft {
+                    basis: "the resume".into(),
+                }),
+            )
+        };
+        let left = |required| outcome(required, FieldResult::Left(Unanswered::NoRule));
+        let held = |outcomes| report(outcomes, End::Page).held_for_the_user();
+
+        assert_eq!(held(vec![own(), from_facts(), left(false)]), None);
+        assert_eq!(
+            held(vec![own(), outcome(true, FieldResult::Left(Unanswered::Held))]),
+            None
+        );
+        assert_eq!(
+            held(vec![own(), left(true)]).as_deref(),
+            Some("1 required field needs your answer.")
+        );
+        // A draft holds the form back even where the question is optional: the user has not read it.
+        assert_eq!(
+            held(vec![own(), draft(false)]).as_deref(),
+            Some("1 answer is a draft for you to read.")
+        );
+        assert_eq!(
+            held(vec![
+                own(),
+                outcome(false, FieldResult::Failed("the field stayed empty".into()))
+            ])
+            .as_deref(),
+            Some("1 answer could not be entered.")
+        );
+        let mut unasked = report(vec![own()], End::Page);
+        unasked.model_problem = Some("no model is set up".into());
+        assert!(unasked.held_for_the_user().is_some());
+    }
+
+    #[test]
+    fn a_form_of_several_pages_is_submitted_only_from_its_last_page() {
+        let own = || outcome(true, filled(Source::StandardAnswer));
+        let left = || outcome(true, FieldResult::Left(Unanswered::NoRule));
+        // The system let every page through, so it holds an answer Maverick did not see.
+        assert_eq!(report(vec![own(), left()], End::Review).held_for_the_user(), None);
+        assert_eq!(
+            report(vec![own()], End::Stopped("Workday did not take My Experience.".into()))
+                .held_for_the_user()
+                .as_deref(),
+            Some("Workday did not take My Experience.")
+        );
+        let draft = outcome(
+            false,
+            filled(Source::Draft {
+                basis: "the resume".into(),
+            }),
+        );
+        assert!(report(vec![own(), draft], End::Review).held_for_the_user().is_some());
+    }
 }
