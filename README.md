@@ -353,6 +353,12 @@ Three entries in your answers file decide answers that would otherwise always be
 - `legal_name` answers a question that asks for your legal name. Every other name question takes `name`.
 - `agrees_to_terms` lets the model agree to a form's terms, privacy notice and statement that the application is true. This includes an arbitration agreement.
 - `pay` set to `posted-midpoint` answers a pay question with the middle of the range the posting states. A posting without a range leaves the question for you.
+- `pay_without_a_range` is the yearly pay in US dollars that a required pay question gets when the posting states no range. An optional pay question stays empty.
+
+Two more things come from outside the standing answers:
+
+- `transcript`, beside `resume`, is the file a question about a transcript gets.
+- A question that asks whether you applied to the company before is answered from the applications Maverick has on record.
 
 To see which required questions your answers do not cover yet, run `maverick gaps`. It reads the form of every open Ashby and Greenhouse posting, opens nothing in Chrome and writes nothing.
 

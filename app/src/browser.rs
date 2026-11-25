@@ -579,6 +579,13 @@ fn saved_auto_submit(database: Option<&Path>) -> bool {
         .is_some_and(|text| text.trim() == "on")
 }
 
+/// The fact that says where the user applied before, read from the database beside the answers.
+async fn applied_before(answers_file: &Path) -> Option<String> {
+    let database = answers_file.with_file_name("maverick.db");
+    let read = move || apply::applied_before(&Store::open(&database).ok()?.applications().ok()?);
+    tokio::task::spawn_blocking(read).await.ok().flatten()
+}
+
 /// Records an application the system confirmed.
 async fn applied(database: Option<PathBuf>, title: String, address: String) -> Applied {
     let (role, link) = (title.clone(), address.clone());
@@ -691,7 +698,7 @@ async fn fill_form(
     }
     let answers_file = answers_file.ok_or("This system has no application data directory.")?;
     // Read on every run, so an edit to the file counts at once.
-    let answers = Answers::load(&answers_file)?;
+    let mut answers = Answers::load(&answers_file)?;
     // A tab the user picked comes forward, so the user can watch the form fill and then review it.
     let (tab, form) = match target {
         Target::Tab(tab) => {
@@ -738,6 +745,7 @@ async fn fill_form(
     let system = System::of(on).ok_or(not_fillable)?;
     let address = system.posting_address(on).ok_or(not_fillable)?;
     let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
+    answers.facts.extend(applied_before(&answers_file).await);
     let report = match form {
         Some(form) => match page.navigate(&form).await {
             Ok(()) => {

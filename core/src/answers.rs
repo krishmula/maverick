@@ -22,6 +22,9 @@ pub struct Answers {
     pub email: String,
     pub phone: String,
     pub resume: PathBuf,
+    /// The user's school transcript. A form that asks for a transcript file takes this one.
+    #[serde(default)]
+    pub transcript: Option<PathBuf>,
     /// As the user would type it into a location search, such as `Springfield, Illinois`.
     #[serde(default)]
     pub location: Option<String>,
@@ -78,6 +81,10 @@ pub struct Standing {
     /// How a question about expected pay is answered. With none, it is left for the user.
     #[serde(default)]
     pub pay: Option<Pay>,
+    /// The yearly pay a required question gets when the posting states no range. An optional
+    /// question stays empty. With none, the question is left for the user.
+    #[serde(default)]
+    pub pay_without_a_range: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -329,7 +336,11 @@ impl Answers {
     pub fn answer(&self, question: &Question) -> Result<Answer, Unanswered> {
         match (&question.kind, question.role) {
             (Kind::File, Some(Role::Resume)) => return Ok(Answer::File(self.resume.clone())),
-            (Kind::File, _) => return Err(Unanswered::NoRule),
+            (Kind::File, _) => {
+                let asks_for_transcript = question.title.to_lowercase().contains("transcript");
+                let transcript = self.transcript.clone().filter(|_| asks_for_transcript);
+                return transcript.map(Answer::File).ok_or(Unanswered::NoRule);
+            }
             (Kind::Email, _) => return Ok(Answer::Text(self.email.clone())),
             (Kind::Phone, _) => return Ok(Answer::Text(self.phone.clone())),
             (Kind::Unsupported(kind), _) => return Err(Unanswered::Unsupported(kind.clone())),
@@ -925,6 +936,27 @@ mod tests {
         };
         assert_eq!(answers().answer(&resume), Ok(Answer::File("/tmp/ada.pdf".into())));
         assert_eq!(ask("Cover letter", Kind::File), Err(Unanswered::NoRule));
+    }
+
+    #[test]
+    fn a_file_question_about_a_transcript_takes_the_saved_transcript() {
+        assert_eq!(ask("Unofficial transcript", Kind::File), Err(Unanswered::NoRule));
+        let answers = Answers {
+            transcript: Some("/tmp/ada-transcript.pdf".into()),
+            ..answers()
+        };
+        let ask = |title: &str| {
+            answers.answer(&Question {
+                title: title.into(),
+                kind: Kind::File,
+                role: None,
+            })
+        };
+        assert_eq!(
+            ask("Unofficial Transcript"),
+            Ok(Answer::File("/tmp/ada-transcript.pdf".into()))
+        );
+        assert_eq!(ask("Cover letter"), Err(Unanswered::NoRule));
     }
 
     #[test]

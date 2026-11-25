@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::answers::{Answer, Answers, Kind, Question, Role, Unanswered};
 use crate::ashby;
 use crate::greenhouse;
+use crate::jobs::Application;
 use crate::model;
 use crate::page::{Locator, Page, PageError};
 use crate::workday;
@@ -440,6 +441,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
                 &job,
                 &requirements,
                 &questions,
+                &factual.iter().map(|&index| fields[index].required).collect::<Vec<_>>(),
             )
             .await,
         )
@@ -517,6 +519,20 @@ fn facts_for_a_model(answers: &Answers) -> Vec<String> {
     answers.facts.iter().cloned().chain(address).collect()
 }
 
+/// The fact that says where the user applied before, from the applications on record. A model
+/// answers "have you applied here before" from it.
+pub fn applied_before(applications: &[Application]) -> Option<String> {
+    let mut sent: Vec<&str> = applications.iter().filter_map(|sent| sent.role.as_deref()).collect();
+    sent.sort_unstable();
+    sent.dedup();
+    (!sent.is_empty()).then(|| {
+        format!(
+            "Applications already sent, each as company and role: {}. Has applied to no other company.",
+            sent.join("; ")
+        )
+    })
+}
+
 /// The places of the questions the standard answers left for a model: the essays, or the rest.
 /// Essays go to their own model call.
 fn open_for_a_model(fields: &[Field], planned: &[Result<Answer, Unanswered>], essays: bool) -> Vec<usize> {
@@ -563,6 +579,7 @@ pub async fn rehearse(answers: &Answers, form: Form) -> Report {
             &job,
             &description,
             &questions,
+            &factual.iter().map(|&index| fields[index].required).collect::<Vec<_>>(),
         )
         .await
         {
@@ -720,6 +737,27 @@ pub fn quoted(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_applications_on_record_say_where_the_user_applied_before() {
+        assert_eq!(applied_before(&[]), None);
+        let sent = |role: Option<&str>| Application {
+            role: role.map(str::to_owned),
+            ..Application::submitted_today("", "https://jobs.example/1")
+        };
+        assert_eq!(
+            applied_before(&[
+                sent(Some("Example Co, Backend Engineer")),
+                sent(None),
+                sent(Some("Acme, SRE"))
+            ]),
+            Some(
+                "Applications already sent, each as company and role: Acme, SRE; Example Co, Backend Engineer. \
+                 Has applied to no other company."
+                    .into()
+            )
+        );
+    }
 
     fn outcome(required: bool, result: FieldResult) -> Outcome {
         Outcome {

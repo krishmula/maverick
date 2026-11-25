@@ -903,7 +903,9 @@ pub fn gaps(limit: usize, show_answers: bool) -> Result<(), Box<dyn Error>> {
     const AT_ONCE: usize = 4;
     let store = open_store()?;
     let file = maverick_core::answers_path().ok_or("this system has no application data directory")?;
-    let answers = Arc::new(Answers::load(&file)?);
+    let mut answers = Answers::load(&file)?;
+    answers.facts.extend(apply::applied_before(&store.applications()?));
+    let answers = Arc::new(answers);
     let board = crate::board::BoardData::new(&store.postings()?, store.applications()?, &store.decisions()?);
     let mut open: Vec<(System, String, String)> = board
         .entries

@@ -25,6 +25,10 @@ A location takes a city and state as a person would type them into a search box.
 Any other question takes the shortest direct answer, with no explanation. \
 In basis, name the fact you used in one short sentence.";
 
+const REQUIRED: &str = "The request says which questions the form requires. Every other question is \
+optional. Where a fact says to give something only when it is required, an optional question about it \
+takes null.";
+
 const NO_TERMS: &str = "Always answer null for agreements, acknowledgments and certifications.";
 const AGREES_TO_TERMS: &str = "The applicant agrees to every form's terms. Where a question only asks the \
 applicant to agree to or acknowledge terms and conditions, a privacy notice, the handling of the \
@@ -39,8 +43,9 @@ const PAY_IS_POSTED_MIDPOINT: &str = "For a question about expected pay or salar
 description states for this job and answer its midpoint: half of the sum of its two ends, as a plain \
 whole number without a currency sign, in the unit the range uses, such as 150000 for a range per year \
 and 55 for a range per hour. Where the question has options, pick the option that holds the midpoint. \
-In basis, quote the range. If the description states no pay range, or states several and does not say \
-which one applies to this applicant, the answer is null.";
+In basis, quote the range.";
+const NO_RANGE: &str = "If the description states no pay range, or states several and does not say \
+which one applies to this applicant,";
 
 /// The instructions for factual questions, with what the user decided once for every form.
 fn instructions(standing: Standing) -> String {
@@ -49,11 +54,16 @@ fn instructions(standing: Standing) -> String {
     } else {
         NO_TERMS
     };
-    let pay = match standing.pay {
-        Some(Pay::PostedMidpoint) => PAY_IS_POSTED_MIDPOINT,
-        None => NO_PAY,
+    let pay = match (standing.pay, standing.pay_without_a_range) {
+        (Some(Pay::PostedMidpoint), Some(yearly)) => format!(
+            "{PAY_IS_POSTED_MIDPOINT} {NO_RANGE} a required question takes {yearly} US dollars per year, with \
+             'pay without a posted range' as the basis. An optional question takes null, and so does a \
+             question that asks for the pay in another currency."
+        ),
+        (Some(Pay::PostedMidpoint), None) => format!("{PAY_IS_POSTED_MIDPOINT} {NO_RANGE} the answer is null."),
+        (None, _) => NO_PAY.to_owned(),
     };
-    format!("{INSTRUCTIONS} {terms} {pay}")
+    format!("{INSTRUCTIONS} {REQUIRED} {terms} {pay}")
 }
 
 /// What the model said about one question.
@@ -76,15 +86,18 @@ or when the field asks no specific question, such as 'Additional information' or
 In basis, name the part of the resume you used in one short sentence.";
 
 /// Answers factual `questions` in order, from the user's facts. `job` says which posting the form
-/// belongs to, and `description` what that job requires.
+/// belongs to, and `description` what that job requires. `required` says of each question whether
+/// the form requires it.
 pub async fn answer(
     facts: &[String],
     standing: Standing,
     job: &str,
     description: &str,
     questions: &[&Question],
+    required: &[bool],
 ) -> Result<Vec<ModelAnswer>, String> {
     let mut asked = request(facts, job, questions);
+    asked.push_str(&required_line(required));
     if !description.is_empty() {
         let _ = write!(asked, "\nThe job description:\n{description}\n");
     }
@@ -134,6 +147,19 @@ fn request(facts: &[String], job: &str, questions: &[&Question]) -> String {
         let _ = writeln!(request, "{}. ({kind}) {}", index + 1, question.title);
     }
     request
+}
+
+/// The line that tells the model which of the numbered questions the form requires.
+fn required_line(required: &[bool]) -> String {
+    let numbers: Vec<String> = (1..)
+        .zip(required)
+        .filter(|(_, required)| **required)
+        .map(|(number, _)| number.to_string())
+        .collect();
+    match numbers.is_empty() {
+        true => "\nThe form requires none of these questions.\n".to_owned(),
+        false => format!("\nThe form requires these questions: {}.\n", numbers.join(", ")),
+    }
 }
 
 fn reply_schema() -> Value {
@@ -237,9 +263,24 @@ mod tests {
         let set = instructions(Standing {
             agrees_to_terms: true,
             pay: Some(Pay::PostedMidpoint),
+            pay_without_a_range: None,
         });
         assert!(set.contains(AGREES_TO_TERMS) && set.contains(PAY_IS_POSTED_MIDPOINT));
         assert!(!set.contains(NO_TERMS) && !set.contains(NO_PAY));
+        assert!(set.ends_with("the answer is null."));
+        let with_fallback = instructions(Standing {
+            pay_without_a_range: Some(90_000),
+            ..Standing {
+                agrees_to_terms: true,
+                pay: Some(Pay::PostedMidpoint),
+                pay_without_a_range: None,
+            }
+        });
+        assert!(with_fallback.contains("a required question takes 90000 US dollars per year"));
+        assert_eq!(
+            required_line(&[true, false, true]),
+            "\nThe form requires these questions: 1, 3.\n"
+        );
     }
 
     #[test]
