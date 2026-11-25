@@ -109,14 +109,27 @@
     root.querySelector(`[data-errors="${id}"]`).innerHTML = `<div data-automation-id="inputAlert">Error: ${text}</div>`;
   };
 
+  // A press of the footer's button saves the page and shows the last one, whose button says Submit.
+  window.next = (button) => {
+    if (button.textContent === "Submit") return (window.submitted = true);
+    window.advanced = true;
+    window.saved = root.querySelector("#name--legalName--firstName").value;
+    setTimeout(() => {
+      root.querySelector('[data-automation-id="applyFlowMyInfoPage"]').outerHTML =
+        '<div data-automation-id="applyFlowReviewPage"><h3>Review</h3></div>';
+      root.querySelector('[data-automation-id="progressBarActiveStep"]').textContent = "current step 2 of 2Review";
+      button.textContent = "Submit";
+    }, 300);
+  };
   const application = `<div data-automation-id="applyFlowPage">
+    <ol data-automation-id="progressBar"><li data-automation-id="progressBarActiveStep">current step 1 of 2My Information</li></ol>
     <div data-automation-id="applyFlowMyInfoPage">
       <div data-automation-id="formField-firstName" data-fkit-id="name--legalName--firstName">
         <label for="name--legalName--firstName"><span>First Name<abbr aria-hidden="true">*</abbr></span></label>
         <div><input type="text" id="name--legalName--firstName" aria-required="true" value=""></div>
       </div>
     </div>
-    <button type="button" data-automation-id="pageFooterNextButton" onclick="window.advanced = true">Save and Continue</button>
+    <button type="button" data-automation-id="pageFooterNextButton" onclick="window.next(this)">Save and Continue</button>
   </div>`;
   // The wall goes, a loading page shows, then the first page of the application.
   const enter = () => {

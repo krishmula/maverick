@@ -154,6 +154,7 @@ pub fn form(reply: &Value) -> Result<Form, FillError> {
             _ => None,
         };
         fields.push(Field {
+            held: false,
             required: entry.is_required.unwrap_or(false),
             question: Question {
                 title: field.title.trim().to_owned(),
@@ -440,6 +441,7 @@ mod tests {
         assert_eq!(job, "Backend Engineer, Remote (US)");
         assert_eq!(description, "Build fast things & ship.\nRust\nSQL");
         let field = |path: &str, required, title: &str, kind, role| Field {
+            held: false,
             path: path.into(),
             required,
             question: Question {

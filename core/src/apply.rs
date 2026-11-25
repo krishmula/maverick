@@ -147,6 +147,8 @@ pub struct Field {
     /// The application system's own name for the field, which its code uses to find the field in the page.
     pub path: String,
     pub required: bool,
+    /// True when the form already holds an answer in this field.
+    pub held: bool,
     pub question: Question,
 }
 
@@ -166,6 +168,18 @@ pub struct Report {
     pub model_problem: Option<String>,
     /// What else the user should know about this fill, when an application system has something to say.
     pub note: Option<String>,
+    pub end: End,
+}
+
+/// Where a fill ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum End {
+    /// The form is one page, and the fill went through it.
+    Page,
+    /// The form has several pages, and the fill stopped before the last one. The text says why.
+    Stopped(String),
+    /// The form has several pages, and the fill reached the last one, which only asks to submit.
+    Review,
 }
 
 /// Where an answer came from.
@@ -222,13 +236,17 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
             .filter(|&index| {
                 let kind = &fields[index].question.kind;
                 let supported = !matches!(kind, Kind::File | Kind::Unsupported(_));
-                planned[index].is_err() && supported && matches!(kind, Kind::LongText) == essays
+                // An answer the form holds came from the user, so no model replaces it.
+                let for_a_model = fields[index].question.role.is_none_or(Role::takes_a_model_answer);
+                let open = planned[index].is_err() && !fields[index].held && for_a_model;
+                open && supported && matches!(kind, Kind::LongText) == essays
             })
             .collect()
     };
     let (factual, essays) = (open(false), open(true));
     let mut results: Vec<Option<FieldResult>> = vec![None; fields.len()];
 
+    let requirements = description.clone();
     // Drafting takes the model longest, so it starts first and runs beside everything else.
     let drafting = (!answers.background.is_empty() && !essays.is_empty()).then(|| {
         let (background, facts, job) = (answers.background.clone(), answers.facts.clone(), job.clone());
@@ -244,7 +262,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
             return None;
         }
         let questions: Vec<&Question> = factual.iter().map(|&index| &fields[index].question).collect();
-        Some(model::answer(&answers.facts, &job, &questions).await)
+        Some(model::answer(&answers.facts, &job, &requirements, &questions).await)
     };
     let entering = async {
         // The resume goes first, because Ashby can fill other fields from it.
@@ -294,6 +312,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
             required: field.required,
             result: match (result, planned) {
                 (Some(result), _) => result,
+                (None, Err(_)) if field.held => FieldResult::Left(Unanswered::Held),
                 (None, Err(why)) => FieldResult::Left(why),
                 (None, Ok(_)) => unreachable!("every planned answer was entered above"),
             },
@@ -303,6 +322,7 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
         outcomes,
         model_problem,
         note: None,
+        end: End::Page,
     })
 }
 
@@ -323,9 +343,9 @@ async fn entered(
 ) -> Result<FieldResult, FillError> {
     match system.enter(page, field, answer).await {
         Ok(shown) => Ok(FieldResult::Filled { shown, by }),
-        Err(Problem::Page(PageError::Bridge(error))) => Err(during(format!("filling {:?}", field.question.title))(
-            PageError::Bridge(error),
-        )),
+        Err(Problem::Page(error)) if error.ends_the_work() => {
+            Err(during(format!("filling {:?}", field.question.title))(error))
+        }
         Err(problem) => Ok(FieldResult::Failed(problem.to_string())),
     }
 }

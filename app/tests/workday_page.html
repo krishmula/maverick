@@ -3,6 +3,8 @@
   A RECONSTRUCTION of one page of a Workday application, not a copy of one. Nobody signed in to
   Workday to make it. The markup follows Workday's public page scripts (release 2026.47.19) and
   the atsfill project's notes on the signed-in wizard. See the top of core/src/workday.rs.
+  These parts follow the structure of live pages seen signed in, in November 2026: the search
+  lists, the date boxes, the list of jobs, the footer, the list of errors and the last page.
   Every name and value here is made up.
 -->
 <title>Reconstructed Workday page</title>
@@ -33,11 +35,19 @@
 
     <div data-automation-id="formField-countryPhoneCode" data-fkit-id="phoneNumber--countryPhoneCode">
       <label for="phoneNumber--countryPhoneCode"><span>Country Phone Code<abbr aria-hidden="true">*</abbr></span></label>
-      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect">
-        <div role="listbox" data-automation-id="selectedItemList" aria-label="items selected">
-          <div role="option" data-automation-id="selectedItem">United States of America (+1)</div>
+      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect" data-options="Canada (+1)|United States of America (+1)">
+        <div data-automation-id="multiselectInputContainer">
+          <input id="phoneNumber--countryPhoneCode" placeholder="Search" data-uxi-widget-type="selectinput" aria-required="true" value="">
+          <div data-automation-id="promptSelectionLabel"></div>
+          <span data-automation-id="promptIcon"></span>
         </div>
-        <div data-automation-id="multiselectInputContainer"><input type="text" id="phoneNumber--countryPhoneCode" data-automation-id="searchBox"></div>
+        <ul role="listbox" data-automation-id="selectedItemList" aria-label="items selected">
+          <li role="presentation" data-automation-id="menuItem">
+            <div role="option" data-automation-id="selectedItem" aria-label="United States of America (+1), press delete to clear value.">
+              <p data-automation-id="promptOption" data-automation-label="United States of America (+1)">United States of America (+1)</p>
+            </div>
+          </li>
+        </ul>
       </div>
     </div>
 
@@ -94,13 +104,13 @@
 
     <div data-automation-id="formField-q3" data-fkit-id="primaryQuestionnaire--q3">
       <label for="primaryQuestionnaire--q3-dateSectionMonth-input"><span>When can you start?</span></label>
-      <div data-automation-id="dateInputWrapper">
-        <div data-automation-id="dateSectionMonth-display">MM</div>
-        <input type="text" id="primaryQuestionnaire--q3-dateSectionMonth-input" data-automation-id="dateSectionMonth-input" role="spinbutton" value="">
-        <div data-automation-id="dateSectionDay-display">DD</div>
-        <input type="text" id="primaryQuestionnaire--q3-dateSectionDay-input" data-automation-id="dateSectionDay-input" role="spinbutton" value="">
-        <div data-automation-id="dateSectionYear-display">YYYY</div>
-        <input type="text" id="primaryQuestionnaire--q3-dateSectionYear-input" data-automation-id="dateSectionYear-input" role="spinbutton" value="">
+      <div data-automation-id="dateInputWrapper" role="group">
+        <div data-automation-id="dateSectionMonth-display" aria-hidden="true">MM</div>
+        <input id="primaryQuestionnaire--q3-dateSectionMonth-input" data-automation-id="dateSectionMonth-input" role="spinbutton" value="">
+        <div data-automation-id="dateSectionDay-display" aria-hidden="true">DD</div>
+        <input id="primaryQuestionnaire--q3-dateSectionDay-input" data-automation-id="dateSectionDay-input" role="spinbutton" value="">
+        <div data-automation-id="dateSectionYear-display" aria-hidden="true">YYYY</div>
+        <input id="primaryQuestionnaire--q3-dateSectionYear-input" data-automation-id="dateSectionYear-input" role="spinbutton" value="">
       </div>
     </div>
 
@@ -114,17 +124,20 @@
 
     <div data-automation-id="formField-source" data-fkit-id="source--source">
       <label for="source--source"><span>How Did You Hear About Us?<abbr aria-hidden="true">*</abbr></span></label>
-      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect">
-        <div data-automation-id="multiselectInputContainer"><input type="text" id="source--source" data-automation-id="searchBox"></div>
+      <div data-automation-id="multiSelectContainer" data-uxi-widget-type="multiselect" data-options="LinkedIn|LinkedIn Jobs|Employee Referral">
+        <div data-automation-id="multiselectInputContainer">
+          <input id="source--source" placeholder="Search" data-uxi-widget-type="selectinput" aria-required="true" value="">
+          <div data-automation-id="promptSelectionLabel"></div>
+          <span data-automation-id="promptIcon"></span>
+        </div>
+        <ul role="listbox" data-automation-id="selectedItemList" aria-label="items selected"></ul>
       </div>
     </div>
 
-    <div role="group" aria-labelledby="Work-Experience-section" data-fkit-id="workExperience-2">
-      <h4 id="Work-Experience-section">Work Experience 1</h4>
-      <div data-automation-id="formField-jobTitle" data-fkit-id="workExperience-2--jobTitle">
-        <label for="workExperience-2--jobTitle"><span>Job Title<abbr aria-hidden="true">*</abbr></span></label>
-        <div><input type="text" id="workExperience-2--jobTitle" value=""></div>
-      </div>
+    <div role="group" aria-labelledby="Work-Experience-section">
+      <h4 id="Work-Experience-section">Work Experience</h4>
+      <div data-entries></div>
+      <button type="button" data-automation-id="add-button">Add Another</button>
     </div>
 
     <div data-automation-id="formField-q4" data-fkit-id="primaryQuestionnaire--q4">
@@ -142,7 +155,131 @@
 <script>
   // What the test reads back: the lists that were opened, and whether the page was left.
   window.opened = [];
-  document.querySelector('[data-automation-id="pageFooterNextButton"]').addEventListener("click", () => (window.advanced = true));
+
+  // The footer, as on a live page. A press saves the page and shows the next one, which here is
+  // the last: it has no field, and its button says Submit. A page with `?refuse` in its address
+  // is not taken, and lists what is wrong with it.
+  const next = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+  next.addEventListener("click", () => {
+    if (next.textContent === "Submit") return (window.submitted = true);
+    if (location.search.includes("refuse")) {
+      document.querySelector('[data-automation-id="errorHeading"]')?.remove();
+      const errors = document.createElement("div");
+      errors.setAttribute("data-automation-id", "errorHeading");
+      errors.innerHTML =
+        '<ol><li value="1"><div><button aria-describedby="hint1"><span>Error</span><div aria-hidden="true">-</div>Postal Code</button>' +
+        '<div id="hint1">The field Postal Code is required and must have a value.</div></div></li></ol>';
+      document.querySelector('[data-automation-id="applyFlowPage"]').prepend(errors);
+      return;
+    }
+    window.advanced = true;
+    setTimeout(() => {
+      document.querySelector('[data-automation-id="applyFlowMyInfoPage"]').outerHTML =
+        '<div data-automation-id="applyFlowReviewPage"><h3>Review</h3></div>';
+      document.querySelector('[data-automation-id="progressBarActiveStep"]').innerHTML =
+        "<div>current step 6 of 6</div><label>Review</label>";
+      next.textContent = "Submit";
+    }, 300);
+  });
+
+  // A date box holds its number without a leading zero, and the text beside it shows the zero.
+  const dateBox = (box) => {
+    const width = box.getAttribute("data-automation-id").includes("Year") ? 4 : 2;
+    box.addEventListener("input", () => {
+      const number = Number(box.value.replace(/\D/g, ""));
+      box.value = number ? String(number) : "";
+      box.previousElementSibling.textContent = number ? String(number).padStart(width, "0") : "";
+    });
+  };
+  document.querySelectorAll('[data-automation-id$="-input"][role="spinbutton"]').forEach(dateBox);
+
+  // A search list, as on a live page. Enter sends the typed text to the server. With one option
+  // found, the list picks it. With several, it opens with them. With none, it opens with all.
+  // Tab closes the list and empties the search box.
+  for (const prompt of document.querySelectorAll('[data-automation-id="multiSelectContainer"]')) {
+    const input = prompt.querySelector("input");
+    const picked = prompt.querySelector('[data-automation-id="selectedItemList"]');
+    const options = prompt.dataset.options.split("|");
+    const closeList = () => document.querySelector('[data-automation-id="responsiveMonikerPrompt"]')?.remove();
+    const labelled = (element, label) => {
+      const option = element.querySelector('[data-automation-id="promptOption"]');
+      option.textContent = label;
+      option.setAttribute("data-automation-label", label);
+      return option;
+    };
+    const pick = (label) => {
+      picked.innerHTML =
+        '<li role="presentation" data-automation-id="menuItem"><div role="option" data-automation-id="selectedItem">' +
+        '<p data-automation-id="promptOption"></p></div></li>';
+      labelled(picked, label);
+      input.value = "";
+      closeList();
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") {
+        input.value = "";
+        closeList();
+      }
+      if (event.key !== "Enter") return;
+      const typed = input.value.toLowerCase();
+      setTimeout(() => {
+        const found = options.filter((option) => option.toLowerCase().includes(typed));
+        if (found.length === 1) return pick(found[0]);
+        closeList();
+        const popup = document.createElement("div");
+        popup.setAttribute("data-automation-id", "responsiveMonikerPrompt");
+        popup.innerHTML = '<div data-automation-id="activeListContainer" role="listbox" tabindex="-1"></div>';
+        for (const label of found.length > 0 ? found : options) {
+          const row = document.createElement("div");
+          row.setAttribute("data-automation-id", "menuItem");
+          row.setAttribute("role", "option");
+          row.innerHTML = '<div data-automation-id="promptLeafNode"><div data-automation-id="promptOption"></div></div>';
+          labelled(row, label).addEventListener("click", () => pick(label));
+          popup.firstChild.append(row);
+        }
+        document.body.append(popup);
+      }, 300);
+    });
+  }
+
+  // The list of jobs, as on a live page. Workday numbers the entries as it likes. A job the
+  // applicant holds now has no last month, so that field goes when the box is ticked.
+  const jobs = document.querySelector('[aria-labelledby="Work-Experience-section"]');
+  let entries = 0;
+  const addJob = () => {
+    const id = `workExperience-${2 + 5 * entries}`;
+    entries += 1;
+    const panel = document.createElement("div");
+    panel.setAttribute("role", "group");
+    panel.setAttribute("aria-labelledby", `Work-Experience-${entries}-panel`);
+    panel.innerHTML = `<h5 id="Work-Experience-${entries}-panel">Work Experience ${entries}</h5>
+      <div data-automation-id="formField-jobTitle" data-fkit-id="${id}--jobTitle">
+        <label for="${id}--jobTitle"><span>Job Title<abbr aria-hidden="true">*</abbr></span></label>
+        <div><input type="text" id="${id}--jobTitle" value=""></div>
+      </div>
+      <div data-automation-id="formField-currentlyWorkHere" data-fkit-id="${id}--currentlyWorkHere">
+        <span class="box"><input type="checkbox" id="${id}--currentlyWorkHere"><div></div></span>
+        <label for="${id}--currentlyWorkHere">I currently work here</label>
+      </div>
+      <div data-automation-id="formField-endDate" data-fkit-id="${id}--endDate">
+        <fieldset><legend><span>To<abbr aria-hidden="true">*</abbr></span></legend>
+          <div data-automation-id="dateInputWrapper" role="group" id="${id}--endDate">
+            <div data-automation-id="dateSectionMonth-display" aria-hidden="true">MM</div>
+            <input id="${id}--endDate-dateSectionMonth-input" data-automation-id="dateSectionMonth-input" role="spinbutton" value="">
+            <div data-automation-id="dateSectionYear-display" aria-hidden="true">YYYY</div>
+            <input id="${id}--endDate-dateSectionYear-input" data-automation-id="dateSectionYear-input" role="spinbutton" value="">
+          </div>
+        </fieldset>
+      </div>`;
+    panel.querySelectorAll('[role="spinbutton"]').forEach(dateBox);
+    const current = panel.querySelector('input[type="checkbox"]');
+    current.addEventListener("change", () => {
+      if (current.checked) panel.querySelector('[data-automation-id="formField-endDate"]').remove();
+    });
+    jobs.querySelector("[data-entries]").append(panel);
+  };
+  addJob();
+  jobs.querySelector('[data-automation-id="add-button"]').addEventListener("click", addJob);
 
   // The list as Workday's script draws it: outside the field, with the keyboard focus, naming its
   // active row. The arrow keys move that row and Enter picks it, as seen on a live page.
@@ -180,6 +317,7 @@
         else if (event.key === "ArrowUp") active = Math.max(0, active - 1);
         else if (event.key === "Enter") {
           button.textContent = labels[active];
+          button.value = active === 0 ? "" : `option-${active}`;
           close(button);
           button.focus();
         } else if (event.key === "Escape") {

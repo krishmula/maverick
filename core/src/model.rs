@@ -13,8 +13,13 @@ use crate::providers::{self, Job};
 const INSTRUCTIONS: &str = "You fill in a job application for the applicant described in the facts. \
 Answer each question only from the facts. If the facts do not settle a question, the answer is null. \
 Never guess, and never invent experience, skills, dates or numbers. \
-Always answer null for: pay or salary expectations, open-ended essay questions, demographic questions, \
+The job description says only what the job itself requires. Use it for a question that asks whether \
+the applicant meets a requirement of the job, such as its minimum years of experience: \
+compare the requirement with the facts. Such a question is not a certification. \
+Always answer null for: pay or salary expectations, open-ended essay questions, \
 and agreements, acknowledgments, certifications or signatures. \
+Answer a question about gender, race or ethnicity, veteran status or disability only when a fact says \
+what the applicant chooses to disclose about it. Otherwise the answer is null. \
 A yes or no question takes exactly yes or no. A date takes YYYY-MM-DD. \
 A question with options takes the exact text of one option. \
 A location takes a city and state as a person would type them into a search box. \
@@ -40,9 +45,19 @@ Answer null when the resume does not cover what the question asks, \
 or when the field asks no specific question, such as 'Additional information' or 'Cover letter'. \
 In basis, name the part of the resume you used in one short sentence.";
 
-/// Answers factual `questions` in order, from the user's facts. `job` says which posting the form belongs to.
-pub async fn answer(facts: &[String], job: &str, questions: &[&Question]) -> Result<Vec<ModelAnswer>, String> {
-    ask(INSTRUCTIONS, request(facts, job, questions), questions.len()).await
+/// Answers factual `questions` in order, from the user's facts. `job` says which posting the form
+/// belongs to, and `description` what that job requires.
+pub async fn answer(
+    facts: &[String],
+    job: &str,
+    description: &str,
+    questions: &[&Question],
+) -> Result<Vec<ModelAnswer>, String> {
+    let mut asked = request(facts, job, questions);
+    if !description.is_empty() {
+        let _ = write!(asked, "\nThe job description:\n{description}\n");
+    }
+    ask(INSTRUCTIONS, asked, questions.len()).await
 }
 
 /// Drafts answers to essay `questions` in order, from the user's resume.

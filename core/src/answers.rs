@@ -20,6 +20,16 @@ pub struct Answers {
     /// As the user would type it into a location search, such as `Springfield, Illinois`.
     #[serde(default)]
     pub location: Option<String>,
+    /// Where the user gets mail. A form that asks for the address in parts takes them from here.
+    #[serde(default)]
+    pub address: Option<Address>,
+    /// The jobs the user has held, the newest first. A form that asks for each job on its own
+    /// takes them from here, in this order.
+    #[serde(default)]
+    pub work: Vec<Work>,
+    /// The schools the user went to, the newest first.
+    #[serde(default)]
+    pub education: Vec<School>,
     #[serde(default)]
     pub rules: Vec<Rule>,
     /// Facts about the user, one per entry. A model answers from these what the rules do not cover.
@@ -30,10 +40,61 @@ pub struct Answers {
     /// from it. With no background, essay questions are left for the user.
     #[serde(default)]
     pub background: Vec<String>,
+    /// What the user chooses to tell an employer about gender, ethnicity, veteran status and
+    /// disability, one statement per entry. A form's voluntary questions are answered from these
+    /// and from the facts. With no entry, those questions are left for the user.
+    #[serde(default)]
+    pub disclosures: Vec<String>,
     /// The jobs the user is looking for, one statement per entry, such as levels and kinds of work.
     /// Scoring judges each posting against these and the background.
     #[serde(default)]
     pub target: Vec<String>,
+}
+
+/// A postal address in the parts forms ask for.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Address {
+    pub street: String,
+    pub city: String,
+    /// The state or province, written out, such as `Illinois`.
+    pub region: String,
+    pub postal_code: String,
+    /// The country as forms list it, such as `United States of America`.
+    pub country: String,
+}
+
+/// One job the user has held.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Work {
+    pub title: String,
+    pub company: String,
+    pub location: String,
+    /// The first month, as `YYYY-MM`.
+    pub from: String,
+    /// The last month, as `YYYY-MM`. Left out for the job the user holds now.
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One school the user went to.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct School {
+    pub school: String,
+    /// The degree as the user writes it, such as `Master of Science`.
+    pub degree: String,
+    pub field: String,
+    /// The first and the last year, as `YYYY`.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub grade: Option<String>,
 }
 
 /// Answers every question whose text holds one of `any` and none of `not`.
@@ -76,6 +137,8 @@ pub enum Kind {
     Choices {
         options: Vec<String>,
     },
+    /// Pick one option from a list that shows its options only after a search for some text.
+    Search,
     /// A kind of field this code does not fill.
     Unsupported(String),
 }
@@ -85,8 +148,58 @@ pub enum Role {
     Name,
     /// A form that asks for the name in two fields marks each of them.
     FirstName,
+    /// Only a rule answers this. Most users have no middle name to give.
+    MiddleName,
     LastName,
     Resume,
+    Street,
+    City,
+    Region,
+    PostalCode,
+    Country,
+    /// Which kind of phone the number belongs to, such as mobile.
+    PhoneKind,
+    /// The country code of the phone number, in a field of its own.
+    PhoneCode,
+    /// The day the form is filled, where the user signs a statement.
+    Today,
+    /// A part of the job at this place in the user's list of jobs.
+    Work(usize, WorkPart),
+    /// A part of the school at this place in the user's list of schools.
+    School(usize, SchoolPart),
+}
+
+impl Role {
+    /// False for a field whose answer is the user's own record and nothing else, such as the
+    /// title of the second job. A model would make one up from the user's facts.
+    pub fn takes_a_model_answer(self) -> bool {
+        !matches!(
+            self,
+            Self::MiddleName | Self::PhoneKind | Self::PhoneCode | Self::Today | Self::Work(..) | Self::School(..)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WorkPart {
+    Title,
+    Company,
+    Location,
+    /// Whether the user holds this job now.
+    Current,
+    From,
+    To,
+    Description,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SchoolPart {
+    Name,
+    Degree,
+    Field,
+    Grade,
+    From,
+    To,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +223,10 @@ pub enum Unanswered {
     NotADate(String),
     NoSuchOption(String),
     Unsupported(String),
+    /// The form held an answer before the fill, and the standard answers have none to replace it.
+    Held,
+    /// Another answer makes this field go away, as the last month of a job the user holds now.
+    NotNeeded,
 }
 
 impl fmt::Display for Unanswered {
@@ -121,6 +238,8 @@ impl fmt::Display for Unanswered {
             Self::NotADate(answer) => write!(f, "this needs a date, and your standard answer is {answer:?}"),
             Self::NoSuchOption(answer) => write!(f, "none of the options is your standard answer, {answer:?}"),
             Self::Unsupported(kind) => write!(f, "Maverick cannot fill a {kind} field yet"),
+            Self::Held => f.write_str("the form already held an answer, and Maverick kept it"),
+            Self::NotNeeded => f.write_str("another answer on this page makes this one unnecessary"),
         }
     }
 }
@@ -134,6 +253,7 @@ impl Kind {
                 Ok(date) => date.strftime("%B %-d, %Y").to_string(),
                 Err(_) => stated.to_owned(),
             })),
+            Self::Search => Ok(Answer::Text(stated.to_owned())),
             Self::Location => Ok(Answer::Text(as_searched(stated))),
             Self::YesNo => match stated.to_lowercase().as_str() {
                 "yes" => Ok(Answer::YesNo(true)),
@@ -166,11 +286,38 @@ impl Answers {
             (Kind::Email, _) => return Ok(Answer::Text(self.email.clone())),
             (Kind::Phone, _) => return Ok(Answer::Text(self.phone.clone())),
             (Kind::Unsupported(kind), _) => return Err(Unanswered::Unsupported(kind.clone())),
+            // A rule about the phone number must not answer these two.
+            (kind, Some(Role::PhoneKind)) => return kind.answer_from("Mobile"),
+            (_, Some(Role::PhoneCode)) => return Err(Unanswered::NoRule),
+            (kind, Some(Role::Today)) => return kind.answer_from(&today()),
+            (kind, Some(Role::Work(place, part))) => {
+                let job = self.work.get(place).ok_or(Unanswered::NoRule)?;
+                return job.answer(part, kind);
+            }
+            (kind, Some(Role::School(place, part))) => {
+                let school = self.education.get(place).ok_or(Unanswered::NoRule)?;
+                return school.answer(part, kind);
+            }
+            (kind, Some(role)) => {
+                if let Some(part) = self.address.as_ref().and_then(|address| address.part(role)) {
+                    return kind.answer_from(part);
+                }
+            }
             _ => {}
         }
+        let now;
         let stated = match self.rule_answer(&question.title)? {
             Some(stated) => stated,
             None => match (&question.kind, question.role) {
+                // A form asks for today's date where the applicant signs a statement.
+                (Kind::Date, _)
+                    if normalized(&question.title)
+                        .replace('\u{2019}', "'")
+                        .contains("today's date") =>
+                {
+                    now = today();
+                    &now
+                }
                 (Kind::Text, Some(Role::Name)) if !asks_for_part_of_a_name(&question.title) => &self.name,
                 (Kind::Text, Some(Role::FirstName)) => self.name_parts().0,
                 (Kind::Text, Some(Role::LastName)) => self.name_parts().1.ok_or(Unanswered::NoRule)?,
@@ -205,6 +352,190 @@ impl Answers {
             Ok(Some(first))
         } else {
             Err(Unanswered::RulesDisagree)
+        }
+    }
+}
+
+/// Today's date where the user is, as `YYYY-MM-DD`.
+fn today() -> String {
+    jiff::Timestamp::now()
+        .to_zoned_datetime(jiff::tz::TimeZone::system())
+        .date()
+        .to_string()
+}
+
+/// A month written `YYYY-MM`, or a year written `YYYY`, as an answer to a date field.
+fn month(kind: &Kind, stated: &str) -> Result<Answer, Unanswered> {
+    let day = match stated.trim().len() {
+        4 => format!("{}-01-01", stated.trim()),
+        7 => format!("{}-01", stated.trim()),
+        _ => stated.trim().to_owned(),
+    };
+    match kind {
+        Kind::Date => kind.answer_from(&day),
+        // A form that takes the month as text gets it as the user wrote it.
+        _ => kind.answer_from(stated),
+    }
+}
+
+impl Work {
+    fn answer(&self, part: WorkPart, kind: &Kind) -> Result<Answer, Unanswered> {
+        match part {
+            WorkPart::Title => kind.answer_from(&self.title),
+            WorkPart::Company => kind.answer_from(&self.company),
+            WorkPart::Location => kind.answer_from(&self.location),
+            WorkPart::Current => kind.answer_from(if self.to.is_none() { "yes" } else { "no" }),
+            WorkPart::From => month(kind, &self.from),
+            WorkPart::To => month(kind, self.to.as_deref().ok_or(Unanswered::NotNeeded)?),
+            WorkPart::Description if self.description.is_empty() => Err(Unanswered::NoRule),
+            WorkPart::Description => kind.answer_from(&self.description),
+        }
+    }
+}
+
+impl School {
+    fn answer(&self, part: SchoolPart, kind: &Kind) -> Result<Answer, Unanswered> {
+        fn stated(text: &Option<String>) -> Result<&str, Unanswered> {
+            text.as_deref().ok_or(Unanswered::NoRule)
+        }
+        match (part, kind) {
+            (SchoolPart::Name, _) => kind.answer_from(&self.school),
+            (SchoolPart::Degree, Kind::Choice { options }) => degree(options, &self.degree).map(Answer::Choice),
+            (SchoolPart::Degree, _) => kind.answer_from(&self.degree),
+            (SchoolPart::Field, _) => kind.answer_from(&self.field),
+            (SchoolPart::Grade, _) => kind.answer_from(stated(&self.grade)?),
+            (SchoolPart::From, _) => month(kind, stated(&self.from)?),
+            (SchoolPart::To, _) => month(kind, stated(&self.to)?),
+        }
+    }
+}
+
+/// How high a degree is, by the words every spelling of it shares. Forms list degrees in their
+/// own words, such as `MS`, `Masters` or `Master's Degree` for a `Master of Science`.
+const DEGREE_LEVELS: [&[&str]; 5] = [
+    &["phd", "ph.d", "ph.d.", "doctor", "doctorate", "doctoral"],
+    &[
+        "master", "masters", "master's", "ms", "m.s", "m.s.", "msc", "meng", "m.eng", "mba", "ma", "m.a.",
+    ],
+    &[
+        "bachelor",
+        "bachelors",
+        "bachelor's",
+        "bs",
+        "b.s",
+        "b.s.",
+        "bsc",
+        "ba",
+        "b.a.",
+        "btech",
+        "b.tech",
+        "beng",
+        "b.e.",
+    ],
+    &["associate", "associates", "associate's"],
+    &["high", "ged", "secondary"],
+];
+
+/// Words that say nothing about which degree an option names.
+const DEGREE_FILLER: [&str; 10] = [
+    "of",
+    "or",
+    "in",
+    "and",
+    "the",
+    "a",
+    "s",
+    "degree",
+    "equivalent",
+    "level",
+];
+
+/// Words that name a level of degree and no one degree of that level.
+const DEGREE_GENERAL: [&str; 12] = [
+    "doctor",
+    "doctorate",
+    "doctoral",
+    "master",
+    "masters",
+    "bachelor",
+    "bachelors",
+    "associate",
+    "associates",
+    "high",
+    "secondary",
+    "school",
+];
+
+/// The option that names the user's degree: the one spelled like it, or else the one option of
+/// the same level. With several options of that level, the one that names most of the degree,
+/// by its words or by its short form such as "MSc". When none does, the one that names no
+/// other degree, such as "Master's Degree" next to "MBA".
+fn degree(options: &[String], stated: &str) -> Result<String, Unanswered> {
+    if let Ok(option) = option(options, stated) {
+        return Ok(option);
+    }
+    let words = |text: &str| -> Vec<String> {
+        normalized(text)
+            .split(|c: char| !(c.is_alphanumeric() || c == '.'))
+            .map(|word| word.replace('.', ""))
+            .filter(|word| !word.is_empty() && !DEGREE_FILLER.contains(&word.as_str()))
+            .collect()
+    };
+    let is_level = |level: &[&str], word: &str| level.iter().any(|name| name.replace(['.', '\''], "") == word);
+    let level = |text: &str| {
+        let words = words(text);
+        DEGREE_LEVELS
+            .iter()
+            .position(|level| words.iter().any(|word| is_level(level, word)))
+    };
+    let none = || Unanswered::NoSuchOption(stated.to_owned());
+    let level_wanted = level(stated).ok_or_else(none)?;
+    let general = |word: &String| DEGREE_GENERAL.contains(&word.as_str());
+    let stated_words = words(stated);
+    let short: String = stated_words.iter().filter_map(|word| word.chars().next()).collect();
+    let mut names: Vec<String> = stated_words.iter().filter(|word| !general(word)).cloned().collect();
+    if stated_words.len() > 1 {
+        if stated_words.last().is_some_and(|word| word.starts_with("science")) {
+            names.push(format!("{short}c"));
+        }
+        names.push(short);
+    }
+    // More shared names first, then fewer names of another degree.
+    let fit = |option: &&String| {
+        let words = words(option);
+        let shared = words.iter().filter(|word| names.contains(word)).count();
+        let other = words
+            .iter()
+            .filter(|word| !names.contains(word) && !general(word))
+            .count();
+        (std::cmp::Reverse(shared), other)
+    };
+    let same_level: Vec<&String> = options
+        .iter()
+        .filter(|option| level(option) == Some(level_wanted))
+        .collect();
+    let best = same_level.iter().map(fit).min().ok_or_else(none)?;
+    match same_level
+        .iter()
+        .filter(|option| fit(option) == best)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [only] => Ok((**only).clone()),
+        _ => Err(none()),
+    }
+}
+
+impl Address {
+    /// The part of the address a field with this role asks for.
+    fn part(&self, role: Role) -> Option<&str> {
+        match role {
+            Role::Street => Some(&self.street),
+            Role::City => Some(&self.city),
+            Role::Region => Some(&self.region),
+            Role::PostalCode => Some(&self.postal_code),
+            Role::Country => Some(&self.country),
+            _ => None,
         }
     }
 }
@@ -306,6 +637,120 @@ fn as_searched(place: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_form_that_asks_for_each_job_and_school_gets_them_in_order() {
+        let answers: Answers = serde_json::from_str(
+            r#"{
+                "name": "Ada Example", "email": "ada@example.com", "phone": "+1 555 0100", "resume": "/tmp/ada.pdf",
+                "rules": [{ "any": ["phone"], "answer": "+1 555 0100" }],
+                "address": { "street": "1 Main Street", "city": "Springfield", "region": "Illinois",
+                             "postal_code": "62701", "country": "United States of America" },
+                "work": [
+                    { "title": "Engineer", "company": "Example Robotics", "location": "Springfield", "from": "2023-06" },
+                    { "title": "Intern", "company": "Example Labs", "location": "Chicago", "from": "2022-01", "to": "2022-08" }
+                ],
+                "education": [{ "school": "Example University", "degree": "Master of Science", "field": "Computer Science", "to": "2023" }]
+            }"#,
+        )
+        .unwrap();
+        let ask = |kind: Kind, role: Role| {
+            answers.answer(&Question {
+                title: "Phone or anything".into(),
+                kind,
+                role: Some(role),
+            })
+        };
+        let text = |text: &str| Ok(Answer::Text(text.into()));
+        let day = |year, month| Ok(Answer::Date(Date::new(year, month, 1).unwrap()));
+        assert_eq!(ask(Kind::Text, Role::Work(0, WorkPart::Title)), text("Engineer"));
+        assert_eq!(ask(Kind::Text, Role::Work(1, WorkPart::Company)), text("Example Labs"));
+        assert_eq!(
+            ask(Kind::YesNo, Role::Work(0, WorkPart::Current)),
+            Ok(Answer::YesNo(true))
+        );
+        assert_eq!(
+            ask(Kind::YesNo, Role::Work(1, WorkPart::Current)),
+            Ok(Answer::YesNo(false))
+        );
+        assert_eq!(ask(Kind::Date, Role::Work(0, WorkPart::From)), day(2023, 6));
+        assert_eq!(ask(Kind::Date, Role::Work(1, WorkPart::To)), day(2022, 8));
+        // The job the user holds now has no last month, and the form drops that field.
+        assert_eq!(ask(Kind::Date, Role::Work(0, WorkPart::To)), Err(Unanswered::NotNeeded));
+        assert_eq!(ask(Kind::Text, Role::Work(2, WorkPart::Title)), Err(Unanswered::NoRule));
+        assert_eq!(
+            ask(Kind::Search, Role::School(0, SchoolPart::Field)),
+            text("Computer Science")
+        );
+        assert_eq!(ask(Kind::Date, Role::School(0, SchoolPart::To)), day(2023, 1));
+        assert_eq!(
+            ask(Kind::Date, Role::School(0, SchoolPart::From)),
+            Err(Unanswered::NoRule)
+        );
+
+        assert_eq!(ask(Kind::Text, Role::Street), text("1 Main Street"));
+        assert_eq!(ask(Kind::Text, Role::PostalCode), text("62701"));
+        // The rule about the phone number answers neither the kind of phone nor its country code.
+        let kinds = Kind::Choice {
+            options: vec!["Landline".into(), "Mobile".into()],
+        };
+        assert_eq!(ask(kinds, Role::PhoneKind), Ok(Answer::Choice("Mobile".into())));
+        assert_eq!(ask(Kind::Search, Role::PhoneCode), Err(Unanswered::NoRule));
+    }
+
+    #[test]
+    fn a_degree_is_found_under_the_forms_own_spelling() {
+        let options = |list: &[&str]| list.iter().map(|option| (*option).to_owned()).collect::<Vec<_>>();
+        let levels = options(&[
+            "High School Diploma",
+            "Bachelor's Degree",
+            "Master's Degree",
+            "Doctorate",
+        ]);
+        assert_eq!(degree(&levels, "Master of Science"), Ok("Master's Degree".into()));
+        assert_eq!(degree(&levels, "PhD"), Ok("Doctorate".into()));
+        let short = options(&["BA", "BS", "MA", "MS", "MBA"]);
+        assert_eq!(degree(&short, "MS"), Ok("MS".into()));
+        assert_eq!(degree(&short, "Master of Science"), Ok("MS".into()));
+        // Two options are a bachelor's degree, and neither names this one.
+        assert_eq!(
+            degree(&short, "Bachelor of Technology"),
+            Err(Unanswered::NoSuchOption("Bachelor of Technology".into()))
+        );
+        let grouped = options(&[
+            "Bachelor’s or Equivalent First-Degree (ISCED 6: BA, BSc, BEng, LLB, etc.)",
+            "Master of Business Administration - MBA ( (ISCED 7)",
+            "Master’s or Equivalent Second-Degree (ISCED 7: MA, MSc, MEng, MPhil, professional licentiate)",
+        ]);
+        assert_eq!(degree(&grouped, "Master of Science"), Ok(grouped[2].clone()));
+        assert_eq!(degree(&grouped, "Bachelor of Science"), Ok(grouped[0].clone()));
+        let general = options(&["Bachelor's Degree", "Master's Degree", "MBA"]);
+        assert_eq!(degree(&general, "Master of Science"), Ok("Master's Degree".into()));
+        let named = options(&["Master of Arts", "Master of Science", "Bachelor of Science"]);
+        assert_eq!(degree(&named, "master of science"), Ok("Master of Science".into()));
+        assert_eq!(
+            degree(&named, "Certificate"),
+            Err(Unanswered::NoSuchOption("Certificate".into()))
+        );
+    }
+
+    #[test]
+    fn a_request_for_todays_date_gets_it() {
+        let asked = Question {
+            title: "Please acknowledge this by entering today\u{2019}s date.".into(),
+            kind: Kind::Date,
+            role: None,
+        };
+        let today = jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .date();
+        assert_eq!(answers().answer(&asked), Ok(Answer::Date(today)));
+        let other = Question {
+            title: "Date of birth".into(),
+            ..asked
+        };
+        assert_eq!(answers().answer(&other), Err(Unanswered::NoRule));
+    }
 
     fn answers() -> Answers {
         serde_json::from_str(

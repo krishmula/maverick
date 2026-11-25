@@ -179,6 +179,7 @@ pub fn form(job_post: &Value) -> Result<Form, FillError> {
             (_, other) => (Kind::Unsupported(other.to_owned()), None),
         };
         fields.push(Field {
+            held: false,
             path: field.name,
             required: asked.required,
             question: Question {
@@ -586,6 +587,7 @@ mod tests {
         assert_eq!(job, "Backend Engineer, Springfield, IL");
         assert_eq!(description, "Build fast things & ship.\nRust\nSQL");
         let field = |path: &str, required, title: &str, kind, role| Field {
+            held: false,
             path: path.into(),
             required,
             question: Question {

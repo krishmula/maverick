@@ -1,6 +1,7 @@
 //! The apply queue: approved postings, filled several at once, each in its own Chrome tab. It never submits.
 
-use maverick_core::apply::{FieldResult, Report};
+use maverick_core::answers::Unanswered;
+use maverick_core::apply::{End, FieldResult, Report};
 use maverick_core::bridge::Tab;
 
 /// How many forms fill at once unless the user picks another number.
@@ -48,10 +49,18 @@ impl Step {
 
 /// What a finished fill leaves for the user: ready to submit, or the required fields still open.
 pub fn after_fill(report: &Report) -> Step {
+    match &report.end {
+        // The form's own checks let every page through.
+        End::Review => return Step::Ready,
+        End::Stopped(why) => return Step::NeedsYou(why.clone()),
+        End::Page => {}
+    }
+    let answered =
+        |result: &FieldResult| matches!(result, FieldResult::Filled { .. } | FieldResult::Left(Unanswered::Held));
     let open = report
         .outcomes
         .iter()
-        .filter(|outcome| outcome.required && !matches!(outcome.result, FieldResult::Filled { .. }))
+        .filter(|outcome| outcome.required && !answered(&outcome.result))
         .count();
     match open {
         0 => Step::Ready,
@@ -191,6 +200,28 @@ mod tests {
     }
 
     #[test]
+    fn a_form_of_several_pages_is_ready_only_at_its_last_page() {
+        let left = Outcome {
+            title: "Country".into(),
+            required: true,
+            result: FieldResult::Left(Unanswered::Held),
+        };
+        let report = |end| Report {
+            outcomes: vec![left.clone()],
+            model_problem: None,
+            note: None,
+            end,
+        };
+        // An answer the form held already leaves nothing for the user to do.
+        assert_eq!(after_fill(&report(End::Page)), Step::Ready);
+        assert_eq!(after_fill(&report(End::Review)), Step::Ready);
+        assert_eq!(
+            after_fill(&report(End::Stopped("Workday did not take My Experience.".into()))),
+            Step::NeedsYou("Workday did not take My Experience.".into())
+        );
+    }
+
+    #[test]
     fn a_fill_with_required_fields_left_needs_the_user() {
         let outcome = |required: bool, result: FieldResult| Outcome {
             title: "Field".into(),
@@ -206,6 +237,7 @@ mod tests {
             outcomes,
             model_problem: None,
             note: None,
+            end: maverick_core::apply::End::Page,
         };
         assert_eq!(
             after_fill(&report(vec![outcome(true, filled()), outcome(false, left())])),
