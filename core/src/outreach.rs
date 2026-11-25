@@ -28,13 +28,15 @@ use crate::score::{self, APPLY_READY, Decision, Profile, Reading};
 use crate::store::{Store, StoreError, stored};
 
 /// The most People-page lookups one check run makes, apply-ready postings first.
-pub const LOOKUP_CAP: usize = 10;
+pub const LOOKUP_CAP: usize = 40;
 /// The most new hiring-post drafts in one Pacific day.
-pub const DRAFTS_PER_DAY: usize = 10;
+pub const DRAFTS_PER_DAY: usize = 40;
 /// How long a saved count of no free InMail credits is believed.
 const CREDITS_FRESH: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 /// The most posts one sweep reads with the model.
-pub const POSTS_READ: usize = 40;
+pub const POSTS_READ: usize = 80;
+/// The most people one outreach check keeps for a posting, best first.
+pub const PEOPLE_PER_POSTING: usize = 10;
 /// LinkedIn content searches for hiring posts. Each one is one page load.
 ///
 /// Every search is a hiring phrase in quotes plus plain words. LinkedIn binds `OR` looser than the
@@ -81,7 +83,7 @@ pub struct Check {
     pub posting_link: String,
     pub verdict: Verdict,
     pub team: Option<String>,
-    /// One or two people, best first.
+    /// Up to `PEOPLE_PER_POSTING` people, best first.
     pub people: Vec<Person>,
     pub note: Option<String>,
     pub checked_at: Timestamp,
@@ -565,7 +567,7 @@ pub struct NamedPerson {
     pub role: String,
 }
 
-/// Up to two of the user's connections at the company, those whose position mentions the team first.
+/// Up to `PEOPLE_PER_POSTING` of the user's connections at the company, those whose position mentions the team first.
 pub fn connections_at(company: &str, team: Option<&str>, connections: &[Connection]) -> Vec<Person> {
     let at_company: Vec<&Connection> = connections
         .iter()
@@ -580,7 +582,7 @@ pub fn connections_at(company: &str, team: Option<&str>, connections: &[Connecti
     first.extend(rest);
     first
         .into_iter()
-        .take(2)
+        .take(PEOPLE_PER_POSTING)
         .map(|connection| Person {
             name: connection.name(),
             title: connection.position.clone(),
@@ -620,7 +622,7 @@ pub enum Lookup {
     Deferred(String),
 }
 
-/// One or two people from a company's People page: the person named, or else engineers whose title
+/// Up to `PEOPLE_PER_POSTING` people from a company's People page: the person named, or else engineers whose title
 /// names the team, then other engineers, then recruiters. A title with no engineering or
 /// recruiting word is never picked, whatever team it names. LinkedIn ignores a search on that page,
 /// so the picking happens here, from the people it lists.
@@ -684,7 +686,11 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
         .collect();
     // Stable, so people of one rank keep the page's order.
     ranked.sort_by_key(|(rank, _)| *rank);
-    ranked.into_iter().take(2).map(|(_, person)| person.clone()).collect()
+    ranked
+        .into_iter()
+        .take(PEOPLE_PER_POSTING)
+        .map(|(_, person)| person.clone())
+        .collect()
 }
 
 /// The verdict, from the three sources in the order the user set: the posting, the connections, the People page.
@@ -703,7 +709,7 @@ pub fn settle(named: &Named, linked: Vec<Person>, lookup: Option<Lookup>) -> (Ve
             _ => named
                 .people
                 .iter()
-                .take(2)
+                .take(PEOPLE_PER_POSTING)
                 .map(|person| Person {
                     name: person.name.clone(),
                     title: person.role.clone(),
@@ -1874,7 +1880,7 @@ mod tests {
         ];
         let found = connections_at("Example Co", Some("Storage team"), &connections);
         let names: Vec<&str> = found.iter().map(|person| person.name.as_str()).collect();
-        assert_eq!(names, ["Cy Sample", "Ada Sample"]);
+        assert_eq!(names, ["Cy Sample", "Ada Sample", "Di Sample"]);
         assert_eq!(found[0].degree.as_deref(), Some("1st"));
         assert!(connections_at("Nowhere Inc", None, &connections).is_empty());
     }
@@ -1947,8 +1953,9 @@ mod tests {
                 .map(|person| person.name)
                 .collect()
         };
-        // An engineer on the team first, then another engineer; Cy names the team but is no engineer.
-        assert_eq!(names("Storage", &named, &results), ["Ed", "Bo"]);
+        // An engineer on the team first, then another engineer, then a recruiter; Cy names the team
+        // but is no engineer, and Ada is neither.
+        assert_eq!(names("Storage", &named, &results), ["Ed", "Bo", "Di"]);
         // A weak team word picks no one by itself, "swe" is not "Sweden" and "Engineered" is no engineer.
         let others = [
             person("Ed", "Senior Analyst, Enterprise Cybersecurity"),
