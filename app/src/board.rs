@@ -1241,9 +1241,14 @@ impl Board {
             Some(_) => ("", ""),
         };
         let link = entry.link.clone();
-        let outreach = self
-            .outreach
-            .update(cx, |outreach, cx| outreach.posting_section(&link, palette, cx));
+        let reported = run.as_ref().is_some_and(|run| run.report.is_some());
+        let scorer_note = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref()).outreach;
+        let (scorer, outreach) = self.outreach.update(cx, |outreach, cx| {
+            let scorer = (!reported)
+                .then(|| outreach.scorer_section(&link, &scorer_note, palette, cx))
+                .flatten();
+            (scorer, outreach.posting_section(&link, palette, cx))
+        });
         let reviewable = run
             .as_ref()
             .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
@@ -1302,6 +1307,7 @@ impl Board {
                         Some(report) => report::sections(report, palette),
                         None => verdict_view(&entry, palette),
                     })
+                    .children(scorer)
                     .child(outreach)
                     .child(ui::caps("details").pb(px(8.)).text_color(palette.faint))
                     .child(ui::facts(&facts, palette)),
@@ -1368,7 +1374,8 @@ fn posting_header(entry: &Entry, company_actions: Div, palette: &Palette) -> Div
         .child(ui::score(entry.score, 54.).text_color(palette.ink))
 }
 
-/// What scoring said, in parts: the reason, then what blocks, what to watch, the team and whom to reach.
+/// What scoring said, in parts: the reason, then what blocks, what to watch and the team. Whom the
+/// scorer said to reach shows in its own section, where each person can be reached.
 fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
     let verdict = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref());
     let status = match (&entry.notes, entry.apply_ready) {
@@ -1429,12 +1436,6 @@ fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
         ))
         .children(points("advisory", "watch for", &verdict.advisory, palette.muted))
         .children(points("team", "team", &team, palette.faint))
-        .children(points(
-            "scorer-outreach",
-            "scorer's outreach note",
-            &verdict.outreach,
-            palette.faint,
-        ))
 }
 
 /// Where a queued posting is, and the fill report's map once there is one.
