@@ -261,7 +261,7 @@ impl Search {
         self.0.is_empty()
     }
 
-    fn finds(&self, text: &str) -> bool {
+    pub fn finds(&self, text: &str) -> bool {
         let text = text.to_lowercase();
         self.is_empty() || self.0.iter().any(|words| words.iter().all(|word| text.contains(word)))
     }
