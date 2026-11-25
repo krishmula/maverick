@@ -840,7 +840,11 @@ impl OutreachView {
                 ];
                 if sweep {
                     let bridge = bridge.ok_or("Chrome is not connected, so the hiring-post sweep did not run.")?;
-                    lines.push(outreach::sweep(&database, &profile?, bridge).await?.summary());
+                    let swept = outreach::sweep(&database, &profile?, bridge).await?;
+                    if let Some(notice) = crate::notify::post_drafts(swept.drafted) {
+                        crate::notify::post(notice);
+                    }
+                    lines.push(swept.summary());
                 }
                 Ok(lines.join("; "))
             },

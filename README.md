@@ -454,6 +454,18 @@ A posting that cannot be read or scored stays found, with the reason in its note
 
 To compare the scorer with the scores the database already holds, run `check-scores [count]`. It scores the newest postings again, writes nothing, and reports how often the two decisions agree.
 
+## Get notified
+
+Maverick shows a macOS notification when:
+
+- a queued form finishes filling and is ready to submit, was submitted by Maverick, needs your answer, or failed,
+- the hourly check scores new apply-ready postings,
+- the hiring-post sweep drafts new notes.
+
+macOS shows them only while Maverick is not the frontmost app. The first start asks for permission. To change it later, open System Settings > Notifications > Maverick.
+
+Notifications work only from `Maverick.app` in `/Applications` or `~/Applications`. A build run with `cargo run`, or an app in a temporary folder, shows none. To check the setup, run `/Applications/Maverick.app/Contents/MacOS/maverick notify`.
+
 ## Run the tests
 
 ```sh

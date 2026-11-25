@@ -77,6 +77,9 @@ impl Funnel {
                 let profile = Profile::load(&answers)?;
                 let sheet = maverick_core::sheet::linked_session().await?;
                 let pass = funnel::run_once(&database, profile, sheet).await?;
+                if let Some(notice) = crate::notify::apply_ready(pass.apply_ready()) {
+                    crate::notify::post(notice);
+                }
                 let lists = tokio::task::spawn_blocking(move || stored_lists(Some(&database)))
                     .await
                     .map_err(|stopped| stopped.to_string())?;
