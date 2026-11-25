@@ -12,6 +12,7 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     canvas, div, fill, img, point, px, size,
 };
+use maverick_core::apply::System;
 use maverick_core::bridge::{BrowserState, Tab};
 
 use gpui_kit::TestSupportExt as _;
@@ -542,7 +543,7 @@ impl MainView {
             .cloned();
         let host = host_of(&tab.tab.url);
         let platform = Platform::of(&tab.tab.url);
-        let tag = if platform.fillable() {
+        let tag = if System::of(&tab.tab.url).is_some() {
             format!("{host} / {}", platform.name())
         } else {
             host.to_owned()

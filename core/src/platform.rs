@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use crate::apply::{self, System};
 use crate::jobs::{self, Posting};
 
-/// Where a posting takes applications. Maverick fills forms on the first three; the rest open for the user.
+/// Where a posting takes applications. Maverick fills and submits forms on the first three, fills
+/// iCIMS and Amazon Jobs up to the last step, and opens the rest for the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Platform {
     Ashby,
     Greenhouse,
     Workday,
+    Icims,
     Lever,
     AmazonJobs,
     OracleCloud,
@@ -20,10 +22,11 @@ pub enum Platform {
 }
 
 impl Platform {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Ashby,
         Self::Greenhouse,
         Self::Workday,
+        Self::Icims,
         Self::Lever,
         Self::AmazonJobs,
         Self::OracleCloud,
@@ -39,6 +42,8 @@ impl Platform {
                 System::Ashby => Self::Ashby,
                 System::Greenhouse => Self::Greenhouse,
                 System::Workday => Self::Workday,
+                System::Icims => Self::Icims,
+                System::Amazon => Self::AmazonJobs,
             };
         }
         let host = host(address);
@@ -68,6 +73,7 @@ impl Platform {
             Self::Ashby => "Ashby",
             Self::Greenhouse => "Greenhouse",
             Self::Workday => "Workday",
+            Self::Icims => "iCIMS",
             Self::Lever => "Lever",
             Self::AmazonJobs => "Amazon Jobs",
             Self::OracleCloud => "Oracle Cloud",

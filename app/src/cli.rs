@@ -912,7 +912,8 @@ pub fn gaps(limit: usize, show_answers: bool) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.decision != Some(Decision::Skipped))
         .filter_map(|entry| {
-            let system = System::of(&entry.address).filter(|system| *system != System::Workday)?;
+            let system =
+                System::of(&entry.address).filter(|system| matches!(system, System::Ashby | System::Greenhouse))?;
             Some((
                 system,
                 format!("{} | {}", entry.company, entry.title),
@@ -924,11 +925,16 @@ pub fn gaps(limit: usize, show_answers: bool) -> Result<(), Box<dyn Error>> {
     let workday = board
         .entries
         .iter()
-        .filter(|entry| System::of(&entry.address) == Some(System::Workday))
+        .filter(|entry| {
+            matches!(
+                System::of(&entry.address),
+                Some(System::Workday | System::Icims | System::Amazon)
+            )
+        })
         .count();
     println!(
-        "{} open postings on Ashby and Greenhouse, {} rehearsed now. {workday} on Workday are left out: \
-         Workday shows its questions only to a signed-in tab.",
+        "{} open postings on Ashby and Greenhouse, {} rehearsed now. {workday} on Workday, iCIMS and Amazon are left out: \
+         they show their questions only to a signed-in tab.",
         open.len(),
         open.len().min(limit)
     );

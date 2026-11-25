@@ -1,5 +1,6 @@
 //! Everything in Maverick except the window.
 
+pub mod amazon;
 pub mod answers;
 pub mod apply;
 pub mod ashby;
@@ -14,9 +15,11 @@ pub mod funnel;
 pub mod google;
 pub mod greenhouse;
 pub mod http;
+pub mod icims;
 pub mod intake;
 pub mod jobs;
 pub mod linkedin;
+pub mod mail;
 pub mod mav;
 pub mod model;
 pub mod outreach;

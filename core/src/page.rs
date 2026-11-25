@@ -291,6 +291,10 @@ impl Page {
                     const element = {};
                     if (!element) return "missing";
                     element.scrollIntoView({{ block: "center", behavior: "instant" }});
+                    // Typed text goes to the focused frame, so each frame around the element takes the focus first.
+                    const frames = [];
+                    for (let view = element.ownerDocument.defaultView; view.frameElement; view = view.parent) frames.unshift(view.frameElement);
+                    frames.forEach((frame) => frame.focus());
                     element.focus();
                     if (typeof element.select === "function") element.select();
                     else getSelection().selectAllChildren(element);
@@ -325,7 +329,15 @@ impl Page {
                     const x = box.left + box.width / 2;
                     const y = box.top + box.height / 2;
                     const top = element.getRootNode().elementFromPoint(x, y);
-                    return top && element.contains(top) ? {{ x, y }} : "covered";
+                    if (!top || !element.contains(top)) return "covered";
+                    // Mouse events go to the tab's own page, so a point inside a frame moves by the frame's place.
+                    let left = 0, above = 0;
+                    for (let view = element.ownerDocument.defaultView; view.frameElement; view = view.parent) {{
+                        const frame = view.frameElement.getBoundingClientRect();
+                        left += frame.left + view.frameElement.clientLeft;
+                        above += frame.top + view.frameElement.clientTop;
+                    }}
+                    return {{ x: x + left, y: y + above }};
                 }})()"#,
                 element.script
             ))
