@@ -1680,29 +1680,38 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
                 ("Day", i32::from(date.day()), 2),
                 ("Year", i32::from(date.year()), 4),
             ];
-            let mut typed = Vec::new();
+            let mut boxes = Vec::new();
             for (part, number, width) in parts {
                 let input = within(id, &format!("[data-automation-id=\"dateSection{part}-input\"]"));
-                if page.evaluate(&format!("!!({})", input.as_script())).await? != true {
-                    continue;
+                if page.evaluate(&format!("!!({})", input.as_script())).await? == true {
+                    // The box holds the number without its leading zero.
+                    boxes.push((part, input, number.to_string(), format!("{number:0width$}")));
                 }
-                // The box holds the number without its leading zero.
-                let wanted = number.to_string();
-                let shows = format!("({})?.value === {}", input.as_script(), quoted(&wanted));
-                if page.evaluate(&shows).await? != true {
-                    // A date box reads key presses. On a live page, text put into a box that
-                    // held a date changed the month and left a wrong day.
-                    let focus = format!("((box) => {{ box.focus(); box.select?.(); }})({})", input.as_script());
-                    page.evaluate(&focus).await?;
-                    page.press_digits(&format!("{number:0width$}")).await?;
-                    expect_value(page, &input, &wanted).await?;
-                }
-                typed.push(format!("{number:0width$}"));
             }
-            if typed.is_empty() {
+            let Some((first, ..)) = boxes.first() else {
                 return Err(Problem::Mismatch("the date field has no box to type in"));
+            };
+            let mut shown = true;
+            for (_, input, wanted, _) in &boxes {
+                let shows = format!("({})?.value === {}", input.as_script(), quoted(wanted));
+                shown = shown && page.evaluate(&shows).await? == true;
             }
-            page.press(Key::Tab).await?;
+            if !shown {
+                // A date reads key presses, and a full number in one box moves the keyboard on
+                // to the next box. So the whole date is typed from its first box, as a person
+                // types it. On a live page, text put into a box that held a date changed the
+                // month, and keys meant for the day box alone went to the month box. The text
+                // beside a box covers it, so the click goes to that text.
+                let display = within(id, &format!("[data-automation-id=\"dateSection{first}-display\"]"));
+                page.click(&display).await?;
+                let digits: String = boxes.iter().map(|(.., typed)| typed.as_str()).collect();
+                page.press_digits(&digits).await?;
+                for (_, input, wanted, _) in &boxes {
+                    expect_value(page, input, wanted).await?;
+                }
+                page.press(Key::Tab).await?;
+            }
+            let typed: Vec<&str> = boxes.iter().map(|(.., typed)| typed.as_str()).collect();
             Ok(typed.join("/"))
         }
     }
