@@ -1,5 +1,6 @@
-//! Auto-apply: Maverick approves each posting scored 75 or more, and sends a draft to the best two
-//! people its outreach check found there, without the user's review. The user turns it on in
+//! Auto-apply: Maverick approves each posting scored 75 or more, sends a draft to the best two
+//! people its outreach check found there, and sends each waiting hiring-post draft, without the
+//! user's review. The user turns it on in
 //! Connections; while it is off, the user approves each posting. Whether an approved form is also
 //! submitted is the auto-submit switch's call.
 
@@ -88,15 +89,16 @@ pub fn approve(database: &Path) -> Result<usize, StoreError> {
 /// One person to send to now.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pick {
-    pub posting_link: String,
+    pub about: About,
     pub profile_url: String,
-    /// The waiting draft to them, or `None` when one is still to be written.
+    /// The waiting draft to them, or `None` when one is still to be written about a posting.
     pub draft: Option<i64>,
 }
 
 /// The people to send to now. A posting counts once it is scored 75 or more and approved or
-/// applied to; its check's best two people with a profile get a draft. Nobody gets a second
-/// draft once one to them was typed, sent or skipped, about this posting or any other.
+/// applied to; its check's best two people with a profile get a draft. Every waiting hiring-post
+/// draft is sent too, newest first, taking turns with the postings so neither waits on the other.
+/// Nobody gets a second draft once one to them was typed, sent or skipped, about anything.
 pub fn to_reach(
     postings: &[Posting],
     decisions: &HashMap<String, Decision>,
@@ -125,7 +127,7 @@ pub fn to_reach(
             draft.profile_url == profile && !matches!(draft.status, Outreach::Drafted | Outreach::NotStarted)
         })
     };
-    let mut picks = Vec::new();
+    let mut picks: Vec<Pick> = Vec::new();
     for posting in chosen {
         let Some(check) = checks.iter().find(|check| check.posting_link == posting.link) else {
             continue;
@@ -148,14 +150,39 @@ pub fn to_reach(
                     && draft.about == About::Posting(posting.link.clone())
             });
             picks.push(Pick {
-                posting_link: posting.link.clone(),
+                about: About::Posting(posting.link.clone()),
                 profile_url: profile.to_owned(),
                 draft: waiting.map(|draft| draft.id),
             });
         }
     }
-    picks.truncate(room);
-    picks
+    let mut posts: Vec<&Draft> = drafts
+        .iter()
+        .filter(|draft| matches!(draft.about, About::Post(_)) && draft.status == Outreach::Drafted)
+        .collect();
+    posts.sort_by_key(|draft| std::cmp::Reverse(draft.created_at));
+    let mut post_picks: Vec<Pick> = Vec::new();
+    for draft in posts {
+        let taken = |pick: &Pick| pick.profile_url == draft.profile_url;
+        if reached(&draft.profile_url) || picks.iter().any(taken) || post_picks.iter().any(taken) {
+            continue;
+        }
+        post_picks.push(Pick {
+            about: draft.about.clone(),
+            profile_url: draft.profile_url.clone(),
+            draft: Some(draft.id),
+        });
+    }
+    let (mut postings, mut posts) = (picks.into_iter(), post_picks.into_iter());
+    let mut turns = Vec::new();
+    while turns.len() < room {
+        match (postings.next(), posts.next()) {
+            (None, None) => break,
+            (one, other) => turns.extend(one.into_iter().chain(other)),
+        }
+    }
+    turns.truncate(room);
+    turns
 }
 
 /// What one auto-apply outreach run did.
@@ -211,23 +238,26 @@ pub async fn reach(
         if index > 0 {
             tokio::time::sleep(BETWEEN_SENDS.wait(fastrand::f64())).await;
         }
-        let draft = match pick.draft {
-            Some(id) => Store::open(database)
+        let draft = match (pick.draft, &pick.about) {
+            (Some(id), _) => Store::open(database)
                 .and_then(|store| store.draft(id))
                 .map_err(said)?
                 .ok_or("a draft left the database during the run")?,
-            None => match outreach::draft_for_check(database, profile, &pick.posting_link, &pick.profile_url).await {
-                Ok(draft) => draft,
-                Err(why) => {
-                    run.failed.push((pick.profile_url.clone(), format!("no draft: {why}")));
-                    failures += 1;
-                    if failures >= FAILURES_IN_A_ROW {
-                        run.stopped = Some("drafts failed twice in a row".into());
-                        break;
+            (None, About::Post(_)) => return Err("a hiring post was picked without its draft".into()),
+            (None, About::Posting(link)) => {
+                match outreach::draft_for_check(database, profile, link, &pick.profile_url).await {
+                    Ok(draft) => draft,
+                    Err(why) => {
+                        run.failed.push((pick.profile_url.clone(), format!("no draft: {why}")));
+                        failures += 1;
+                        if failures >= FAILURES_IN_A_ROW {
+                            run.stopped = Some("drafts failed twice in a row".into());
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            },
+            }
         };
         let sent = match outreach::check_written(draft.subject.as_deref(), &draft.text, draft.slot) {
             Ok(written) => {
@@ -391,10 +421,57 @@ mod tests {
             .iter()
             .map(|pick| {
                 let handle = pick.profile_url.trim_end_matches('/').rsplit('/').next().unwrap();
-                (pick.posting_link.as_str(), handle, pick.draft)
+                let About::Posting(link) = &pick.about else {
+                    panic!("only postings here")
+                };
+                (link.as_str(), handle, pick.draft)
             })
             .collect();
         assert_eq!(said, [("b", "di", Some(7)), ("a", "bo", None)]);
+    }
+
+    fn post_draft(id: i64, handle: &str, status: Outreach, at: &str) -> Draft {
+        Draft {
+            about: About::Post(format!("https://www.linkedin.com/feed/update/urn:li:activity:{id}/")),
+            ..draft(id, "", handle, status, at)
+        }
+    }
+
+    #[test]
+    fn waiting_hiring_post_drafts_are_sent_newest_first_taking_turns_with_postings() {
+        let postings: Vec<Posting> = (0..3)
+            .map(|n| posting(&format!("p{n}"), 90 - n, Stage::Applied))
+            .collect();
+        let checks: Vec<Check> = (0..3).map(|n| check(&format!("p{n}"), &[&format!("a{n}")])).collect();
+        let drafts = [
+            post_draft(1, "old", Outreach::Drafted, "2026-11-23T18:00:00Z"),
+            post_draft(2, "new", Outreach::Drafted, "2026-11-24T18:00:00Z"),
+            post_draft(3, "gone", Outreach::Skipped, "2026-11-24T19:00:00Z"),
+            post_draft(4, "a1", Outreach::Drafted, "2026-11-24T19:00:00Z"),
+            post_draft(5, "twice", Outreach::Drafted, "2026-11-24T17:00:00Z"),
+            draft(6, "x", "twice", Outreach::Sent, "2026-11-20T18:00:00Z"),
+        ];
+        let picks = to_reach(&postings, &HashMap::new(), &checks, &drafts, NOW.parse().unwrap());
+        let said: Vec<(&str, Option<i64>)> = picks
+            .iter()
+            .map(|pick| {
+                let kind = match pick.about {
+                    About::Posting(_) => "posting",
+                    About::Post(_) => "post",
+                };
+                (kind, pick.draft)
+            })
+            .collect();
+        // A1 is reached about the posting, so the post draft to them waits; Twice was already sent to.
+        assert_eq!(
+            said,
+            [
+                ("posting", None),
+                ("post", Some(2)),
+                ("posting", None),
+                ("post", Some(1))
+            ]
+        );
     }
 
     #[test]
