@@ -2,8 +2,9 @@
 //!
 //! LinkedIn restricts accounts that load many pages, so every page goes through `Visits`:
 //! a cap per run and a random wait between loads. Maverick reads a company's People page
-//! and the hiring-post search, never general people search. It opens a profile only to type a
-//! draft the user approved, or to read what an InMail costs when the user asks for a draft.
+//! and the hiring-post search. It runs a people search only for one person the user asked to
+//! reach whose profile link is unknown. It opens a profile only to type a draft the user approved,
+//! or to read what an InMail costs when the user asks for a draft.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -247,6 +248,46 @@ pub struct PeoplePage {
 /// plain list and picks people from it. `slug` is the company's part of its page address.
 pub fn people_address(slug: &str) -> String {
     format!("{SITE}/company/{slug}/people/")
+}
+
+/// LinkedIn's people search for `keywords`, such as a person's name and company.
+pub fn people_search_address(keywords: &str) -> String {
+    format!("{SITE}/search/results/people/?keywords={}", encoded(keywords))
+}
+
+/// The first person in `people` whose name is `wanted`. Extra words such as a middle name or a
+/// credential are allowed, a nickname in brackets is left out, and a word the wanted name shortens
+/// to an initial, as in "Ashish S.", fits any word with that initial.
+pub fn named_in(people: &[Person], wanted: &str) -> Option<Person> {
+    let words = |name: &str| -> Vec<String> {
+        name.split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    // A nickname in brackets, as in "Yao (Jason) Lu", is often not on the card.
+    let mut plain = String::new();
+    let mut depth = 0;
+    for ch in wanted.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth <= 0 => plain.push(ch),
+            _ => {}
+        }
+    }
+    let wanted = words(&plain);
+    let fits = |person: &&Person| {
+        let found = words(&person.name);
+        let mut rest = found.iter();
+        found.first() == wanted.first()
+            && wanted.iter().all(|word| {
+                rest.any(|have| have == word || (word.chars().count() == 1 && have.starts_with(word.as_str())))
+            })
+    };
+    (!wanted.is_empty())
+        .then(|| people.iter().find(fits).cloned())
+        .flatten()
 }
 
 /// The LinkedIn company pages a web page links to, as slugs, the most linked first. A posting page
@@ -1161,6 +1202,33 @@ First Name,Last Name,URL,Email Address,Company,Position,Connected On\n\
 Ada,Example,https://www.linkedin.com/in/ada-example-1a2b3c,,Example Co,\"Software Engineer, Storage\",15 Nov 2026\n\
 Bo,Sample,https://www.linkedin.com/in/bo-sample?trk=x,bo@sample.test,Sample Inc,\"Recruiter, \"\"Tech\"\"\",02 Jan 2025\n\
 Cy,Nolink,,,Other LLC,Engineer,\n";
+
+    #[test]
+    fn a_name_fits_with_extra_words_and_initials_but_not_another_first_name() {
+        let person = |name: &str| Person {
+            name: name.into(),
+            title: String::new(),
+            profile_url: Some(format!("https://www.linkedin.com/in/{}/", name.replace(' ', "-"))),
+            degree: None,
+        };
+        let people = [
+            person("Ashley Sharma"),
+            person("Ashish Kumar Sharma, PhD"),
+            person("Felix Schäfer"),
+            person("Yao Lu"),
+        ];
+        let found = |wanted: &str| named_in(&people, wanted).map(|person| person.name);
+        assert_eq!(found("Ashish S.").as_deref(), Some("Ashish Kumar Sharma, PhD"));
+        assert_eq!(found("Ashish Sharma").as_deref(), Some("Ashish Kumar Sharma, PhD"));
+        assert_eq!(found("felix schäfer").as_deref(), Some("Felix Schäfer"));
+        assert_eq!(found("Yao (Jason) Lu").as_deref(), Some("Yao Lu"));
+        assert_eq!(found("Sharma"), None);
+        assert_eq!(found("Ashish Patel"), None);
+        assert_eq!(
+            people_search_address("Felix Schäfer Clera"),
+            "https://www.linkedin.com/search/results/people/?keywords=Felix%20Sch%C3%A4fer%20Clera"
+        );
+    }
 
     #[test]
     fn the_connections_export_is_read_past_its_notes() {
