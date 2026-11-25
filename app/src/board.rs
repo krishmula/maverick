@@ -16,10 +16,11 @@ use crate::report;
 use crate::tabs::host_of;
 use crate::ui::{self, Palette, Signal};
 use crate::verdict::Verdict;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::{IndexPath, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable as _,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
@@ -276,6 +277,53 @@ impl CompanyFilter {
     }
 }
 
+/// What the search box asks for. Commas separate alternatives, and every word of one
+/// alternative must appear in a posting's company, title, location or application system.
+/// "amazon, apple ml" finds Amazon postings and Apple postings that mention ML.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Search(Vec<Vec<String>>);
+
+impl Search {
+    pub fn new(text: &str) -> Self {
+        Self(
+            text.split(',')
+                .map(|alternative| {
+                    alternative
+                        .split_whitespace()
+                        .map(str::to_lowercase)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|words| !words.is_empty())
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn finds(&self, text: &str) -> bool {
+        let text = text.to_lowercase();
+        self.is_empty() || self.0.iter().any(|words| words.iter().all(|word| text.contains(word)))
+    }
+
+    pub fn finds_entry(&self, entry: &Entry) -> bool {
+        let location = entry.location.as_deref().unwrap_or_default();
+        self.finds(&format!(
+            "{} {} {location} {}",
+            entry.company,
+            entry.title,
+            entry.system()
+        ))
+    }
+
+    pub fn finds_application(&self, sent: &Application) -> bool {
+        let role = sent.role.as_deref().unwrap_or_default();
+        let host = sent.link.as_deref().map(host_of).unwrap_or_default();
+        self.finds(&format!("{role} {host}"))
+    }
+}
+
 /// Which list the board shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
@@ -287,11 +335,15 @@ pub struct Rows {
     browser: Entity<Browser>,
     outreach: Entity<OutreachView>,
     section: Section,
-    /// The pending postings the company filter shows.
+    /// The pending postings the company filter and the search show.
     entries: Vec<Entry>,
-    /// The pending postings the company filter keeps out.
+    /// The pending postings the company filter or the search keeps out.
     filtered_out: Vec<Entry>,
+    /// The applications the search shows.
     submitted: Vec<Application>,
+    /// The applications the search keeps out.
+    submitted_out: Vec<Application>,
+    search: Search,
     selected: Option<IndexPath>,
 }
 
@@ -301,11 +353,19 @@ impl Rows {
         self.entries.iter().chain(&self.filtered_out)
     }
 
-    /// Splits the postings again into those `filter` shows and those it keeps out.
+    /// Splits the postings again into those `filter` and the search show and those they keep out,
+    /// and the applications into those the search shows and the rest. A search looks past `filter`,
+    /// since typing a company's name asks for it even when it is hidden.
     fn refilter(&mut self, filter: &CompanyFilter) {
         let mut all = std::mem::take(&mut self.entries);
         all.append(&mut self.filtered_out);
-        (self.entries, self.filtered_out) = all.into_iter().partition(|entry| filter.shows(&entry.company));
+        let search = &self.search;
+        (self.entries, self.filtered_out) = all
+            .into_iter()
+            .partition(|entry| (!search.is_empty() || filter.shows(&entry.company)) && search.finds_entry(entry));
+        let mut sent = std::mem::take(&mut self.submitted);
+        sent.append(&mut self.submitted_out);
+        (self.submitted, self.submitted_out) = sent.into_iter().partition(|sent| search.finds_application(sent));
     }
 
     fn shown(&self) -> usize {
@@ -489,9 +549,12 @@ impl ListDelegate for Rows {
     }
 
     fn render_empty(&mut self, _: &mut Window, cx: &mut Context<ListState<Self>>) -> impl IntoElement {
+        let searching = !self.search.is_empty();
         let message = match self.section {
+            Section::Pending if searching && !self.filtered_out.is_empty() => "No posting matches the search.",
             Section::Pending if !self.filtered_out.is_empty() => "The company filter hides every posting.",
             Section::Pending => "Nothing waits on a decision. New postings arrive with the hourly check.",
+            Section::Submitted if searching && !self.submitted_out.is_empty() => "No application matches the search.",
             Section::Submitted => "No applications are recorded yet.",
         };
         ui::serif(message).p_4().text_color(Palette::of(cx).muted)
@@ -511,6 +574,8 @@ pub struct Board {
     order: Order,
     submitted_order: SubmittedOrder,
     filter: CompanyFilter,
+    /// The search box over both lists.
+    search: Entity<InputState>,
     /// Where the hidden companies are saved.
     filter_file: Option<PathBuf>,
     /// Each decision made in this run, newest last, with the decision it replaced.
@@ -541,10 +606,30 @@ impl Board {
             entries: Vec::new(),
             filtered_out: Vec::new(),
             submitted: Vec::new(),
+            submitted_out: Vec::new(),
+            search: Search::default(),
             selected: None,
         };
         let list = cx.new(|cx| ListState::new(rows, window, cx));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search: amazon, apple")
+                .clean_on_escape()
+        });
         let _subscriptions = vec![
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => {
+                        let text = input.read(cx).value();
+                        this.set_search(Search::new(&text), window, cx);
+                    }
+                    // Enter hands the keys back to the list, so a and s decide the postings found.
+                    InputEvent::PressEnter { .. } => this.focus(window, cx),
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(&list, window, |this, _, event: &ListEvent, _, cx| {
                 // Enter on a posting with an open tab brings the tab forward.
                 if let ListEvent::Confirm(_) = event {
@@ -564,6 +649,7 @@ impl Board {
             .and_then(|database| Some(database.parent()?.join("company-filter.json")));
         let mut board = Self {
             filter: CompanyFilter::load(filter_file.as_deref()),
+            search,
             filter_file,
             browser,
             outreach,
@@ -591,8 +677,9 @@ impl Board {
             let rows = list.delegate_mut();
             rows.entries = data.entries;
             rows.filtered_out.clear();
-            rows.refilter(&filter);
             rows.submitted = data.applications;
+            rows.submitted_out.clear();
+            rows.refilter(&filter);
             sort(&mut rows.entries, order, &reachable);
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
@@ -679,6 +766,25 @@ impl Board {
             select_row(list, row, window, cx);
         });
         cx.notify();
+    }
+
+    /// Shows the postings and applications `search` finds, in the section on screen.
+    fn set_search(&mut self, search: Search, window: &mut Window, cx: &mut Context<Self>) {
+        let (order, submitted_order, filter) = (self.order, self.submitted_order, self.filter.clone());
+        let reachable = self.outreach.read(cx).reachable();
+        self.list.update(cx, |list, cx| {
+            let rows = list.delegate_mut();
+            rows.search = search;
+            rows.refilter(&filter);
+            sort(&mut rows.entries, order, &reachable);
+            sort_submitted(&mut rows.submitted, submitted_order);
+            select_row(list, 0, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |search, cx| search.focus(window, cx));
     }
 
     /// Keeps the selected posting's company out of the list. The selection lands on the next posting.
@@ -781,7 +887,7 @@ impl Board {
             cx.notify();
             return;
         }
-        let submitted_order = self.submitted_order;
+        let (submitted_order, filter) = (self.submitted_order, self.filter.clone());
         self.list.update(cx, |list, cx| {
             let row = list.selected_index().map_or(0, |ix| ix.row);
             let rows = list.delegate_mut();
@@ -791,6 +897,7 @@ impl Board {
                 rows.submitted
                     .push(Application::submitted_today(&sent.title, &sent.address));
             }
+            rows.refilter(&filter);
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, row, window, cx);
         });
@@ -921,14 +1028,17 @@ impl Board {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Letters typed into a draft are text, not decisions.
-        if self.outreach.read(cx).is_editing() {
+        // Letters typed into a draft or the search are text, not decisions.
+        let searching = self.search.read(cx).focus_handle(cx).is_focused(window);
+        if self.outreach.read(cx).is_editing() || searching {
             return;
         }
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
             "z" if modifiers.platform => self.undo(window, cx),
+            "f" if modifiers.platform => self.focus_search(window, cx),
             _ if modifiers.modified() => return,
+            "/" => self.focus_search(window, cx),
             "a" => self.decide(Decision::Approved, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
             "o" => self.open_selected(cx),
@@ -1024,10 +1134,11 @@ impl Board {
             return None;
         }
         let rows = self.list.read(cx).delegate();
+        let searching = !rows.search.is_empty();
         let out = rows
             .filtered_out
             .iter()
-            .filter(|entry| entry.decision.is_none())
+            .filter(|entry| entry.decision.is_none() && !self.filter.shows(&entry.company))
             .count();
         let unset = |id: ElementId, name: String, word: String, filter: CompanyFilter| {
             ui::button(id, name, ui::quiet_face(format!("{word} ×"), palette))
@@ -1078,14 +1189,19 @@ impl Board {
                 .child(ui::caps(label).text_color(palette.faint))
                 .children(parts)
                 .child(div().flex_1())
-                .child(
-                    ui::caps(format!("{out} pending hidden"))
+                .child({
+                    let said = if searching {
+                        "the search looks past this".to_owned()
+                    } else {
+                        format!("{out} pending hidden")
+                    };
+                    ui::caps(said.clone())
                         .id("filtered-out")
                         .test_support()
                         .role(gpui_kit::Role::Label)
-                        .aria_label(format!("{out} pending hidden"))
-                        .text_color(palette.faint),
-                )
+                        .aria_label(said)
+                        .text_color(palette.faint)
+                })
                 .children((self.filter.hidden.len() > 1 || self.filter.only.is_some()).then(|| {
                     ui::button(
                         "show-all-companies",
@@ -1516,13 +1632,27 @@ impl Render for Board {
                     .min_h_0()
                     .items_start()
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .border_r_1()
                             .border_color(palette.line)
-                            .child(List::new(&self.list)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .border_b_1()
+                                    .border_color(palette.line)
+                                    .child(
+                                        Input::new(&self.search)
+                                            .id("job-search")
+                                            .aria_label("Search postings and applications")
+                                            .cleanable(true),
+                                    ),
+                            )
+                            .child(div().flex_1().min_h_0().child(List::new(&self.list))),
                     )
                     .child(
                         div()
@@ -1700,6 +1830,32 @@ mod tests {
             CompanyFilter::load(Some(&scratch.path().join("none.json"))),
             CompanyFilter::default()
         );
+    }
+
+    #[test]
+    fn a_search_finds_any_alternative_and_every_word_of_one() {
+        let (postings, applications) = sample();
+        let entries = BoardData::new(&postings, applications.clone(), &HashMap::new()).entries;
+        let found = |text: &str| {
+            let search = Search::new(text);
+            entries
+                .iter()
+                .filter(|entry| search.finds_entry(entry))
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("").len(), entries.len());
+        assert_eq!(found(" , ").len(), entries.len());
+        assert_eq!(found("MIDDLING"), ["Middling"]);
+        assert_eq!(found("ready, middling").len(), 3);
+        assert_eq!(found("example ready not"), ["High but not ready"]);
+        assert_eq!(found("austin simplify unscored"), ["Unscored"]);
+        assert!(found("nowhere inc").is_empty());
+
+        let sent = Application::submitted_today("Engineer at Example Co", "https://jobs.lever.co/example/1");
+        assert!(Search::new("example co, apple").finds_application(&sent));
+        assert!(Search::new("lever.co").finds_application(&sent));
+        assert!(!Search::new("apple").finds_application(&sent));
     }
 
     #[test]
@@ -1990,7 +2146,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(shown(cx, &board).0, "Big one, Big two, Small one, Third one");
+
+        // The search narrows the list as the user types, and letters typed there decide nothing.
+        cx.update_window(window, |_, window, cx| {
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("/", cx);
+            window.input("small, third", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(
+            shown(cx, &board),
+            ("Small one, Third one".into(), Some("Small one".into()), 4)
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            window.input("third inc a", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board), ("Third one".into(), Some("Third one".into()), 4));
+        cx.update_window(window, |_, window, cx| {
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.press("s", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board), ("Third one".into(), Some("Third one".into()), 3));
+        cx.update_window(window, |_, window, cx| {
+            window.press("cmd-f", cx);
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board).0, "Big one, Big two, Small one, Third one");
         let saved = std::fs::read_to_string(scratch.path().join("company-filter.json")).unwrap();
         assert!(!saved.contains("Big Corp"), "{saved}");
+
+        // A search looks past hidden companies, since typing a name asks for that company.
+        cx.update_window(window, |_, window, cx| {
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("h", cx);
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board).0, "Small one, Third one");
+        cx.update_window(window, |_, window, cx| {
+            window.press("/", cx);
+            window.input("big two", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("filtered-out").label(), Some("the search looks past this"));
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board).0, "Big two");
     }
 }
