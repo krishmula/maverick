@@ -5,6 +5,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::amazon;
 use crate::answers::{Answer, Answers, Kind, Question, Role, Unanswered};
 use crate::ashby;
 use crate::greenhouse;
@@ -25,6 +26,7 @@ pub enum System {
     Greenhouse,
     Workday,
     Icims,
+    Amazon,
 }
 
 impl System {
@@ -35,6 +37,7 @@ impl System {
             .or_else(|| greenhouse::is_posting(address).then_some(Self::Greenhouse))
             .or_else(|| workday::is_posting(address).then_some(Self::Workday))
             .or_else(|| icims::is_posting(address).then_some(Self::Icims))
+            .or_else(|| amazon::is_posting(address).then_some(Self::Amazon))
     }
 
     /// The posting's address without anything a tracker or a campaign added to it.
@@ -44,6 +47,7 @@ impl System {
             Self::Greenhouse => greenhouse::posting_address(address),
             Self::Workday => workday::posting_address(address),
             Self::Icims => icims::posting_address(address),
+            Self::Amazon => amazon::posting_address(address),
         }
     }
 
@@ -54,6 +58,7 @@ impl System {
             Self::Greenhouse => greenhouse::form_address(address),
             Self::Workday => workday::form_address(address),
             Self::Icims => icims::form_address(address),
+            Self::Amazon => amazon::form_address(address),
         }
     }
 
@@ -64,6 +69,7 @@ impl System {
             Self::Greenhouse => greenhouse::SUBMITTED,
             Self::Workday => workday::SUBMITTED,
             Self::Icims => icims::SUBMITTED,
+            Self::Amazon => amazon::SUBMITTED,
         }
     }
 
@@ -73,6 +79,7 @@ impl System {
             Self::Greenhouse => "Greenhouse",
             Self::Workday => "Workday",
             Self::Icims => "iCIMS",
+            Self::Amazon => "Amazon",
         }
     }
 
@@ -86,7 +93,7 @@ impl System {
                     return button?.textContent.trim().toLowerCase() === "submit" && !button.disabled ? button : null;
                 })()"#
             }
-            Self::Icims => "null",
+            Self::Icims | Self::Amazon => "null",
             Self::Ashby | Self::Greenhouse => {
                 r#"(() => {
                     const found = [...document.querySelectorAll("button")].filter((button) =>
@@ -112,12 +119,12 @@ impl System {
     /// Call this only for a report that `Report::held_for_the_user` lets through. It never
     /// presses twice: a press that is not confirmed is left for the user to look at.
     pub async fn submit(self, page: &Page) -> Result<Sent, FillError> {
-        if self == Self::Icims {
-            return Ok(Sent::Unconfirmed(
-                "Maverick filled the iCIMS application up to its last step. It leaves the submit on iCIMS to you \
-                 until it has seen iCIMS confirm one. Submit it in the tab."
-                    .to_owned(),
-            ));
+        if matches!(self, Self::Icims | Self::Amazon) {
+            let name = self.name();
+            return Ok(Sent::Unconfirmed(format!(
+                "Maverick filled the {name} application up to its last step. It leaves the submit on {name} to you \
+                 until it has seen {name} confirm one. Submit it in the tab."
+            )));
         }
         let button = self.submit_button();
         if !self
@@ -191,6 +198,7 @@ impl System {
             Self::Greenhouse => greenhouse::fill(page, answers).await,
             Self::Workday => workday::fill(page, answers).await,
             Self::Icims => icims::fill(page, answers).await,
+            Self::Amazon => amazon::fill(page, answers).await,
         }
     }
 }

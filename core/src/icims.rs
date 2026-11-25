@@ -505,7 +505,7 @@ async fn refused(page: &Page, at: u32) -> Result<Vec<String>, FillError> {
         }
     }
     Ok(vec![format!(
-        "the page did not move on within {} seconds. Look at the tab before you click Fill form again.",
+        "the page did not move on within {} seconds. Look at the tab before you click Fill form again",
         SCREEN_WAIT.as_secs()
     )])
 }

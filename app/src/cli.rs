@@ -925,10 +925,15 @@ pub fn gaps(limit: usize, show_answers: bool) -> Result<(), Box<dyn Error>> {
     let workday = board
         .entries
         .iter()
-        .filter(|entry| matches!(System::of(&entry.address), Some(System::Workday | System::Icims)))
+        .filter(|entry| {
+            matches!(
+                System::of(&entry.address),
+                Some(System::Workday | System::Icims | System::Amazon)
+            )
+        })
         .count();
     println!(
-        "{} open postings on Ashby and Greenhouse, {} rehearsed now. {workday} on Workday and iCIMS are left out: \
+        "{} open postings on Ashby and Greenhouse, {} rehearsed now. {workday} on Workday, iCIMS and Amazon are left out: \
          they show their questions only to a signed-in tab.",
         open.len(),
         open.len().min(limit)
