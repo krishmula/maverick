@@ -1043,7 +1043,10 @@ pub async fn type_draft(
     resume: Option<&Path>,
 ) -> Result<Typed, String> {
     let page = open_profile_tab(bridge, profile_url).await?;
-    let typed = type_in(&page, profile_url, slot, subject, text, resume).await;
+    let typed = match land(&page, profile_url).await {
+        Ok(()) => type_in(&page, slot, subject, text, resume).await,
+        Err(why) => Err(why),
+    };
     // The debugging bar goes away; the dialog and the typed draft stay for the user.
     let _ = page.detach().await;
     typed
@@ -1075,12 +1078,15 @@ pub enum Delivery {
     Sent,
     /// Send was pressed, but the page did not show the draft as sent. The tab stays open.
     Unconfirmed(String),
+    /// Nothing was typed or sent: the profile's location, given here, is outside the US.
+    OutsideUs(String),
 }
 
 /// How long LinkedIn may take to show a sent draft, with an attached resume still uploading.
 const SEND_WAIT: Duration = Duration::from_secs(30);
 
-/// Types a draft like `type_draft`, presses Send, and checks the page shows it sent. A sent draft's
+/// Types a draft like `type_draft`, presses Send, and checks the page shows it sent. A person whose
+/// profile is outside the US gets nothing. A sent draft's
 /// tab closes; any other stays open for the user. An error means Send was never pressed.
 pub async fn send_draft(
     bridge: Arc<Bridge>,
@@ -1092,7 +1098,22 @@ pub async fn send_draft(
 ) -> Result<(Typed, Delivery), String> {
     let page = open_profile_tab(bridge, profile_url).await?;
     let sent = async {
-        let typed = type_in(&page, profile_url, slot, subject, text, resume).await?;
+        land(&page, profile_url).await?;
+        let location = page
+            .evaluate(PROFILE_LOCATION)
+            .await
+            .map_err(|error| error.to_string())?;
+        let location = location
+            .as_str()
+            .ok_or("the profile shows no location, so Maverick could not tell whether this person is in the US")?;
+        if !is_in_us(location) {
+            let typed = Typed {
+                resume: Resume::NotAsked,
+                credits: None,
+            };
+            return Ok((typed, Delivery::OutsideUs(location.to_owned())));
+        }
+        let typed = type_in(&page, slot, subject, text, resume).await?;
         // The Send button stays disabled while the resume uploads.
         let send = send_button(slot);
         page.wait_for(&send, SEND_WAIT)
@@ -1104,7 +1125,7 @@ pub async fn send_draft(
         Ok::<_, String>((typed, confirm_sent(&page, slot, text).await))
     }
     .await;
-    if let Ok((_, Delivery::Sent)) = &sent {
+    if let Ok((_, Delivery::Sent | Delivery::OutsideUs(_))) = &sent {
         let _ = page.send("Page.close", json!({})).await;
     }
     let _ = page.detach().await;
@@ -1210,14 +1231,8 @@ async fn attach(page: &Page, resume: Option<&Path>) -> Resume {
     }
 }
 
-async fn type_in(
-    page: &Page,
-    profile_url: &str,
-    slot: Slot,
-    subject: Option<&str>,
-    text: &str,
-    resume: Option<&Path>,
-) -> Result<Typed, String> {
+/// Loads the profile and waits for LinkedIn to make its buttons work.
+async fn land(page: &Page, profile_url: &str) -> Result<(), String> {
     let said = |error: PageError| error.to_string();
     page.navigate(profile_url).await.map_err(said)?;
     let landed = page.evaluate("location.href").await.map_err(said)?;
@@ -1227,6 +1242,158 @@ async fn type_in(
     // LinkedIn wires its buttons up after the load event. Clicked before that, Connect is a plain
     // link back to the profile, so the click reloads the page and no dialog opens.
     tokio::time::sleep(SETTLE).await;
+    Ok(())
+}
+
+/// The location on the profile's top card, the text next to "Contact info", such as
+/// `Austin, Texas, United States`.
+const PROFILE_LOCATION: &str = r#"(() => {
+    const contact = document.querySelector("a[href*='/overlay/contact-info']");
+    for (let box = contact && contact.parentElement; box && box !== document.body; box = box.parentElement) {
+        const text = box.innerText.replace(/Contact info/g, "").replace(/[·•]/g, " ").replace(/\s+/g, " ").trim();
+        if (text) return text;
+    }
+    return null;
+})()"#;
+
+/// US states and the District of Columbia, in lower case.
+const US_STATES: &[&str] = &[
+    "alabama",
+    "alaska",
+    "arizona",
+    "arkansas",
+    "california",
+    "colorado",
+    "connecticut",
+    "delaware",
+    "district of columbia",
+    "florida",
+    "georgia",
+    "hawaii",
+    "idaho",
+    "illinois",
+    "indiana",
+    "iowa",
+    "kansas",
+    "kentucky",
+    "louisiana",
+    "maine",
+    "maryland",
+    "massachusetts",
+    "michigan",
+    "minnesota",
+    "mississippi",
+    "missouri",
+    "montana",
+    "nebraska",
+    "nevada",
+    "new hampshire",
+    "new jersey",
+    "new mexico",
+    "new york",
+    "north carolina",
+    "north dakota",
+    "ohio",
+    "oklahoma",
+    "oregon",
+    "pennsylvania",
+    "rhode island",
+    "south carolina",
+    "south dakota",
+    "tennessee",
+    "texas",
+    "utah",
+    "vermont",
+    "virginia",
+    "washington",
+    "west virginia",
+    "wisconsin",
+    "wyoming",
+];
+
+/// Cities in the names of LinkedIn's US metro areas, such as `San Francisco Bay Area` or
+/// `Greater Seattle Area`, which name no state.
+const US_METROS: &[&str] = &[
+    "san francisco",
+    "bay area",
+    "silicon valley",
+    "san jose",
+    "seattle",
+    "new york",
+    "boston",
+    "los angeles",
+    "chicago",
+    "dallas",
+    "fort worth",
+    "washington dc",
+    "baltimore",
+    "atlanta",
+    "houston",
+    "denver",
+    "austin",
+    "philadelphia",
+    "miami",
+    "minneapolis",
+    "phoenix",
+    "salt lake city",
+    "raleigh",
+    "durham",
+    "san diego",
+    "sacramento",
+    "detroit",
+    "pittsburgh",
+    "st. louis",
+    "nashville",
+    "orlando",
+    "charlotte",
+    "kansas city",
+    "cleveland",
+    "tampa",
+    "las vegas",
+    "indianapolis",
+    "cincinnati",
+    "milwaukee",
+    "new orleans",
+    "boise",
+    "honolulu",
+    "omaha",
+    "albuquerque",
+    "louisville",
+    "memphis",
+    "jacksonville",
+    "provo",
+    "san antonio",
+];
+
+/// True when a profile's location is in the United States. A location that names another country
+/// last, such as `Toronto, Ontario, Canada`, is not.
+pub fn is_in_us(location: &str) -> bool {
+    let lower = location.to_lowercase();
+    if lower.contains("united states") || lower.split(',').any(|part| part.trim() == "us" || part.trim() == "usa") {
+        return true;
+    }
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '.')
+        .filter(|word| !word.is_empty())
+        .collect();
+    let joined = format!(" {} ", words.join(" "));
+    let names = |list: &[&str]| list.iter().any(|name| joined.contains(&format!(" {name} ")));
+    // `Tbilisi, Georgia` names the country; LinkedIn adds `United States` after a US state.
+    let last = lower.rsplit(',').next().unwrap_or_default().trim().to_owned();
+    if lower.contains(',') && last == "georgia" {
+        return false;
+    }
+    names(US_STATES) || names(US_METROS)
+}
+
+async fn type_in(
+    page: &Page,
+    slot: Slot,
+    subject: Option<&str>,
+    text: &str,
+    resume: Option<&Path>,
+) -> Result<Typed, String> {
+    let said = |error: PageError| error.to_string();
     let found = |control: Control| async move {
         page.wait_for(&control.locator(), STEP_WAIT)
             .await
@@ -1327,6 +1494,33 @@ async fn type_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_profiles_located_in_the_us_count_as_in_the_us() {
+        for here in [
+            "Austin, Texas, United States",
+            "San Francisco Bay Area",
+            "Greater Seattle Area",
+            "New York City Metropolitan Area",
+            "Washington DC-Baltimore Area",
+            "Atlanta, Georgia, United States",
+            "Portland, Oregon Metropolitan Area",
+            "United States",
+        ] {
+            assert!(is_in_us(here), "{here}");
+        }
+        for abroad in [
+            "Bengaluru, Karnataka, India",
+            "Toronto, Ontario, Canada",
+            "London Area, United Kingdom",
+            "Greater Sydney Area",
+            "Tbilisi, Georgia",
+            "Mexico City, Mexico",
+            "Hyderabad, Telangana, India",
+        ] {
+            assert!(!is_in_us(abroad), "{abroad}");
+        }
+    }
 
     const CONNECTIONS: &str = "Notes:\n\
 \"When exporting your connection data, you may notice that some of the email addresses are missing.\"\n\

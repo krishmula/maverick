@@ -6,6 +6,9 @@ use maverick_core::bridge::Tab;
 /// How many forms fill at once unless the user picks another number.
 pub const DEFAULT_PARALLEL: usize = 3;
 pub const MOST_PARALLEL: usize = 8;
+/// The most tabs the queue keeps open at once, filling or waiting on the user. Past it, no
+/// new form opens until the user submits or closes one, so a long queue cannot swamp Chrome.
+pub const MOST_OPEN_TABS: usize = 8;
 
 /// Where one queued application is.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,9 +133,14 @@ impl Queue {
             .retain(|run| !(run.address == address && run.step == Step::Queued));
     }
 
-    /// Moves waiting runs to `Opening` while slots are free, and returns their addresses.
+    /// Moves waiting runs to `Opening` while slots are free and fewer than `MOST_OPEN_TABS`
+    /// tabs are open, and returns their addresses.
     pub fn start_next(&mut self) -> Vec<String> {
-        let mut free = self.parallel.saturating_sub(self.running());
+        let open = self.running() + self.waiting_on_you();
+        let mut free = self
+            .parallel
+            .saturating_sub(self.running())
+            .min(MOST_OPEN_TABS.saturating_sub(open));
         let mut started = Vec::new();
         for run in &mut self.runs {
             if free == 0 {
@@ -145,6 +153,14 @@ impl Queue {
             }
         }
         started
+    }
+
+    /// Runs whose tab waits on the user.
+    pub fn waiting_on_you(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|run| matches!(run.step, Step::Ready | Step::NeedsYou(_)))
+            .count()
     }
 
     pub fn running(&self) -> usize {
@@ -218,6 +234,24 @@ mod tests {
         assert_eq!(queue.start_next(), ["b"]);
         queue.set_parallel(0);
         assert_eq!(queue.parallel(), 1);
+    }
+
+    #[test]
+    fn no_new_form_opens_while_too_many_tabs_wait_on_the_user() {
+        let mut queue = Queue::new(3);
+        for id in 0..MOST_OPEN_TABS + 2 {
+            queue.add(format!("Job {id}"), id.to_string());
+        }
+        for _ in 0..MOST_OPEN_TABS {
+            for address in queue.start_next() {
+                queue.get_mut(&address).unwrap().step = Step::Ready;
+            }
+        }
+        assert_eq!(queue.waiting_on_you(), MOST_OPEN_TABS);
+        assert!(queue.start_next().is_empty());
+
+        queue.get_mut("0").unwrap().step = Step::Applied;
+        assert_eq!(queue.start_next(), [MOST_OPEN_TABS.to_string()]);
     }
 
     #[test]

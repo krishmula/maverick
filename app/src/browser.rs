@@ -65,8 +65,6 @@ pub struct Browser {
     fill: Fill,
     subject: Option<Subject>,
     queue: Queue,
-    /// True when Maverick submits a form itself once nothing in it is left for the user.
-    auto_submit: bool,
     /// The tab the last finished fill left its form in.
     filled_tab: Option<Tab>,
     state: BrowserState,
@@ -94,7 +92,6 @@ impl Browser {
             }
         });
         let queue = Queue::new(saved_parallel(database.as_deref()));
-        let auto_submit = saved_auto_submit(database.as_deref());
         let mut browser = Self {
             state: bridge.state(),
             bridge,
@@ -109,7 +106,6 @@ impl Browser {
             fill: Fill::Idle,
             subject: None,
             queue,
-            auto_submit,
             filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
@@ -250,7 +246,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
-            self.auto_submit,
+            self.auto_submit(),
             |_| {},
         ));
         cx.spawn(async move |this, cx| {
@@ -298,7 +294,7 @@ impl Browser {
         let (bridge, database) = (self.bridge.clone(), self.database.clone());
         let recorded = self.background.spawn(async move {
             let confirmation = system.submitted();
-            if !submitted(
+            let watched = submitted(
                 &bridge,
                 tab.connection,
                 tab.tab.id,
@@ -306,18 +302,36 @@ impl Browser {
                 SUBMIT_CHECK_GAP,
                 SUBMIT_WATCH,
             )
-            .await
-            {
-                return None;
+            .await;
+            match watched {
+                Watched::Submitted => Some(Ok(applied(database, title, address).await)),
+                Watched::Gone => Some(Err(address)),
+                Watched::TimedOut => None,
             }
-            Some(applied(database, title, address).await)
         });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Some(applied)) = recorded.await {
+        cx.spawn(async move |this, cx| match recorded.await {
+            Ok(Some(Ok(applied))) => {
                 this.update(cx, |this, cx| this.note_applied(applied, cx)).ok();
             }
+            Ok(Some(Err(address))) => {
+                this.update(cx, |this, cx| this.note_closed(&address, cx)).ok();
+            }
+            _ => {}
         })
         .detach();
+    }
+
+    /// A tab that waited on the user closed without the application going through. Its run lets
+    /// go of its place among the open tabs, so the queue moves on.
+    fn note_closed(&mut self, address: &str, cx: &mut Context<Self>) {
+        if let Some(run) = self.queue.get_mut(address)
+            && matches!(run.step, Step::Ready | Step::NeedsYou(_))
+        {
+            run.step = Step::Failed("The tab closed before the application went through.".into());
+            run.tab = None;
+        }
+        self.pump(cx);
+        cx.notify();
     }
 
     fn note_applied(&mut self, applied: Applied, cx: &mut Context<Self>) {
@@ -358,21 +372,10 @@ impl Browser {
         cx.notify();
     }
 
-    /// True when Maverick submits a form itself once nothing in it is left for the user.
+    /// True when Maverick submits a form itself once nothing in it is left for the user: the
+    /// auto-apply switch in Connections is on.
     pub fn auto_submit(&self) -> bool {
-        self.auto_submit
-    }
-
-    /// Turns auto-submit on or off for the fills that start from now on. The choice is kept
-    /// next to the database.
-    pub fn set_auto_submit(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.auto_submit = on;
-        if let Some(file) = auto_submit_file(self.database.as_deref())
-            && let Err(error) = std::fs::write(&file, if on { "on" } else { "off" })
-        {
-            eprintln!("maverick: could not save {}: {error}", file.display());
-        }
-        cx.notify();
+        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
 
     /// How many forms fill at once. The number is kept next to the database.
@@ -420,7 +423,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
-            self.auto_submit,
+            self.auto_submit(),
             move |step| {
                 // The receiver goes away only with the window.
                 let _ = sender.send(step);
@@ -452,6 +455,9 @@ impl Browser {
                             run.report = Some(filled.report);
                         }
                         if filled.sent == Some(Sent::Confirmed) {
+                            if let Some(run) = this.queue.get_mut(&address) {
+                                run.tab = None;
+                            }
                             this.record_sent(title.clone(), address.clone(), cx);
                         }
                         Some((filled.system, filled.tab))
@@ -547,8 +553,18 @@ struct Filled {
     address: String,
 }
 
-/// True once the tab shows the element at `confirmation`, which an application system shows
-/// after a submission. False when the tab closes, Chrome goes away, or `limit` passes first.
+/// How a watch on a tab for a submission ended.
+#[derive(Debug, PartialEq)]
+enum Watched {
+    /// The tab showed the system's confirmation.
+    Submitted,
+    /// The tab closed or Chrome went away.
+    Gone,
+    TimedOut,
+}
+
+/// Watches the tab until it shows the element at `confirmation`, which an application system
+/// shows after a submission, the tab goes away, or `limit` passes.
 async fn submitted(
     bridge: &Bridge,
     connection: ConnectionId,
@@ -556,7 +572,7 @@ async fn submitted(
     confirmation: &str,
     gap: Duration,
     limit: Duration,
-) -> bool {
+) -> Watched {
     let check = Command::HasElement {
         tab_id,
         selector: confirmation.to_owned(),
@@ -565,25 +581,13 @@ async fn submitted(
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(gap).await;
         match bridge.request(connection, &check).await {
-            Ok(shown) if shown == true => return true,
+            Ok(shown) if shown == true => return Watched::Submitted,
             // A slow answer says nothing about the page.
             Ok(_) | Err(BridgeError::Timeout) => {}
-            Err(_) => return false,
+            Err(_) => return Watched::Gone,
         }
     }
-    false
-}
-
-/// Where the auto-submit choice is kept.
-fn auto_submit_file(database: Option<&Path>) -> Option<PathBuf> {
-    Some(database?.parent()?.join("auto-submit"))
-}
-
-/// The auto-submit choice the user made. It is off until the user turns it on.
-fn saved_auto_submit(database: Option<&Path>) -> bool {
-    auto_submit_file(database)
-        .and_then(|file| std::fs::read_to_string(file).ok())
-        .is_some_and(|text| text.trim() == "on")
+    Watched::TimedOut
 }
 
 /// The fact that says where the user applied before, read from the database beside the answers.
@@ -778,6 +782,10 @@ async fn fill_form(
         }
         _ => None,
     };
+    // A confirmed application's tab closes, so tabs do not pile up while the queue runs.
+    if sent == Some(Sent::Confirmed) {
+        let _ = page.send("Page.close", serde_json::json!({})).await;
+    }
     // Chrome's debugging bar goes away with the detach, whether or not the fill worked.
     let detached = page.detach().await;
     let report = report.map_err(|error| Stopped {
@@ -832,7 +840,7 @@ mod tests {
         })
     }
 
-    async fn watch(answers: Vec<Value>) -> (bool, Vec<Value>) {
+    async fn watch(answers: Vec<Value>) -> (Watched, Vec<Value>) {
         let scratch = tempfile::tempdir().unwrap();
         let socket = scratch.path().join("bridge.sock");
         let bridge = Bridge::new();
@@ -852,7 +860,7 @@ mod tests {
         let no = json!({ "kind": "result", "value": false });
         let yes = json!({ "kind": "result", "value": true });
         let (seen, asked) = watch(vec![no.clone(), no, yes]).await;
-        assert!(seen);
+        assert_eq!(seen, Watched::Submitted);
         assert_eq!(asked.len(), 3);
         assert_eq!(
             asked[0],
@@ -869,7 +877,7 @@ mod tests {
     async fn the_watch_gives_up_when_the_tab_is_gone() {
         let no = json!({ "kind": "result", "value": false });
         let gone = json!({ "kind": "error", "message": "No tab with id: 31" });
-        assert!(!watch(vec![no, gone]).await.0);
+        assert_eq!(watch(vec![no, gone]).await.0, Watched::Gone);
     }
 
     /// Stands in for Chrome: every new tab gets the next id, every page fails to load,
