@@ -684,7 +684,15 @@ impl Board {
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
         });
+        if self.auto_apply() {
+            self.apply_approved(cx);
+        }
         cx.notify();
+    }
+
+    /// Whether Maverick approves postings scored 75 or more and reaches their people by itself.
+    fn auto_apply(&self) -> bool {
+        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
 
     /// How many postings wait on a decision, those the company filter keeps out included.

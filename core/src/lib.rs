@@ -3,6 +3,7 @@
 pub mod answers;
 pub mod apply;
 pub mod ashby;
+pub mod auto;
 pub mod bridge;
 pub mod calendar;
 pub mod chats;
