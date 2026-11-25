@@ -11,9 +11,11 @@ gpui-kit = "0.10.0"
 jiff = "1.0.2"
 maverick-core = { path = "../core" }
 objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 serde_json = "1.0.154"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSData", "NSError", "NSString"] }
 tokio = { version = "1.54.1", features = ["net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]

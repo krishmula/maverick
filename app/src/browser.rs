@@ -444,6 +444,13 @@ impl Browser {
                         None
                     }
                 };
+                if let Some(notice) = this
+                    .queue
+                    .get(&address)
+                    .and_then(|run| crate::notify::fill_ended(&run.title, &run.step))
+                {
+                    crate::notify::post(notice);
+                }
                 let waits = this
                     .queue
                     .get(&address)
