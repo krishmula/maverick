@@ -534,12 +534,28 @@ fn is_apply_ready(posting: &Posting) -> bool {
         .is_some_and(|notes| notes.starts_with(APPLY_READY))
 }
 
+/// When the people kept per posting went up from 2 to `PEOPLE_PER_POSTING`.
+const MORE_PEOPLE_SINCE: &str = "2026-11-25T08:00:00Z";
+
+/// True for a check that found people while only 2 were kept, and kept 2, so the company may
+/// have more. Checking it again once keeps up to `PEOPLE_PER_POSTING`.
+pub fn cut_short(check: &Check) -> bool {
+    let since: Timestamp = MORE_PEOPLE_SINCE.parse().expect("the time is valid");
+    check.verdict.found_people() && check.people.len() == 2 && check.checked_at < since
+}
+
 /// The postings a check run looks at, in order: postings to review that have no verdict yet,
-/// or whose lookup was deferred, apply-ready first, then by score.
+/// or whose lookup was deferred, apply-ready first, then by score; then the checks cut short at
+/// the old limit of 2 people, in the same order.
 pub fn to_check(postings: &[Posting], checks: &[Check]) -> Vec<Posting> {
     let settled: HashSet<&str> = checks
         .iter()
-        .filter(|check| check.verdict != Verdict::Deferred)
+        .filter(|check| check.verdict != Verdict::Deferred && !cut_short(check))
+        .map(|check| check.posting_link.as_str())
+        .collect();
+    let again: HashSet<&str> = checks
+        .iter()
+        .filter(|check| cut_short(check))
         .map(|check| check.posting_link.as_str())
         .collect();
     let mut due: Vec<Posting> = postings
@@ -547,7 +563,13 @@ pub fn to_check(postings: &[Posting], checks: &[Check]) -> Vec<Posting> {
         .filter(|posting| posting.stage == Stage::Review && !settled.contains(posting.link.as_str()))
         .cloned()
         .collect();
-    due.sort_by_key(|posting| (!is_apply_ready(posting), Reverse(posting.score)));
+    due.sort_by_key(|posting| {
+        (
+            again.contains(posting.link.as_str()),
+            !is_apply_ready(posting),
+            Reverse(posting.score),
+        )
+    });
     due
 }
 
@@ -813,7 +835,7 @@ impl CheckRun {
 /// `only` checks just the postings with those links, whatever their earlier verdicts.
 pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: &[String]) -> Result<CheckRun, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
-    let (due, deferred, connections, mut pages) = {
+    let (due, deferred, again, connections, mut pages) = {
         let store = Store::open(database).map_err(said)?;
         let checks = store.checks().map_err(said)?;
         let postings = store.postings().map_err(said)?;
@@ -825,14 +847,21 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
                 .filter(|posting| only.contains(&posting.link))
                 .collect()
         };
+        // A check cut short keeps its people until a lookup can find more, so it waits like a deferred one.
         let deferred: HashSet<String> = checks
-            .into_iter()
+            .iter()
             .filter(|check| check.verdict == Verdict::Deferred)
-            .map(|check| check.posting_link)
+            .map(|check| check.posting_link.clone())
+            .collect();
+        let again: HashSet<String> = checks
+            .iter()
+            .filter(|check| cut_short(check))
+            .map(|check| check.posting_link.clone())
             .collect();
         (
             due,
             deferred,
+            again,
             store.connections().map_err(said)?,
             store.company_pages().map_err(said)?,
         )
@@ -843,7 +872,8 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
     for posting in due {
         // A deferred posting only waits for a People lookup, so without one left reading it again is wasted.
         let can_look_up = matches!(lookups, Some((_, left)) if left > 0);
-        if only.is_empty() && deferred.contains(&posting.link) && !can_look_up {
+        let waits = deferred.contains(&posting.link) || again.contains(&posting.link);
+        if only.is_empty() && waits && !can_look_up {
             continue;
         }
         let (named, mut note) = match named_in(&posting).await {
@@ -895,6 +925,10 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
             None
         };
         let (verdict, people, why) = settle(&named, linked, lookup);
+        // A check again that could not look anyone up keeps the people it had.
+        if again.contains(&posting.link) && !verdict.found_people() {
+            continue;
+        }
         note = match (note, why) {
             (Some(one), Some(two)) => Some(format!("{one}; {two}")),
             (one, two) => one.or(two),
@@ -1868,6 +1902,26 @@ mod tests {
             .map(|posting| posting.link)
             .collect();
         assert_eq!(order, ["b", "c", "d", "a"]);
+
+        // A check that kept 2 people under the old limit is checked again once, after the new ones.
+        let at = |time: &str| time.parse::<Timestamp>().unwrap();
+        let two = vec![person("Bo", "Engineer"), person("Cy", "Engineer")];
+        let found = |link: &str, people: Vec<Person>, checked_at: &str| Check {
+            verdict: Verdict::TeamMember,
+            people,
+            checked_at: at(checked_at),
+            ..check(link, Verdict::TeamMember)
+        };
+        let checks = [
+            found("e", two.clone(), "2026-11-24T12:00:00Z"),
+            found("b", vec![person("Bo", "Engineer")], "2026-11-24T12:00:00Z"),
+            found("c", two, "2026-11-26T12:00:00Z"),
+        ];
+        let order: Vec<String> = to_check(&postings, &checks)
+            .into_iter()
+            .map(|posting| posting.link)
+            .collect();
+        assert_eq!(order, ["d", "a", "e"]);
     }
 
     #[test]
