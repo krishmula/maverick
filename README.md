@@ -77,7 +77,7 @@ Click the icon at the left of the bar and pick Stealth, Sunset, Arctic, Neon or 
 
 ## Fill an application form
 
-Maverick fills application forms on two systems. It never clicks Submit.
+Maverick fills application forms on two systems. It clicks Submit only when you turn on auto-submit (see [Auto-submit](#auto-submit)).
 
 - Ashby, on `jobs.ashbyhq.com`.
 - Greenhouse, on the boards Greenhouse hosts: `job-boards.greenhouse.io`, the older `boards.greenhouse.io`, and their `eu.` variants. A company's own careers page that shows a Greenhouse form inside it is not covered.
@@ -95,7 +95,7 @@ Answers come from two places:
 
 - For essay questions, the model writes a draft from the `background` in your answers file, which holds your resume as text, and from the job description. Read each draft before you submit. With no background in the file, essays are left for you.
 
-The model leaves pay questions, demographic questions and agreements for you. Maverick lists every answer and every draft the model gave, with what it used, and every field it left.
+The model leaves pay questions, demographic questions and agreements for you, unless your answers file says otherwise under `standing` (see [Auto-submit](#auto-submit)). Maverick lists every answer and every draft the model gave, with what it used, and every field it left.
 
 On a Greenhouse form, Maverick leaves the demographic, equal opportunity and education sections alone. It splits `name` into the First Name and Last Name fields at the first space, unless a rule covers those titles.
 
@@ -332,13 +332,38 @@ A decision goes only into a row whose Status still says Found when Maverick writ
 - Press `a` to approve the selected posting and `s` to skip it, or click **approve** or **skip**. The selection moves to the next pending posting. `⌘Z` or **undo** takes back the last decision.
 - **Submitted** lists the applications, latest first or by company.
 
+### Auto-submit
+
+Click **auto-submit off** in the board's toolbar to turn auto-submit on. It is off until you do. With it on, Maverick presses Submit on a form once, when all of these hold:
+
+- Every required field holds one of your standard answers, or an answer the model worked out from your `facts`.
+- No answer is a draft. A form with an essay waits for you to read the draft.
+- Every answer went in, and the model could be asked.
+- The page shows exactly one Submit button.
+
+After the press, Maverick waits a minute for the system's confirmation and records the application. When the system asks for a code it emailed you, or checks that you are human, the tab waits for you. Maverick never presses Submit twice.
+
+Three entries in your answers file decide answers that would otherwise always be left for you:
+
+```json
+"legal_name": { "first": "Augusta Ada", "last": "Example" },
+"standing": { "agrees_to_terms": true, "pay": "posted-midpoint" }
+```
+
+- `legal_name` answers a question that asks for your legal name. Every other name question takes `name`.
+- `agrees_to_terms` lets the model agree to a form's terms, privacy notice and statement that the application is true. This includes an arbitration agreement.
+- `pay` set to `posted-midpoint` answers a pay question with the middle of the range the posting states. A posting without a range leaves the question for you.
+
+To see which required questions your answers do not cover yet, run `maverick gaps`. It reads the form of every open Ashby and Greenhouse posting, opens nothing in Chrome and writes nothing.
+
 ### The apply queue
 
-Approving a posting puts it in the apply queue. Maverick fills queued forms several at once, each in its own background tab in Chrome, three at a time unless you change it with **-** and **+** in the board's toolbar. It never submits. Each row shows where its posting is:
+Approving a posting puts it in the apply queue. Maverick fills queued forms several at once, each in its own background tab in Chrome, three at a time unless you change it with **-** and **+** in the board's toolbar. It submits a form only with auto-submit on. Each row shows where its posting is:
 
 - **queued**: waiting for a free slot. The queue waits while Chrome is not connected.
 - **opening** and **filling**: the form is loading, then the answers go in.
-- **ready to submit**: every required field is answered.
+- **ready to submit**: every required field is answered. With auto-submit on, the pane says why Maverick left the Submit to you.
+- **submitting**: nothing was left for you, and Maverick pressed Submit.
 - **needs you**: required fields are left, there is a sign-in wall or an email to verify, or the posting is on a system Maverick cannot fill yet (Amazon, Oracle, Lever, company sites, unresolved Simplify links). Those open in a tab for you.
 - **applied**: the application system confirmed your submission, and the posting moves to Submitted.
 - **failed**: the reason shows in the pane. Approve it again to try again.

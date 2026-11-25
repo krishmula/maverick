@@ -13,7 +13,12 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Answers {
+    /// The name the user goes by, such as `Ada Example`.
     pub name: String,
+    /// The name on the user's papers, when it differs from `name`. A question that asks for the
+    /// legal name takes it from here.
+    #[serde(default)]
+    pub legal_name: Option<LegalName>,
     pub email: String,
     pub phone: String,
     pub resume: PathBuf,
@@ -49,6 +54,37 @@ pub struct Answers {
     /// Scoring judges each posting against these and the background.
     #[serde(default)]
     pub target: Vec<String>,
+    /// The answers the user gave once for every form.
+    #[serde(default)]
+    pub standing: Standing,
+}
+
+/// The name on the user's papers.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LegalName {
+    pub first: String,
+    pub last: String,
+}
+
+/// Answers the user gave once for every form, to questions whose wording differs on each form.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Standing {
+    /// True when the user agrees to every form's terms, privacy notice and statement that the
+    /// application is true. False leaves those questions for the user.
+    #[serde(default)]
+    pub agrees_to_terms: bool,
+    /// How a question about expected pay is answered. With none, it is left for the user.
+    #[serde(default)]
+    pub pay: Option<Pay>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Pay {
+    /// The middle of the pay range the posting states. A posting without a range gets no answer.
+    PostedMidpoint,
 }
 
 /// A postal address in the parts forms ask for.
@@ -151,6 +187,11 @@ pub enum Role {
     /// Only a rule answers this. Most users have no middle name to give.
     MiddleName,
     LastName,
+    /// The first and the last name on the user's papers, where the form says so without words.
+    LegalFirstName,
+    LegalLastName,
+    /// Whether the user goes by another name than the one on their papers.
+    HasPreferredName,
     Resume,
     Street,
     City,
@@ -175,7 +216,13 @@ impl Role {
     pub fn takes_a_model_answer(self) -> bool {
         !matches!(
             self,
-            Self::MiddleName | Self::PhoneKind | Self::PhoneCode | Self::Today | Self::Work(..) | Self::School(..)
+            Self::MiddleName
+                | Self::HasPreferredName
+                | Self::PhoneKind
+                | Self::PhoneCode
+                | Self::Today
+                | Self::Work(..)
+                | Self::School(..)
         )
     }
 }
@@ -290,6 +337,9 @@ impl Answers {
             (kind, Some(Role::PhoneKind)) => return kind.answer_from("Mobile"),
             (_, Some(Role::PhoneCode)) => return Err(Unanswered::NoRule),
             (kind, Some(Role::Today)) => return kind.answer_from(&today()),
+            (kind, Some(Role::HasPreferredName)) => {
+                return kind.answer_from(if self.goes_by_another_name() { "yes" } else { "no" });
+            }
             (kind, Some(Role::Work(place, part))) => {
                 let job = self.work.get(place).ok_or(Unanswered::NoRule)?;
                 return job.answer(part, kind);
@@ -305,7 +355,7 @@ impl Answers {
             }
             _ => {}
         }
-        let now;
+        let (now, named);
         let stated = match self.rule_answer(&question.title)? {
             Some(stated) => stated,
             None => match (&question.kind, question.role) {
@@ -318,14 +368,68 @@ impl Answers {
                     now = today();
                     &now
                 }
-                (Kind::Text, Some(Role::Name)) if !asks_for_part_of_a_name(&question.title) => &self.name,
-                (Kind::Text, Some(Role::FirstName)) => self.name_parts().0,
-                (Kind::Text, Some(Role::LastName)) => self.name_parts().1.ok_or(Unanswered::NoRule)?,
+                (Kind::Text, role) => match self.name_asked(&question.title, role) {
+                    Some(name) => {
+                        named = name;
+                        &named
+                    }
+                    None => return Err(Unanswered::NoRule),
+                },
                 (Kind::Location, _) => self.location.as_deref().ok_or(Unanswered::NoRule)?,
                 _ => return Err(Unanswered::NoRule),
             },
         };
         question.kind.answer_from(stated)
+    }
+
+    /// The name, or the part of it, that a question asks for. `None` for a question about
+    /// anything else, and for one about another person's name.
+    ///
+    /// A question that says "legal", and a field the form marks as legal, takes the name on the
+    /// user's papers. Every other question takes the name the user goes by.
+    fn name_asked(&self, title: &str, role: Option<Role>) -> Option<String> {
+        let title = normalized(title);
+        let words: Vec<&str> = title
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect();
+        let has = |any: &[&str]| words.iter().any(|word| any.contains(word));
+        // Without a role, only a question made of these words is about the user's own name.
+        // "Reference's first name" is not.
+        if role.is_none() && !(has(&["name"]) && words.iter().all(|word| NAME_WORDS.contains(word))) {
+            return None;
+        }
+        if has(&["middle"]) {
+            return None;
+        }
+        let legal_role = matches!(role, Some(Role::LegalFirstName | Role::LegalLastName));
+        let legal = (legal_role || has(&["legal"])) && !has(&["preferred"]);
+        let (first, last) = match (&self.legal_name, legal) {
+            (Some(papers), true) => (papers.first.trim(), Some(papers.last.trim())),
+            _ => self.name_parts(),
+        };
+        match role {
+            Some(Role::FirstName | Role::LegalFirstName) => Some(first.to_owned()),
+            Some(Role::LastName | Role::LegalLastName) => last.map(str::to_owned),
+            Some(Role::Name) | None => {
+                if has(&["first", "given"]) {
+                    Some(first.to_owned())
+                } else if has(&["last", "family", "surname"]) {
+                    last.map(str::to_owned)
+                } else {
+                    Some(last.map_or_else(|| first.to_owned(), |last| format!("{first} {last}")))
+                }
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// True when the name on the user's papers is not the name the user goes by.
+    fn goes_by_another_name(&self) -> bool {
+        self.legal_name.as_ref().is_some_and(|papers| {
+            let (first, last) = self.name_parts();
+            papers.first.trim() != first || Some(papers.last.trim()) != last
+        })
     }
 
     /// The first word of the name, and the rest of it as the last name. A name of one word has no last name.
@@ -548,12 +652,36 @@ fn option(options: &[String], stated: &str) -> Result<String, Unanswered> {
         .ok_or_else(|| Unanswered::NoSuchOption(stated.to_owned()))
 }
 
-/// True for a title such as "Legal first name", where the full name would be a wrong answer.
-fn asks_for_part_of_a_name(title: &str) -> bool {
-    normalized(title)
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| matches!(word, "first" | "last" | "middle" | "given" | "family"))
-}
+/// The words of a question that asks for the user's own name and nothing else.
+const NAME_WORDS: [&str; 27] = [
+    "name",
+    "names",
+    "legal",
+    "preferred",
+    "first",
+    "last",
+    "given",
+    "family",
+    "surname",
+    "full",
+    "your",
+    "my",
+    "what",
+    "is",
+    "s",
+    "please",
+    "enter",
+    "provide",
+    "the",
+    "a",
+    "of",
+    "if",
+    "different",
+    "from",
+    "above",
+    "applicable",
+    "optional",
+];
 
 /// Lower case, with each run of white space as one space.
 fn normalized(text: &str) -> String {
@@ -810,7 +938,79 @@ mod tests {
         };
         assert_eq!(name("Name"), Ok(Answer::Text("Ada Example".into())));
         assert_eq!(name("Legal Name"), Ok(Answer::Text("Ada Byron Example".into())));
-        assert_eq!(name("Legal First Name"), Err(Unanswered::NoRule));
+        assert_eq!(name("Legal First Name"), Ok(Answer::Text("Ada".into())));
+    }
+
+    #[test]
+    fn a_question_about_the_legal_name_takes_the_name_on_the_users_papers() {
+        let mut answers = answers();
+        answers.rules.clear();
+        let ask = |answers: &Answers, title: &str, kind: Kind, role: Option<Role>| {
+            answers.answer(&Question {
+                title: title.into(),
+                kind,
+                role,
+            })
+        };
+        let text = |answers: &Answers, title: &str, role| ask(answers, title, Kind::Text, role);
+        let said = |name: &str| Ok(Answer::Text(name.into()));
+        // Without a legal name on file, the user has one name.
+        assert_eq!(text(&answers, "Legal first name", None), said("Ada"));
+        assert_eq!(
+            ask(
+                &answers,
+                "I have a preferred name",
+                Kind::YesNo,
+                Some(Role::HasPreferredName)
+            ),
+            Ok(Answer::YesNo(false))
+        );
+
+        answers.legal_name = Some(LegalName {
+            first: "Augusta Ada".into(),
+            last: "Example".into(),
+        });
+        assert_eq!(
+            text(&answers, "First Name", Some(Role::LegalFirstName)),
+            said("Augusta Ada")
+        );
+        assert_eq!(text(&answers, "Last Name", Some(Role::LegalLastName)), said("Example"));
+        assert_eq!(
+            text(&answers, "Legal First Name", Some(Role::FirstName)),
+            said("Augusta Ada")
+        );
+        assert_eq!(text(&answers, "Full legal name", None), said("Augusta Ada Example"));
+        assert_eq!(
+            text(&answers, "Legal Name", Some(Role::Name)),
+            said("Augusta Ada Example")
+        );
+        // Everything else takes the name the user goes by.
+        assert_eq!(text(&answers, "First Name", Some(Role::FirstName)), said("Ada"));
+        assert_eq!(text(&answers, "Name", Some(Role::Name)), said("Ada Example"));
+        assert_eq!(text(&answers, "Preferred First Name", None), said("Ada"));
+        assert_eq!(text(&answers, "Preferred last name", None), said("Example"));
+        assert_eq!(
+            text(&answers, "Preferred name (if different from legal name)", None),
+            said("Ada Example")
+        );
+        assert_eq!(
+            ask(
+                &answers,
+                "I have a preferred name",
+                Kind::YesNo,
+                Some(Role::HasPreferredName)
+            ),
+            Ok(Answer::YesNo(true))
+        );
+        // Another person's name, and a middle name, are not the user's name.
+        for title in [
+            "Reference's first name",
+            "Name of your manager",
+            "Legal middle name",
+            "School name",
+        ] {
+            assert_eq!(text(&answers, title, None), Err(Unanswered::NoRule), "{title}");
+        }
     }
 
     #[test]

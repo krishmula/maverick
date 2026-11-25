@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::answers::{Kind, Question};
+use crate::answers::{Kind, Pay, Question, Standing};
 use crate::providers::{self, Job};
 
 const INSTRUCTIONS: &str = "You fill in a job application for the applicant described in the facts. \
@@ -16,8 +16,7 @@ Never guess, and never invent experience, skills, dates or numbers. \
 The job description says only what the job itself requires. Use it for a question that asks whether \
 the applicant meets a requirement of the job, such as its minimum years of experience: \
 compare the requirement with the facts. Such a question is not a certification. \
-Always answer null for: pay or salary expectations, open-ended essay questions, \
-and agreements, acknowledgments, certifications or signatures. \
+Always answer null for open-ended essay questions and for a signature the applicant types. \
 Answer a question about gender, race or ethnicity, veteran status or disability only when a fact says \
 what the applicant chooses to disclose about it. Otherwise the answer is null. \
 A yes or no question takes exactly yes or no. A date takes YYYY-MM-DD. \
@@ -25,6 +24,37 @@ A question with options takes the exact text of one option. \
 A location takes a city and state as a person would type them into a search box. \
 Any other question takes the shortest direct answer, with no explanation. \
 In basis, name the fact you used in one short sentence.";
+
+const NO_TERMS: &str = "Always answer null for agreements, acknowledgments and certifications.";
+const AGREES_TO_TERMS: &str = "The applicant agrees to every form's terms. Where a question only asks the \
+applicant to agree to or acknowledge terms and conditions, a privacy notice, the handling of the \
+application's data, or a statement that the application is true and complete, give the answer that agrees, \
+and write 'standing yes to terms' as the basis. \
+This does not cover a statement about the applicant's own circumstances, such as having no agreement \
+with a former employer or no relative at the company, and it does not cover an offer to join a \
+talent community or a mailing list: only the facts settle those.";
+
+const NO_PAY: &str = "Always answer null for pay or salary expectations.";
+const PAY_IS_POSTED_MIDPOINT: &str = "For a question about expected pay or salary, find the pay range the job \
+description states for this job and answer its midpoint: half of the sum of its two ends, as a plain \
+whole number without a currency sign, in the unit the range uses, such as 150000 for a range per year \
+and 55 for a range per hour. Where the question has options, pick the option that holds the midpoint. \
+In basis, quote the range. If the description states no pay range, or states several and does not say \
+which one applies to this applicant, the answer is null.";
+
+/// The instructions for factual questions, with what the user decided once for every form.
+fn instructions(standing: Standing) -> String {
+    let terms = if standing.agrees_to_terms {
+        AGREES_TO_TERMS
+    } else {
+        NO_TERMS
+    };
+    let pay = match standing.pay {
+        Some(Pay::PostedMidpoint) => PAY_IS_POSTED_MIDPOINT,
+        None => NO_PAY,
+    };
+    format!("{INSTRUCTIONS} {terms} {pay}")
+}
 
 /// What the model said about one question.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +79,7 @@ In basis, name the part of the resume you used in one short sentence.";
 /// belongs to, and `description` what that job requires.
 pub async fn answer(
     facts: &[String],
+    standing: Standing,
     job: &str,
     description: &str,
     questions: &[&Question],
@@ -57,7 +88,7 @@ pub async fn answer(
     if !description.is_empty() {
         let _ = write!(asked, "\nThe job description:\n{description}\n");
     }
-    ask(INSTRUCTIONS, asked, questions.len()).await
+    ask(&instructions(standing), asked, questions.len()).await
 }
 
 /// Drafts answers to essay `questions` in order, from the user's resume.
@@ -197,6 +228,18 @@ mod tests {
              2. (one of [\"Citizen\",\"Needs \\\"sponsorship\\\"\"]) Work status?\n\
              3. (text) What country are you based in?\n"
         );
+    }
+
+    #[test]
+    fn the_instructions_hold_back_terms_and_pay_until_the_user_decides_them() {
+        let unset = instructions(Standing::default());
+        assert!(unset.contains(NO_TERMS) && unset.contains(NO_PAY));
+        let set = instructions(Standing {
+            agrees_to_terms: true,
+            pay: Some(Pay::PostedMidpoint),
+        });
+        assert!(set.contains(AGREES_TO_TERMS) && set.contains(PAY_IS_POSTED_MIDPOINT));
+        assert!(!set.contains(NO_TERMS) && !set.contains(NO_PAY));
     }
 
     #[test]

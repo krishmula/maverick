@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maverick_core::answers::Answers;
-use maverick_core::apply::{End, FieldResult, FillError, Outcome, Report, Source, System};
+use maverick_core::apply::{End, FieldResult, FillError, Outcome, Report, Sent, Source, System};
 use maverick_core::ashby;
 use maverick_core::bridge::{self, Bridge, BrowserState, Command, Tab};
 use maverick_core::credentials::{Password, SignIn};
@@ -579,6 +579,7 @@ async fn a_live_ashby_form_is_filled_and_not_submitted() {
     };
     assert_eq!(has(".ashby-application-form-submit-button").await, true);
     assert_eq!(has(ashby::SUBMITTED).await, false);
+    assert!(System::Ashby.shows_submit(&page).await.unwrap(), "one Submit button");
 
     // A second run finds the standard answers already in place and changes none of them.
     let again = ashby::fill(&page, &answers).await.unwrap().outcomes;
@@ -1413,6 +1414,7 @@ async fn a_live_greenhouse_form_is_filled_and_not_submitted() {
         system.form_address(&posting),
         "the tab is still on the form"
     );
+    assert!(system.shows_submit(&page).await.unwrap(), "one Submit button");
     assert_eq!(has(system.submitted()).await, false, "the form was not submitted");
 }
 
@@ -1512,4 +1514,63 @@ async fn a_search_page_in_a_background_tab_is_scrolled_three_times_for_more_post
     assert_eq!(scrolled.len(), 16);
     assert_eq!(scrolled[15].poster, "Person 16");
     assert_eq!(scrolled[15].text, "We are hiring engineer number 16.");
+}
+
+/// A form in the shape of Ashby's and Greenhouse's: one button submits it. `?code` makes the
+/// page ask for an emailed code instead of confirming, and `?two` shows a second submit button.
+const SUBMIT_FORM: &str = r#"<!doctype html><title>Apply</title>
+<form id="form"><input id="name"><button type="button" id="submit">Submit Application</button></form>
+<script>
+  window.presses = 0;
+  if (location.search === "?two") {
+    document.body.insertAdjacentHTML("beforeend", '<button type="button" id="other">Submit</button>');
+  }
+  for (const button of document.querySelectorAll("button")) {
+    button.addEventListener("click", () => {
+      window.presses += 1;
+      setTimeout(() => {
+        document.getElementById("form").outerHTML = location.search === "?code"
+          ? '<p>Enter the security code we sent to your email.</p>'
+          : '<div class="ashby-application-form-success-container">Thanks for applying.</div>';
+      }, 700);
+    });
+  }
+</script>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_complete_form_is_submitted_with_one_press_and_the_page_decides_the_outcome() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch("data:text/html,<title>First</title>");
+    let form = serve(SUBMIT_FORM).await;
+    let tabs = wait_for(&mut states, "the tab listed", |tabs| titled(tabs, "First").is_some()).await;
+    let page = Page::attach(bridge.clone(), &titled(&tabs, "First").unwrap())
+        .await
+        .unwrap();
+    let presses = async |page: &Page| page.evaluate("window.presses").await.unwrap();
+
+    page.navigate(&form).await.unwrap();
+    assert!(System::Ashby.shows_submit(&page).await.unwrap());
+    assert_eq!(System::Ashby.submit(&page).await.unwrap(), Sent::Confirmed);
+
+    // A code sent by email is the user's to enter, and Maverick does not press again.
+    page.navigate(&format!("{form}?code")).await.unwrap();
+    match System::Greenhouse.submit(&page).await.unwrap() {
+        Sent::Unconfirmed(why) => assert!(why.contains("asks for a code"), "{why}"),
+        Sent::Confirmed => panic!("a page that asks for a code is not a confirmation"),
+    }
+
+    // With two buttons that could submit, Maverick presses neither.
+    page.navigate(&format!("{form}?two")).await.unwrap();
+    assert!(!System::Ashby.shows_submit(&page).await.unwrap());
+    match System::Ashby.submit(&page).await.unwrap() {
+        Sent::Unconfirmed(why) => assert!(why.contains("did not find one Submit button"), "{why}"),
+        Sent::Confirmed => panic!("nothing was pressed"),
+    }
+    assert_eq!(presses(&page).await, 0);
+    page.detach().await.unwrap();
 }
