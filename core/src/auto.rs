@@ -1,8 +1,7 @@
-//! Auto-apply: Maverick approves each posting scored 75 or more, sends a draft to the best two
-//! people its outreach check found there, and sends each waiting hiring-post draft, without the
-//! user's review. The user turns it on in
-//! Connections; while it is off, the user approves each posting. Whether an approved form is also
-//! submitted is the auto-submit switch's call.
+//! Auto-apply: once the user approves a posting, Maverick submits its form when nothing in it is
+//! left for the user, sends a draft to the best two people its outreach check found there, and
+//! sends each waiting hiring-post draft, without the user's review. The user turns it on in
+//! Connections. Maverick never approves a posting itself.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -22,10 +21,11 @@ use crate::store::{Store, StoreError};
 
 /// How many people at one posting Maverick sends to, best first.
 pub const PEOPLE_PER_POSTING: usize = 2;
-/// The most postings one funnel pass approves, so the apply queue fills a few at a time.
-pub const APPROVALS_PER_PASS: usize = 10;
 /// The most drafts sent in one Pacific day, the user's own sends included, to keep LinkedIn calm.
 pub const SENDS_PER_DAY: usize = 20;
+/// The most drafts sent to people at one company in one Pacific day, so a company with many
+/// postings does not hear from Maverick about each of them at once.
+pub const SENDS_PER_COMPANY_PER_DAY: usize = 2;
 /// The most drafts one hourly outreach run sends.
 pub const SENDS_PER_RUN: usize = 4;
 /// The random wait between two sends.
@@ -147,35 +147,6 @@ fn best_first(postings: &mut [&Posting]) {
     postings.sort_by(|a, b| b.score.cmp(&a.score).then(b.found_at.cmp(&a.found_at)));
 }
 
-/// The postings to approve now: scored 75 or more, in scope, waiting for review, and not decided by anyone.
-pub fn to_approve(postings: &[Posting], decisions: &HashMap<String, Decision>, scope: &Scope) -> Vec<String> {
-    let mut waiting: Vec<&Posting> = postings
-        .iter()
-        .filter(|posting| {
-            scored_enough(posting)
-                && scope.covers(posting)
-                && posting.stage == Stage::Review
-                && !decisions.contains_key(&posting.link)
-        })
-        .collect();
-    best_first(&mut waiting);
-    waiting
-        .into_iter()
-        .take(APPROVALS_PER_PASS)
-        .map(|posting| posting.link.clone())
-        .collect()
-}
-
-/// Approves the postings `to_approve` gives, and says how many.
-pub fn approve(database: &Path) -> Result<usize, StoreError> {
-    let mut store = Store::open(database)?;
-    let links = to_approve(&store.postings()?, &store.decisions()?, &Scope::load(database));
-    for link in &links {
-        store.decide(link, Some(Decision::Approved))?;
-    }
-    Ok(links.len())
-}
-
 /// One person to send to now.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pick {
@@ -186,7 +157,8 @@ pub struct Pick {
 }
 
 /// The people to send to now. A posting counts once it is scored 75 or more and approved or
-/// applied to; its check's best two people with a profile get a draft. Every waiting hiring-post
+/// applied to; its check's best two people with a profile get a draft, while its company has had
+/// fewer than two sends today. Every waiting hiring-post
 /// draft is sent too, newest first, taking turns with the postings so neither waits on the other.
 /// Nobody gets a second draft once one to them was typed, sent or skipped, about anything.
 pub fn to_reach(
@@ -204,6 +176,22 @@ pub fn to_reach(
         })
         .count();
     let room = SENDS_PER_DAY.saturating_sub(sent_today).min(SENDS_PER_RUN);
+    let company_of = |link: &str| {
+        postings
+            .iter()
+            .find(|posting| posting.link == link)
+            .map(|posting| posting.company.trim().to_lowercase())
+    };
+    let mut company_sends: HashMap<String, usize> = HashMap::new();
+    for draft in drafts {
+        if let About::Posting(link) = &draft.about
+            && draft.status == Outreach::Sent
+            && outreach::pacific_day(draft.updated_at) == outreach::pacific_day(now)
+            && let Some(company) = company_of(link)
+        {
+            *company_sends.entry(company).or_default() += 1;
+        }
+    }
     let mut chosen: Vec<&Posting> = postings
         .iter()
         .filter(|posting| {
@@ -232,10 +220,16 @@ pub fn to_reach(
             .iter()
             .filter_map(|person| person.profile_url.as_deref())
             .take(PEOPLE_PER_POSTING);
+        let company = posting.company.trim().to_lowercase();
         for profile in people {
             if reached(profile) || picks.iter().any(|pick: &Pick| pick.profile_url == profile) {
                 continue;
             }
+            let sends = company_sends.entry(company.clone()).or_default();
+            if *sends >= SENDS_PER_COMPANY_PER_DAY {
+                break;
+            }
+            *sends += 1;
             let waiting = drafts.iter().find(|draft| {
                 draft.profile_url == profile
                     && draft.status == Outreach::Drafted
@@ -496,12 +490,19 @@ mod tests {
             ),
         ];
         let none = HashMap::new();
+        let covered = |scope: &Scope| -> Vec<&str> {
+            postings
+                .iter()
+                .filter(|posting| scope.covers(posting))
+                .map(|posting| posting.link.as_str())
+                .collect()
+        };
         let mut scope = Scope::default();
-        assert_eq!(to_approve(&postings, &none, &scope), ["ashby", "greenhouse"]);
+        assert_eq!(covered(&scope), ["ashby", "greenhouse"]);
 
         scope.toggle_platform(Platform::Lever);
         scope.toggle_company("big corp ");
-        assert_eq!(to_approve(&postings, &none, &scope), ["ashby", "lever"]);
+        assert_eq!(covered(&scope), ["ashby", "lever"]);
         // Big Corp is left out but still listed once, under the posting's own name; a company
         // left out with nothing waiting is listed with none.
         scope.toggle_company("Gone Inc");
@@ -530,23 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn postings_scored_75_or_more_and_undecided_are_approved_best_first() {
-        let postings = [
-            posting("a", 74, Stage::Review),
-            posting("b", 75, Stage::Review),
-            posting("c", 90, Stage::Review),
-            posting("d", 95, Stage::Skipped),
-            posting("e", 88, Stage::Review),
-            posting("f", 99, Stage::Applied),
+    fn one_company_hears_from_maverick_at_most_twice_a_day() {
+        let at = |link: &str, company: &str| Posting {
+            company: company.into(),
+            ..posting(link, 90, Stage::Applied)
+        };
+        let postings = [at("a1", "Big Corp"), at("a2", "big corp "), at("o", "Other Co")];
+        let checks = [
+            check("a1", &["ada", "bo"]),
+            check("a2", &["cy", "di"]),
+            check("o", &["eve"]),
         ];
-        let decisions = HashMap::from([("e".to_owned(), Decision::Skipped)]);
-        assert_eq!(to_approve(&postings, &decisions, &everywhere()), ["c", "b"]);
+        let handles = |picks: Vec<Pick>| -> Vec<String> {
+            picks
+                .iter()
+                .map(|pick| {
+                    pick.profile_url
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let none = HashMap::new();
+        let now: Timestamp = NOW.parse().unwrap();
+        let picks = to_reach(&postings, &none, &checks, &[], &everywhere(), now);
+        assert_eq!(handles(picks), ["ada", "bo", "eve"]);
 
-        let many: Vec<Posting> = (0..15).map(|n| posting(&n.to_string(), 80, Stage::Review)).collect();
-        assert_eq!(
-            to_approve(&many, &HashMap::new(), &everywhere()).len(),
-            APPROVALS_PER_PASS
-        );
+        // A send to Big Corp earlier today leaves room for one more there.
+        let earlier = [draft(1, "a2", "zed", Outreach::Sent, NOW)];
+        let picks = to_reach(&postings, &none, &checks, &earlier, &everywhere(), now);
+        assert_eq!(handles(picks), ["ada", "eve"]);
     }
 
     #[test]
@@ -648,7 +665,12 @@ mod tests {
 
     #[test]
     fn sends_keep_to_the_daily_and_the_run_caps() {
-        let postings: Vec<Posting> = (0..20).map(|n| posting(&format!("p{n}"), 80, Stage::Applied)).collect();
+        let postings: Vec<Posting> = (0..20)
+            .map(|n| Posting {
+                company: format!("Company {n}"),
+                ..posting(&format!("p{n}"), 80, Stage::Applied)
+            })
+            .collect();
         let checks: Vec<Check> = (0..20)
             .map(|n| check(&format!("p{n}"), &[&format!("a{n}"), &format!("b{n}")]))
             .collect();
