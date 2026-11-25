@@ -1,5 +1,5 @@
 //! Auto-apply: once the user approves a posting, Maverick submits its form when nothing in it is
-//! left for the user, sends a draft to the best two people its outreach check found there, and
+//! left for the user, sends a draft to the best two people in the US its outreach check found there, and
 //! sends each waiting hiring-post draft, without the user's review. The user turns it on in
 //! Connections. Maverick never approves a posting itself.
 
@@ -276,6 +276,9 @@ pub fn to_reach(
 pub struct ReachRun {
     /// The people a draft went to.
     pub sent: Vec<String>,
+    /// The people not sent to because their profile is outside the US, with where it says they are.
+    /// Their draft is skipped.
+    pub abroad: Vec<String>,
     /// Each person whose draft could not be sent, and why. Their draft is skipped; Reset brings it back.
     pub failed: Vec<(String, String)>,
     /// Why the run stopped early, when it did.
@@ -287,6 +290,9 @@ impl ReachRun {
         let mut line = format!("auto-apply sent {}", self.sent.len());
         if !self.sent.is_empty() {
             line.push_str(&format!(" ({})", self.sent.join(", ")));
+        }
+        if !self.abroad.is_empty() {
+            line.push_str(&format!("; not in the US: {}", self.abroad.join(", ")));
         }
         for (person, why) in &self.failed {
             line.push_str(&format!("; {person} not sent: {why}"));
@@ -372,6 +378,10 @@ pub async fn reach(
                     Delivery::Sent => {
                         store.set_draft_status(draft.id, Outreach::Sent, now).map_err(said)?;
                         run.sent.push(draft.person.clone());
+                    }
+                    Delivery::OutsideUs(location) => {
+                        store.set_draft_status(draft.id, Outreach::Skipped, now).map_err(said)?;
+                        run.abroad.push(format!("{} ({location})", draft.person));
                     }
                     Delivery::Unconfirmed(why) => {
                         store.set_draft_status(draft.id, Outreach::Typed, now).map_err(said)?;

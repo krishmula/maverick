@@ -859,7 +859,7 @@ impl Connections {
         let state = if on { "on" } else { "off" };
         let explained = if on {
             "Once you approve a posting, Maverick fills its form and submits it when nothing in it is left \
-             for you. Each hour it sends a LinkedIn draft to the best two people found at approved postings \
+             for you. Each hour it sends a LinkedIn draft to the best two people in the US found at approved postings \
              on the platforms and at the companies below, at most two people per company a day, and sends the \
              waiting hiring-post drafts, up to 20 a day in all, without your review. Maverick never approves a \
              posting itself."
