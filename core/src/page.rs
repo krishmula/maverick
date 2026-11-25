@@ -6,16 +6,19 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-use crate::bridge::{Bridge, BridgeError, Command, ConnectionId, Tab};
+use crate::bridge::{Bridge, BridgeError, Command, ConnectionId, DebuggerEvent, Tab};
 
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_GAP: Duration = Duration::from_millis(100);
+/// Part of Chrome's refusal to attach a debugger to a tab that holds another extension's page.
+const OTHER_EXTENSION: &str = "chrome-extension:// URL of different extension";
 
 /// Finds one element in a page.
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +87,8 @@ pub struct Page {
     bridge: Arc<Bridge>,
     connection: ConnectionId,
     tab_id: i32,
+    /// The tab's debugger events that no one has looked at yet. See `another_extension_drew`.
+    unread: Mutex<Receiver<DebuggerEvent>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -102,6 +107,17 @@ pub enum PageError {
         element: String,
     },
     NotLoaded(String),
+    /// Another extension shows its own page in a frame of this tab, as a password manager does
+    /// with the menu it opens on a form field. Chrome lets no debugger on such a tab, and takes
+    /// a held debugger away the moment such a frame starts to load.
+    OtherExtension,
+}
+
+impl PageError {
+    /// True when the tab takes no more commands, so nothing later in the same work can succeed.
+    pub fn ends_the_work(&self) -> bool {
+        matches!(self, Self::Bridge(_) | Self::OtherExtension)
+    }
 }
 
 impl fmt::Display for PageError {
@@ -113,6 +129,11 @@ impl fmt::Display for PageError {
             Self::Covered { element } => write!(f, "another element covers {element:?}"),
             Self::CannotFocus { element } => write!(f, "{element:?} cannot take the keyboard focus"),
             Self::NotLoaded(problem) => write!(f, "the page did not load: {problem}"),
+            Self::OtherExtension => f.write_str(
+                "Chrome took Maverick off this tab, because another extension opened its own menu or panel \
+                 inside the page. Maverick keeps most of these out, and this one got through. Turn that \
+                 extension off for this site, reload the page, then try again.",
+            ),
         }
     }
 }
@@ -129,6 +150,7 @@ impl Page {
     /// Chrome shows its debugging bar from here until `detach`.
     pub async fn attach(bridge: Arc<Bridge>, tab: &Tab) -> Result<Self, PageError> {
         let page = Self {
+            unread: Mutex::new(bridge.events()),
             bridge,
             connection: tab.connection,
             tab_id: tab.tab.id,
@@ -163,17 +185,55 @@ impl Page {
     ///
     /// Chrome can drop the debugger in the middle of work, for example when the user closes
     /// the debugging bar. In that case this attaches again and sends the command once more.
+    /// When another extension's frame is why Chrome dropped it, this fails with
+    /// `PageError::OtherExtension` instead: the frame would cost the debugger again.
     pub async fn send(&self, command: &str, params: Value) -> Result<Value, PageError> {
         let debug = self.debug(command, params);
-        match self.request(&debug).await {
-            Err(PageError::Bridge(BridgeError::Browser(message))) if lost_debugger(&message) => {
-                // The detach clears the extension's record of the tab. It fails when Chrome
-                // already detached, which is the usual case here.
-                let _ = self.request(&Command::DetachDebugger { tab_id: self.tab_id }).await;
-                self.attach_debugger().await?;
-                self.request(&debug).await
+        let mut reply = self.request(&debug).await;
+        if self.lost_debugger(&reply)? {
+            // The detach clears the extension's record of the tab. It fails when Chrome
+            // already detached, which is the usual case here.
+            let _ = self.request(&Command::DetachDebugger { tab_id: self.tab_id }).await;
+            self.attach_debugger().await?;
+            reply = self.request(&debug).await;
+            self.lost_debugger(&reply)?;
+        }
+        reply
+    }
+
+    /// True when a reply says the debugger is no longer on the tab.
+    /// Fails when another extension's frame is the reason.
+    fn lost_debugger(&self, reply: &Result<Value, PageError>) -> Result<bool, PageError> {
+        let lost = matches!(reply, Err(PageError::Bridge(BridgeError::Browser(message)))
+            if message.contains("Detached while handling command") || message.contains("Debugger is not attached"));
+        if lost && self.another_extension_drew() {
+            return Err(PageError::OtherExtension);
+        }
+        Ok(lost)
+    }
+
+    /// True when a frame of this tab started to load an extension's page since the last look.
+    /// Maverick's own extension has no pages, so such a frame belongs to another extension.
+    fn another_extension_drew(&self) -> bool {
+        let mut unread = self.unread.lock().expect("no code panics while holding this lock");
+        let mut drew = false;
+        loop {
+            match unread.try_recv() {
+                Ok(event) => {
+                    let ours = event.connection == self.connection && event.tab_id == self.tab_id;
+                    let loads = matches!(
+                        event.method.as_str(),
+                        "Page.frameRequestedNavigation" | "Page.frameStartedNavigating"
+                    );
+                    let extension_page = event.params["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("chrome-extension://"));
+                    drew |= ours && loads && extension_page;
+                }
+                // Only the oldest events are lost, and the frame that cost the debugger is among the newest.
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return drew,
             }
-            reply => reply,
         }
     }
 
@@ -319,6 +379,26 @@ impl Page {
         Ok(())
     }
 
+    /// Presses the key of each digit in whatever has the keyboard focus, as a keyboard does.
+    /// A field that reads key presses, and not the text that arrives, needs this.
+    pub async fn press_digits(&self, digits: &str) -> Result<(), PageError> {
+        for digit in digits.chars().filter(char::is_ascii_digit) {
+            let key = json!({
+                "key": digit.to_string(),
+                "code": format!("Digit{digit}"),
+                "windowsVirtualKeyCode": u32::from(digit),
+            });
+            let mut down = key.clone();
+            down["type"] = json!("keyDown");
+            down["text"] = json!(digit.to_string());
+            let mut up = key;
+            up["type"] = json!("keyUp");
+            self.send("Input.dispatchKeyEvent", down).await?;
+            self.send("Input.dispatchKeyEvent", up).await?;
+        }
+        Ok(())
+    }
+
     /// Waits until the page has the element.
     pub async fn wait_for(&self, element: &Locator, limit: Duration) -> Result<(), PageError> {
         let deadline = Instant::now() + limit;
@@ -334,13 +414,11 @@ impl Page {
     }
 
     async fn request(&self, command: &Command) -> Result<Value, PageError> {
-        Ok(self.bridge.request(self.connection, command).await?)
+        match self.bridge.request(self.connection, command).await {
+            Err(BridgeError::Browser(message)) if message.contains(OTHER_EXTENSION) => Err(PageError::OtherExtension),
+            reply => Ok(reply?),
+        }
     }
-}
-
-/// True for Chrome's errors that mean the debugger is no longer attached to the tab.
-fn lost_debugger(message: &str) -> bool {
-    message.contains("Detached while handling command") || message.contains("Debugger is not attached")
 }
 
 /// A string as a JavaScript literal.

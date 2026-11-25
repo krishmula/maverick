@@ -28,13 +28,15 @@ use crate::score::{self, APPLY_READY, Decision, Profile, Reading};
 use crate::store::{Store, StoreError, stored};
 
 /// The most People-page lookups one check run makes, apply-ready postings first.
-pub const LOOKUP_CAP: usize = 10;
+pub const LOOKUP_CAP: usize = 40;
 /// The most new hiring-post drafts in one Pacific day.
-pub const DRAFTS_PER_DAY: usize = 10;
+pub const DRAFTS_PER_DAY: usize = 40;
 /// How long a saved count of no free InMail credits is believed.
 const CREDITS_FRESH: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 /// The most posts one sweep reads with the model.
-pub const POSTS_READ: usize = 40;
+pub const POSTS_READ: usize = 80;
+/// The most people one outreach check keeps for a posting, best first.
+pub const PEOPLE_PER_POSTING: usize = 10;
 /// LinkedIn content searches for hiring posts. Each one is one page load.
 ///
 /// Every search is a hiring phrase in quotes plus plain words. LinkedIn binds `OR` looser than the
@@ -81,7 +83,7 @@ pub struct Check {
     pub posting_link: String,
     pub verdict: Verdict,
     pub team: Option<String>,
-    /// One or two people, best first.
+    /// Up to `PEOPLE_PER_POSTING` people, best first.
     pub people: Vec<Person>,
     pub note: Option<String>,
     pub checked_at: Timestamp,
@@ -471,6 +473,34 @@ impl Store {
             .optional()
     }
 
+    /// Keeps the people the model read in a posting's scorer note, with the note it read.
+    pub fn save_scorer_people(&self, read: &ScorerPeople, at: Timestamp) -> Result<(), StoreError> {
+        let people = serde_json::to_string(&read.people).expect("people always serialize");
+        self.db.execute(
+            "INSERT INTO scorer_people (posting_link, note, people, read_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (posting_link) DO UPDATE SET note = excluded.note, people = excluded.people,
+                 read_at = excluded.read_at",
+            params![read.posting_link, read.note, people, at.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every scorer note read so far.
+    pub fn scorer_people(&self) -> Result<Vec<ScorerPeople>, StoreError> {
+        let mut statement = self
+            .db
+            .prepare("SELECT posting_link, note, people FROM scorer_people")?;
+        let rows = statement.query_map([], |row| {
+            let people: String = row.get(2)?;
+            Ok(ScorerPeople {
+                posting_link: row.get(0)?,
+                note: row.get(1)?,
+                people: serde_json::from_str(&people).unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Saves the InMail credits a LinkedIn message window said are left.
     pub fn save_inmail_credits(&self, credits: u32, at: Timestamp) -> Result<(), StoreError> {
         self.db.execute(
@@ -532,12 +562,28 @@ fn is_apply_ready(posting: &Posting) -> bool {
         .is_some_and(|notes| notes.starts_with(APPLY_READY))
 }
 
+/// When the people kept per posting went up from 2 to `PEOPLE_PER_POSTING`.
+const MORE_PEOPLE_SINCE: &str = "2026-11-25T08:00:00Z";
+
+/// True for a check that found people while only 2 were kept, and kept 2, so the company may
+/// have more. Checking it again once keeps up to `PEOPLE_PER_POSTING`.
+pub fn cut_short(check: &Check) -> bool {
+    let since: Timestamp = MORE_PEOPLE_SINCE.parse().expect("the time is valid");
+    check.verdict.found_people() && check.people.len() == 2 && check.checked_at < since
+}
+
 /// The postings a check run looks at, in order: postings to review that have no verdict yet,
-/// or whose lookup was deferred, apply-ready first, then by score.
+/// or whose lookup was deferred, apply-ready first, then by score; then the checks cut short at
+/// the old limit of 2 people, in the same order.
 pub fn to_check(postings: &[Posting], checks: &[Check]) -> Vec<Posting> {
     let settled: HashSet<&str> = checks
         .iter()
-        .filter(|check| check.verdict != Verdict::Deferred)
+        .filter(|check| check.verdict != Verdict::Deferred && !cut_short(check))
+        .map(|check| check.posting_link.as_str())
+        .collect();
+    let again: HashSet<&str> = checks
+        .iter()
+        .filter(|check| cut_short(check))
         .map(|check| check.posting_link.as_str())
         .collect();
     let mut due: Vec<Posting> = postings
@@ -545,7 +591,13 @@ pub fn to_check(postings: &[Posting], checks: &[Check]) -> Vec<Posting> {
         .filter(|posting| posting.stage == Stage::Review && !settled.contains(posting.link.as_str()))
         .cloned()
         .collect();
-    due.sort_by_key(|posting| (!is_apply_ready(posting), Reverse(posting.score)));
+    due.sort_by_key(|posting| {
+        (
+            again.contains(posting.link.as_str()),
+            !is_apply_ready(posting),
+            Reverse(posting.score),
+        )
+    });
     due
 }
 
@@ -565,7 +617,7 @@ pub struct NamedPerson {
     pub role: String,
 }
 
-/// Up to two of the user's connections at the company, those whose position mentions the team first.
+/// Up to `PEOPLE_PER_POSTING` of the user's connections at the company, those whose position mentions the team first.
 pub fn connections_at(company: &str, team: Option<&str>, connections: &[Connection]) -> Vec<Person> {
     let at_company: Vec<&Connection> = connections
         .iter()
@@ -580,7 +632,7 @@ pub fn connections_at(company: &str, team: Option<&str>, connections: &[Connecti
     first.extend(rest);
     first
         .into_iter()
-        .take(2)
+        .take(PEOPLE_PER_POSTING)
         .map(|connection| Person {
             name: connection.name(),
             title: connection.position.clone(),
@@ -620,7 +672,7 @@ pub enum Lookup {
     Deferred(String),
 }
 
-/// One or two people from a company's People page: the person named, or else engineers whose title
+/// Up to `PEOPLE_PER_POSTING` people from a company's People page: the person named, or else engineers whose title
 /// names the team, then other engineers, then recruiters. A title with no engineering or
 /// recruiting word is never picked, whatever team it names. LinkedIn ignores a search on that page,
 /// so the picking happens here, from the people it lists.
@@ -684,7 +736,11 @@ pub fn picked(query: &str, named: &Named, people: &[Person]) -> Vec<Person> {
         .collect();
     // Stable, so people of one rank keep the page's order.
     ranked.sort_by_key(|(rank, _)| *rank);
-    ranked.into_iter().take(2).map(|(_, person)| person.clone()).collect()
+    ranked
+        .into_iter()
+        .take(PEOPLE_PER_POSTING)
+        .map(|(_, person)| person.clone())
+        .collect()
 }
 
 /// The verdict, from the three sources in the order the user set: the posting, the connections, the People page.
@@ -703,7 +759,7 @@ pub fn settle(named: &Named, linked: Vec<Person>, lookup: Option<Lookup>) -> (Ve
             _ => named
                 .people
                 .iter()
-                .take(2)
+                .take(PEOPLE_PER_POSTING)
                 .map(|person| Person {
                     name: person.name.clone(),
                     title: person.role.clone(),
@@ -807,7 +863,7 @@ impl CheckRun {
 /// `only` checks just the postings with those links, whatever their earlier verdicts.
 pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: &[String]) -> Result<CheckRun, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
-    let (due, deferred, connections, mut pages) = {
+    let (due, deferred, again, connections, mut pages) = {
         let store = Store::open(database).map_err(said)?;
         let checks = store.checks().map_err(said)?;
         let postings = store.postings().map_err(said)?;
@@ -819,14 +875,21 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
                 .filter(|posting| only.contains(&posting.link))
                 .collect()
         };
+        // A check cut short keeps its people until a lookup can find more, so it waits like a deferred one.
         let deferred: HashSet<String> = checks
-            .into_iter()
+            .iter()
             .filter(|check| check.verdict == Verdict::Deferred)
-            .map(|check| check.posting_link)
+            .map(|check| check.posting_link.clone())
+            .collect();
+        let again: HashSet<String> = checks
+            .iter()
+            .filter(|check| cut_short(check))
+            .map(|check| check.posting_link.clone())
             .collect();
         (
             due,
             deferred,
+            again,
             store.connections().map_err(said)?,
             store.company_pages().map_err(said)?,
         )
@@ -837,7 +900,8 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
     for posting in due {
         // A deferred posting only waits for a People lookup, so without one left reading it again is wasted.
         let can_look_up = matches!(lookups, Some((_, left)) if left > 0);
-        if only.is_empty() && deferred.contains(&posting.link) && !can_look_up {
+        let waits = deferred.contains(&posting.link) || again.contains(&posting.link);
+        if only.is_empty() && waits && !can_look_up {
             continue;
         }
         let (named, mut note) = match named_in(&posting).await {
@@ -889,6 +953,10 @@ pub async fn check_postings(database: &Path, bridge: Option<Arc<Bridge>>, only: 
             None
         };
         let (verdict, people, why) = settle(&named, linked, lookup);
+        // A check again that could not look anyone up keeps the people it had.
+        if again.contains(&posting.link) && !verdict.found_people() {
+            continue;
+        }
         note = match (note, why) {
             (Some(one), Some(two)) => Some(format!("{one}; {two}")),
             (one, two) => one.or(two),
@@ -1632,8 +1700,7 @@ pub async fn draft_for_post(
     Ok(PostDraft { draft, credits_unread })
 }
 
-/// Drafts a note to one person a check found, picked by their profile address, for the user to approve.
-/// A connection gets a message, anyone else an InMail while a credit is free, else a connection note.
+/// Drafts a note to one person a posting's outreach check found, by their profile address.
 pub async fn draft_for_check(
     database: &Path,
     profile: &Profile,
@@ -1641,33 +1708,43 @@ pub async fn draft_for_check(
     person_profile: &str,
 ) -> Result<Draft, String> {
     let said = |error: StoreError| format!("the database failed: {error}");
-    let (posting, check) = {
-        let store = Store::open(database).map_err(said)?;
-        let posting = store
-            .postings()
-            .map_err(said)?
-            .into_iter()
-            .find(|posting| posting.link == posting_link)
-            .ok_or("the posting is no longer in the database")?;
-        let check = store
-            .checks()
-            .map_err(said)?
-            .into_iter()
-            .find(|check| check.posting_link == posting_link)
-            .ok_or("the posting has no outreach check yet")?;
-        (posting, check)
-    };
+    let check = Store::open(database)
+        .map_err(said)?
+        .checks()
+        .map_err(said)?
+        .into_iter()
+        .find(|check| check.posting_link == posting_link)
+        .ok_or("the posting has no outreach check yet")?;
     let person = check
         .people
         .iter()
         .find(|person| person.profile_url.as_deref() == Some(person_profile))
         .ok_or("that person is no longer in the posting's outreach check")?;
+    draft_to(database, profile, posting_link, person, check.team.as_deref()).await
+}
+
+/// Drafts a note about the posting at `posting_link` to `person`, who must have a profile address.
+async fn draft_to(
+    database: &Path,
+    profile: &Profile,
+    posting_link: &str,
+    person: &Person,
+    team: Option<&str>,
+) -> Result<Draft, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let profile_url = person
+        .profile_url
+        .clone()
+        .ok_or_else(|| format!("no LinkedIn profile is known for {}", person.name))?;
+    let posting = Store::open(database)
+        .map_err(said)?
+        .postings()
+        .map_err(said)?
+        .into_iter()
+        .find(|posting| posting.link == posting_link)
+        .ok_or("the posting is no longer in the database")?;
     let slot = Slot::to_reach(person.degree.as_deref(), inmail_credit_is_free(database));
-    let team = check
-        .team
-        .as_deref()
-        .map(|team| format!(" on the {team} team"))
-        .unwrap_or_default();
+    let team = team.map(|team| format!(" on the {team} team")).unwrap_or_default();
     let ask = Ask {
         slot,
         person: &person.name,
@@ -1684,7 +1761,7 @@ pub async fn draft_for_check(
         about: About::Posting(posting.link.clone()),
         person: person.name.clone(),
         headline: person.title.clone(),
-        profile_url: person.profile_url.clone().expect("the person was picked for a profile"),
+        profile_url,
         slot,
         subject: written.subject,
         text: written.text,
@@ -1698,6 +1775,165 @@ pub async fn draft_for_check(
         None => return Err(format!("{} already has a draft about this posting", person.name)),
     };
     Ok(draft)
+}
+
+/// The people a posting's scorer note names, as the model read them from `note`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScorerPeople {
+    pub posting_link: String,
+    /// The note as it was read. A changed note is read again.
+    pub note: String,
+    pub people: Vec<Person>,
+}
+
+const SCORER_INSTRUCTIONS: &str = "You read a note that says whom an applicant could reach at a company \
+about one job posting. List each person the note names who works at that company. name is the name as \
+the note writes it. title is their job title as the note writes it, or an empty string. profile_url is the \
+LinkedIn profile link the note writes for them, or null when it writes none. degree is 1st when the note \
+says they are the applicant's own connection, 2nd or 3rd+ when the note says so, or null. Leave out \
+people the note says work at another company, and return an empty list when the note names nobody. \
+Never guess a name or a link.";
+
+fn scorer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "people": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "title": { "type": "string" },
+                        "profile_url": { "type": ["string", "null"] },
+                        "degree": { "type": ["string", "null"], "enum": ["1st", "2nd", "3rd+", null] },
+                    },
+                    "required": ["name", "title", "profile_url", "degree"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": ["people"],
+        "additionalProperties": false,
+    })
+}
+
+/// The people in a posting's scorer note. A note read before is not read again; a new or changed
+/// one is read by the model and kept.
+pub async fn scorer_people(database: &Path, posting_link: &str, note: &str) -> Result<Vec<Person>, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let kept = Store::open(database)
+        .map_err(said)?
+        .scorer_people()
+        .map_err(said)?
+        .into_iter()
+        .find(|read| read.posting_link == posting_link && read.note == note);
+    if let Some(kept) = kept {
+        return Ok(kept.people);
+    }
+    #[derive(Deserialize)]
+    struct Reply {
+        people: Vec<Person>,
+    }
+    // "None — apply cold" names nobody, so the model is not asked.
+    let people = if note.trim_start().to_lowercase().starts_with("none") {
+        Vec::new()
+    } else {
+        let reply = providers::run(Job::Scoring, SCORER_INSTRUCTIONS, note.to_owned(), &scorer_schema()).await?;
+        let reply: Reply = serde_json::from_value(reply)
+            .map_err(|error| format!("the model's reply was not in the agreed form: {error}"))?;
+        tidied(reply.people)
+    };
+    let read = ScorerPeople {
+        posting_link: posting_link.to_owned(),
+        note: note.to_owned(),
+        people: people.clone(),
+    };
+    Store::open(database)
+        .and_then(|store| store.save_scorer_people(&read, Timestamp::now()))
+        .map_err(said)?;
+    Ok(people)
+}
+
+/// The people with profile links in one form, without the same person twice.
+fn tidied(people: Vec<Person>) -> Vec<Person> {
+    let mut kept: Vec<Person> = Vec::new();
+    for mut person in people {
+        person.name = person.name.trim().to_owned();
+        person.profile_url = person
+            .profile_url
+            .filter(|link| link.contains("/in/"))
+            .map(|link| linkedin::profile_address(&link));
+        if !person.name.is_empty() && !kept.iter().any(|seen| seen.name == person.name) {
+            kept.push(person);
+        }
+    }
+    kept
+}
+
+/// Drafts a note to a person the posting's scorer note names, by their name. A person the note
+/// gives no profile link for is first looked up on LinkedIn by name and company, one page load,
+/// and the link found is kept.
+pub async fn draft_for_scorer(
+    database: &Path,
+    profile: &Profile,
+    bridge: Option<Arc<Bridge>>,
+    posting_link: &str,
+    name: &str,
+) -> Result<Draft, String> {
+    let said = |error: StoreError| format!("the database failed: {error}");
+    let (mut read, posting) = {
+        let store = Store::open(database).map_err(said)?;
+        let read = store
+            .scorer_people()
+            .map_err(said)?
+            .into_iter()
+            .find(|read| read.posting_link == posting_link)
+            .ok_or("the scorer note has not been read yet")?;
+        let posting = store
+            .postings()
+            .map_err(said)?
+            .into_iter()
+            .find(|posting| posting.link == posting_link)
+            .ok_or("the posting is no longer in the database")?;
+        (read, posting)
+    };
+    let at = read
+        .people
+        .iter()
+        .position(|person| person.name == name)
+        .ok_or_else(|| format!("{name} is no longer in the scorer note"))?;
+    if read.people[at].profile_url.is_none() {
+        let bridge =
+            bridge.ok_or_else(|| format!("Chrome is not connected, so {name}'s profile cannot be looked up"))?;
+        let found = find_profile(bridge, name, &posting.company).await?;
+        read.people[at].profile_url = found.profile_url;
+        if read.people[at].degree.is_none() {
+            read.people[at].degree = found.degree;
+        }
+        if read.people[at].title.is_empty() {
+            read.people[at].title = found.title;
+        }
+        Store::open(database)
+            .and_then(|store| store.save_scorer_people(&read, Timestamp::now()))
+            .map_err(said)?;
+    }
+    draft_to(database, profile, posting_link, &read.people[at], None).await
+}
+
+/// Finds one person's profile with a LinkedIn people search for their name and company: one page load.
+async fn find_profile(bridge: Arc<Bridge>, name: &str, company: &str) -> Result<Person, String> {
+    let mut reader = Reader::open(bridge, 1).await.map_err(|stop| stop.to_string())?;
+    let loaded = reader
+        .load(
+            &linkedin::people_search_address(&format!("{name} {company}")),
+            First::Nothing,
+        )
+        .await;
+    reader.close().await;
+    let html = loaded.map_err(|stop| stop.to_string())?;
+    linkedin::named_in(&people_page(&html).people, name)
+        .ok_or_else(|| format!("LinkedIn's people search for {name} at {company} showed no one by that name"))
 }
 
 /// Rewrites a waiting draft to someone outside the network in the other form: a note becomes an
@@ -1844,6 +2080,57 @@ mod tests {
     }
 
     #[test]
+    fn a_scorer_note_read_before_is_not_read_again_and_links_keep_one_form() {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let people = tidied(vec![
+            Person {
+                name: " Ann Named ".into(),
+                title: "SWE".into(),
+                profile_url: Some("linkedin.com/in/ann-named?trk=x".into()),
+                degree: Some("2nd".into()),
+            },
+            Person {
+                name: "Ann Named".into(),
+                title: String::new(),
+                profile_url: None,
+                degree: None,
+            },
+            Person {
+                name: "Cy Nolink".into(),
+                title: "Recruiter".into(),
+                profile_url: Some("not a profile".into()),
+                degree: None,
+            },
+        ]);
+        assert_eq!(
+            people
+                .iter()
+                .map(|person| (person.name.as_str(), person.profile_url.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("Ann Named", Some("https://www.linkedin.com/in/ann-named/")),
+                ("Cy Nolink", None)
+            ]
+        );
+        let read = ScorerPeople {
+            posting_link: "https://simplify.jobs/p/1".into(),
+            note: "Team member found — Ann Named".into(),
+            people,
+        };
+        Store::open(&database)
+            .unwrap()
+            .save_scorer_people(&read, Timestamp::now())
+            .unwrap();
+        // The same note comes back from the store; reading it again would need the model.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let kept = runtime
+            .block_on(scorer_people(&database, &read.posting_link, &read.note))
+            .unwrap();
+        assert_eq!(kept, read.people);
+    }
+
+    #[test]
     fn apply_ready_postings_are_checked_first_and_settled_ones_are_not_checked_again() {
         let postings = [
             posting("a", 70, "Review - 70"),
@@ -1862,6 +2149,26 @@ mod tests {
             .map(|posting| posting.link)
             .collect();
         assert_eq!(order, ["b", "c", "d", "a"]);
+
+        // A check that kept 2 people under the old limit is checked again once, after the new ones.
+        let at = |time: &str| time.parse::<Timestamp>().unwrap();
+        let two = vec![person("Bo", "Engineer"), person("Cy", "Engineer")];
+        let found = |link: &str, people: Vec<Person>, checked_at: &str| Check {
+            verdict: Verdict::TeamMember,
+            people,
+            checked_at: at(checked_at),
+            ..check(link, Verdict::TeamMember)
+        };
+        let checks = [
+            found("e", two.clone(), "2026-11-24T12:00:00Z"),
+            found("b", vec![person("Bo", "Engineer")], "2026-11-24T12:00:00Z"),
+            found("c", two, "2026-11-26T12:00:00Z"),
+        ];
+        let order: Vec<String> = to_check(&postings, &checks)
+            .into_iter()
+            .map(|posting| posting.link)
+            .collect();
+        assert_eq!(order, ["d", "a", "e"]);
     }
 
     #[test]
@@ -1874,7 +2181,7 @@ mod tests {
         ];
         let found = connections_at("Example Co", Some("Storage team"), &connections);
         let names: Vec<&str> = found.iter().map(|person| person.name.as_str()).collect();
-        assert_eq!(names, ["Cy Sample", "Ada Sample"]);
+        assert_eq!(names, ["Cy Sample", "Ada Sample", "Di Sample"]);
         assert_eq!(found[0].degree.as_deref(), Some("1st"));
         assert!(connections_at("Nowhere Inc", None, &connections).is_empty());
     }
@@ -1947,8 +2254,9 @@ mod tests {
                 .map(|person| person.name)
                 .collect()
         };
-        // An engineer on the team first, then another engineer; Cy names the team but is no engineer.
-        assert_eq!(names("Storage", &named, &results), ["Ed", "Bo"]);
+        // An engineer on the team first, then another engineer, then a recruiter; Cy names the team
+        // but is no engineer, and Ada is neither.
+        assert_eq!(names("Storage", &named, &results), ["Ed", "Bo", "Di"]);
         // A weak team word picks no one by itself, "swe" is not "Sweden" and "Engineered" is no engineer.
         let others = [
             person("Ed", "Senior Analyst, Enterprise Cybersecurity"),

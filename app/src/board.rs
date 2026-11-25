@@ -5,7 +5,7 @@
 //! They never go to the sheet. Approving a posting puts it in the apply queue, which fills
 //! several forms at once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::browser::Browser;
@@ -31,6 +31,7 @@ use maverick_core::jobs::{
 use maverick_core::outreach::Check;
 use maverick_core::score::APPLY_READY;
 use maverick_core::store::Store;
+use serde::{Deserialize, Serialize};
 
 /// A posting on the board.
 #[derive(Clone, Debug, PartialEq)]
@@ -239,6 +240,42 @@ pub fn sort_submitted(applications: &mut [Application], order: SubmittedOrder) {
     }
 }
 
+/// Which companies the pending list shows.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CompanyFilter {
+    /// Companies kept out of the list, as their postings name them. They stay hidden after a restart.
+    pub hidden: BTreeSet<String>,
+    /// The one company the list shows, until the user shows all again.
+    #[serde(skip)]
+    pub only: Option<String>,
+}
+
+impl CompanyFilter {
+    pub fn shows(&self, company: &str) -> bool {
+        let same = |name: &String| name.trim().eq_ignore_ascii_case(company.trim());
+        match &self.only {
+            Some(only) => same(only),
+            None => !self.hidden.iter().any(same),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.only.is_some() || !self.hidden.is_empty()
+    }
+
+    /// The filter saved in `file`, or none when there is no file or it cannot be read.
+    pub fn load(file: Option<&std::path::Path>) -> Self {
+        file.and_then(|file| std::fs::read(file).ok())
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, file: &std::path::Path) -> std::io::Result<()> {
+        let data = serde_json::to_vec_pretty(self).expect("the company filter serializes");
+        std::fs::write(file, data)
+    }
+}
+
 /// Which list the board shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
@@ -250,12 +287,27 @@ pub struct Rows {
     browser: Entity<Browser>,
     outreach: Entity<OutreachView>,
     section: Section,
+    /// The pending postings the company filter shows.
     entries: Vec<Entry>,
+    /// The pending postings the company filter keeps out.
+    filtered_out: Vec<Entry>,
     submitted: Vec<Application>,
     selected: Option<IndexPath>,
 }
 
 impl Rows {
+    /// Every posting on the board, shown or filtered out.
+    fn all(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().chain(&self.filtered_out)
+    }
+
+    /// Splits the postings again into those `filter` shows and those it keeps out.
+    fn refilter(&mut self, filter: &CompanyFilter) {
+        let mut all = std::mem::take(&mut self.entries);
+        all.append(&mut self.filtered_out);
+        (self.entries, self.filtered_out) = all.into_iter().partition(|entry| filter.shows(&entry.company));
+    }
+
     fn shown(&self) -> usize {
         match self.section {
             Section::Pending => self.entries.len(),
@@ -292,7 +344,7 @@ fn sponsorship_chip(sponsorship: Sponsorship, palette: &Palette) -> Div {
 /// Where a queued posting is, in the signal that says whose move it is.
 fn step_chip(step: &Step, palette: &Palette) -> Div {
     match step {
-        Step::Queued | Step::Opening | Step::Filling => ui::boxed(step.word(), palette.muted),
+        Step::Queued | Step::Opening | Step::Filling | Step::Submitting => ui::boxed(step.word(), palette.muted),
         Step::NeedsYou(_) | Step::Ready => ui::chip(Signal::Yours, step.word(), palette),
         Step::Applied => ui::chip(Signal::Done, step.word(), palette),
         Step::Failed(_) => ui::chip(Signal::Failed, step.word(), palette),
@@ -438,6 +490,7 @@ impl ListDelegate for Rows {
 
     fn render_empty(&mut self, _: &mut Window, cx: &mut Context<ListState<Self>>) -> impl IntoElement {
         let message = match self.section {
+            Section::Pending if !self.filtered_out.is_empty() => "The company filter hides every posting.",
             Section::Pending => "Nothing waits on a decision. New postings arrive with the hourly check.",
             Section::Submitted => "No applications are recorded yet.",
         };
@@ -457,6 +510,9 @@ pub struct Board {
     list: Entity<ListState<Rows>>,
     order: Order,
     submitted_order: SubmittedOrder,
+    filter: CompanyFilter,
+    /// Where the hidden companies are saved.
+    filter_file: Option<PathBuf>,
     /// Each decision made in this run, newest last, with the decision it replaced.
     made: Vec<(String, Option<Decision>)>,
     /// Why the last decision could not be saved.
@@ -483,6 +539,7 @@ impl Board {
             outreach: outreach.clone(),
             section: Section::Pending,
             entries: Vec::new(),
+            filtered_out: Vec::new(),
             submitted: Vec::new(),
             selected: None,
         };
@@ -502,7 +559,12 @@ impl Board {
                 cx.notify();
             }),
         ];
+        let filter_file = database
+            .as_ref()
+            .and_then(|database| Some(database.parent()?.join("company-filter.json")));
         let mut board = Self {
+            filter: CompanyFilter::load(filter_file.as_deref()),
+            filter_file,
             browser,
             outreach,
             database,
@@ -523,10 +585,13 @@ impl Board {
     /// Shows what the database holds now, keeping the section and the orders.
     pub fn replace(&mut self, data: BoardData, window: &mut Window, cx: &mut Context<Self>) {
         let (order, submitted_order) = (self.order, self.submitted_order);
+        let filter = self.filter.clone();
         let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
             rows.entries = data.entries;
+            rows.filtered_out.clear();
+            rows.refilter(&filter);
             rows.submitted = data.applications;
             sort(&mut rows.entries, order, &reachable);
             sort_submitted(&mut rows.submitted, submitted_order);
@@ -535,10 +600,10 @@ impl Board {
         cx.notify();
     }
 
-    /// How many postings wait on a decision.
+    /// How many postings wait on a decision, those the company filter keeps out included.
     pub fn pending(&self, cx: &App) -> usize {
         let rows = self.list.read(cx).delegate();
-        rows.entries.iter().filter(|entry| entry.decision.is_none()).count()
+        rows.all().filter(|entry| entry.decision.is_none()).count()
     }
 
     /// The selected posting, when the pending list shows.
@@ -593,6 +658,54 @@ impl Board {
         cx.notify();
     }
 
+    /// Shows the postings `filter` lets through, keeping the selection at `row`, and saves the hidden companies.
+    fn set_filter(&mut self, filter: CompanyFilter, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if filter.hidden != self.filter.hidden
+            && let Some(file) = &self.filter_file
+        {
+            self.problem = filter
+                .save(file)
+                .err()
+                .map(|error| format!("The hidden companies were not saved: {error}"));
+        }
+        self.filter = filter;
+        let (order, filter) = (self.order, self.filter.clone());
+        let reachable = self.outreach.read(cx).reachable();
+        self.list.update(cx, |list, cx| {
+            let rows = list.delegate_mut();
+            rows.section = Section::Pending;
+            rows.refilter(&filter);
+            sort(&mut rows.entries, order, &reachable);
+            select_row(list, row, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Keeps the selected posting's company out of the list. The selection lands on the next posting.
+    fn hide_company(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let list = self.list.read(cx);
+        let row = list.selected_index().map_or(0, |ix| ix.row);
+        let Some(company) = list.delegate().selected_entry().map(|entry| entry.company.clone()) else {
+            return;
+        };
+        let mut filter = self.filter.clone();
+        filter.only = None;
+        filter.hidden.insert(company);
+        self.set_filter(filter, row, window, cx);
+    }
+
+    /// Shows only the selected posting's company.
+    fn only_company(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(company) = self.selected_entry(cx).map(|entry| entry.company.clone()) else {
+            return;
+        };
+        let filter = CompanyFilter {
+            only: Some(company),
+            ..self.filter.clone()
+        };
+        self.set_filter(filter, 0, window, cx);
+    }
+
     /// Decides the selected posting. The selection stays in place, so it lands on the next pending one.
     pub fn decide(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.order;
@@ -621,7 +734,7 @@ impl Board {
     /// Puts an approved posting in the apply queue, and takes any other out while it waits.
     fn sync_queue(&mut self, link: &str, decision: Option<Decision>, cx: &mut Context<Self>) {
         let rows = self.list.read(cx).delegate();
-        let Some(entry) = rows.entries.iter().find(|entry| entry.link == link) else {
+        let Some(entry) = rows.all().find(|entry| entry.link == link) else {
             return;
         };
         let (role, address) = (entry.role(), entry.address.clone());
@@ -645,8 +758,7 @@ impl Board {
         self.list
             .read(cx)
             .delegate()
-            .entries
-            .iter()
+            .all()
             .filter(|entry| entry.decision == Some(Decision::Approved) && queue.get(&entry.address).is_none())
             .cloned()
             .collect()
@@ -675,6 +787,7 @@ impl Board {
             let rows = list.delegate_mut();
             for sent in new {
                 rows.entries.retain(|entry| entry.address != sent.address);
+                rows.filtered_out.retain(|entry| entry.address != sent.address);
                 rows.submitted
                     .push(Application::submitted_today(&sent.title, &sent.address));
             }
@@ -694,7 +807,8 @@ impl Board {
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
             rows.section = Section::Pending;
-            if let Some(entry) = rows.entries.iter_mut().find(|entry| entry.link == link) {
+            let all = rows.entries.iter_mut().chain(&mut rows.filtered_out);
+            if let Some(entry) = all.into_iter().find(|entry| entry.link == link) {
                 entry.decision = before;
             }
             sort(&mut rows.entries, order, &reachable);
@@ -818,6 +932,7 @@ impl Board {
             "a" => self.decide(Decision::Approved, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
             "o" => self.open_selected(cx),
+            "h" => self.hide_company(window, cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -903,6 +1018,87 @@ impl Board {
             }))
     }
 
+    /// The company filter in force, with a way to take back each part of it.
+    fn filter_strip(&self, palette: &Palette, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.filter.is_active() {
+            return None;
+        }
+        let rows = self.list.read(cx).delegate();
+        let out = rows
+            .filtered_out
+            .iter()
+            .filter(|entry| entry.decision.is_none())
+            .count();
+        let unset = |id: ElementId, name: String, word: String, filter: CompanyFilter| {
+            ui::button(id, name, ui::quiet_face(format!("{word} ×"), palette))
+                .on_click(cx.listener(move |this, _, window, cx| this.set_filter(filter.clone(), 0, window, cx)))
+                .into_any_element()
+        };
+        let parts: Vec<AnyElement> = match &self.filter.only {
+            Some(only) => vec![unset(
+                "company-only".into(),
+                format!("Show all companies, not only {only}"),
+                format!("only {only}"),
+                CompanyFilter {
+                    only: None,
+                    ..self.filter.clone()
+                },
+            )],
+            None => self
+                .filter
+                .hidden
+                .iter()
+                .enumerate()
+                .map(|(ix, company)| {
+                    let mut filter = self.filter.clone();
+                    filter.hidden.remove(company);
+                    unset(
+                        ElementId::NamedInteger("unhide-company".into(), ix as u64),
+                        format!("Show {company} again"),
+                        company.clone(),
+                        filter,
+                    )
+                })
+                .collect(),
+        };
+        let label = if self.filter.only.is_some() {
+            "showing"
+        } else {
+            "hiding"
+        };
+        Some(
+            h_flex()
+                .flex_none()
+                .flex_wrap()
+                .gap_2()
+                .px(px(14.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(palette.line)
+                .child(ui::caps(label).text_color(palette.faint))
+                .children(parts)
+                .child(div().flex_1())
+                .child(
+                    ui::caps(format!("{out} pending hidden"))
+                        .id("filtered-out")
+                        .test_support()
+                        .role(gpui_kit::Role::Label)
+                        .aria_label(format!("{out} pending hidden"))
+                        .text_color(palette.faint),
+                )
+                .children((self.filter.hidden.len() > 1 || self.filter.only.is_some()).then(|| {
+                    ui::button(
+                        "show-all-companies",
+                        "Show all companies",
+                        ui::quiet_face("show all", palette),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.set_filter(CompanyFilter::default(), 0, window, cx)),
+                    )
+                })),
+        )
+    }
+
     /// The queue's counts, how many forms fill at once, and a way to start approvals from before.
     fn queue_controls(&self, palette: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let browser = self.browser.read(cx);
@@ -940,6 +1136,26 @@ impl Board {
                 .into_any_element(),
             );
         }
+        let auto_submit = browser.auto_submit();
+        let (word, tip) = match auto_submit {
+            true => (
+                "auto-submit on",
+                "Maverick submits a form when every answer in it is yours or follows from your facts. Click to turn this off.",
+            ),
+            false => (
+                "auto-submit off",
+                "Maverick fills each form and leaves the Submit to you. Click to let it submit complete forms.",
+            ),
+        };
+        controls.push(
+            ui::button("auto-submit", word, ui::quiet_face(word, palette))
+                .tip(tip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.browser
+                        .update(cx, |browser, cx| browser.set_auto_submit(!auto_submit, cx));
+                }))
+                .into_any_element(),
+        );
         let step = |id: &'static str, name: &'static str, word: &'static str, to: usize| {
             ui::button(id, name, ui::quiet_face(word, palette))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1003,11 +1219,17 @@ impl Board {
             Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
             _ => None,
         };
+        let auto_submit = self.browser.read(cx).auto_submit();
         let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
+            (None, _) if auto_submit => "approve queues it. maverick submits it when nothing is left for you.",
             (None, _) => "approve queues it. nothing gets submitted.",
             (Some(Decision::Skipped), _) => "skipped.",
             (Some(Decision::Approved), None) => "approve again to queue it.",
+            (_, Some(Step::Queued | Step::Opening | Step::Filling)) if auto_submit => {
+                "filling. maverick submits it when nothing is left for you."
+            }
             (_, Some(Step::Queued | Step::Opening | Step::Filling)) => "filling. nothing gets submitted.",
+            (_, Some(Step::Submitting)) => "submitting.",
             (_, Some(Step::NeedsYou(_) | Step::Ready)) => "you click submit.",
             (_, Some(Step::Applied)) => "applied.",
             (_, Some(Step::Failed(_))) => "nothing was submitted.",
@@ -1019,9 +1241,14 @@ impl Board {
             Some(_) => ("", ""),
         };
         let link = entry.link.clone();
-        let outreach = self
-            .outreach
-            .update(cx, |outreach, cx| outreach.posting_section(&link, palette, cx));
+        let reported = run.as_ref().is_some_and(|run| run.report.is_some());
+        let scorer_note = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref()).outreach;
+        let (scorer, outreach) = self.outreach.update(cx, |outreach, cx| {
+            let scorer = (!reported)
+                .then(|| outreach.scorer_section(&link, &scorer_note, palette, cx))
+                .flatten();
+            (scorer, outreach.posting_section(&link, palette, cx))
+        });
         let reviewable = run
             .as_ref()
             .is_some_and(|run| run.tab.is_some() && matches!(run.step, Step::NeedsYou(_) | Step::Ready));
@@ -1043,9 +1270,29 @@ impl Board {
             })
         };
         let link_bar = self.link_bar(&entry.address, palette, cx);
+        let company_actions = h_flex()
+            .gap_2()
+            .child(
+                ui::button(
+                    "hide-company",
+                    format!("Hide {}", entry.company),
+                    ui::quiet_face("hide  h", palette),
+                )
+                .tip("Keep this company's postings out of the list. It stays hidden after a restart.")
+                .on_click(cx.listener(|this, _, window, cx| this.hide_company(window, cx))),
+            )
+            .children(self.filter.only.is_none().then(|| {
+                ui::button(
+                    "only-company",
+                    format!("Only {}", entry.company),
+                    ui::quiet_face("only", palette),
+                )
+                .tip("Show this company's postings alone.")
+                .on_click(cx.listener(|this, _, window, cx| this.only_company(window, cx)))
+            }));
         v_flex()
             .size_full()
-            .child(posting_header(&entry, palette))
+            .child(posting_header(&entry, company_actions, palette))
             .child(link_bar)
             .children(run.as_ref().map(|run| run_status(run, palette)))
             .child(
@@ -1060,6 +1307,7 @@ impl Board {
                         Some(report) => report::sections(report, palette),
                         None => verdict_view(&entry, palette),
                     })
+                    .children(scorer)
                     .child(outreach)
                     .child(ui::caps("details").pb(px(8.)).text_color(palette.faint))
                     .child(ui::facts(&facts, palette)),
@@ -1083,8 +1331,8 @@ impl Board {
     }
 }
 
-/// The company and the application system above the posting's title, all of which can be copied.
-fn posting_header(entry: &Entry, palette: &Palette) -> Div {
+/// The company, its filter buttons and the application system above the posting's title, which can be copied.
+fn posting_header(entry: &Entry, company_actions: Div, palette: &Palette) -> Div {
     h_flex()
         .flex_none()
         .items_end()
@@ -1111,7 +1359,8 @@ fn posting_header(entry: &Entry, palette: &Palette) -> Div {
                                 .text_color(palette.ink)
                                 .child(ui::selectable("posting-company", &entry.company.to_uppercase())),
                         )
-                        .child(ui::boxed(entry.system(), palette.muted)),
+                        .child(ui::boxed(entry.system(), palette.muted))
+                        .child(company_actions),
                 )
                 .child(
                     div()
@@ -1125,7 +1374,8 @@ fn posting_header(entry: &Entry, palette: &Palette) -> Div {
         .child(ui::score(entry.score, 54.).text_color(palette.ink))
 }
 
-/// What scoring said, in parts: the reason, then what blocks, what to watch, the team and whom to reach.
+/// What scoring said, in parts: the reason, then what blocks, what to watch and the team. Whom the
+/// scorer said to reach shows in its own section, where each person can be reached.
 fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
     let verdict = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref());
     let status = match (&entry.notes, entry.apply_ready) {
@@ -1186,12 +1436,6 @@ fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
         ))
         .children(points("advisory", "watch for", &verdict.advisory, palette.muted))
         .children(points("team", "team", &team, palette.faint))
-        .children(points(
-            "scorer-outreach",
-            "scorer's outreach note",
-            &verdict.outreach,
-            palette.faint,
-        ))
 }
 
 /// Where a queued posting is, and the fill report's map once there is one.
@@ -1200,10 +1444,18 @@ fn run_status(run: &Run, palette: &Palette) -> impl IntoElement + use<> {
         Step::Queued => (None, "Queued. It starts when a slot is free.".to_owned()),
         Step::Opening => (None, "Opening the form in a background tab.".to_owned()),
         Step::Filling => (Some(Signal::Model), "Filling the form in a background tab.".to_owned()),
+        Step::Submitting => (
+            Some(Signal::Model),
+            "Nothing was left for you, so Maverick pressed Submit.".to_owned(),
+        ),
         Step::NeedsYou(why) => (Some(Signal::Yours), why.clone()),
+        // The report says why Maverick would not submit this form itself, such as a draft to read.
         Step::Ready => (
             Some(Signal::Yours),
-            "Every required field is answered. Review it and click Submit.".to_owned(),
+            match run.report.as_ref().and_then(|report| report.held_for_the_user()) {
+                Some(why) => format!("Every required field is answered. {why} Review it and click Submit."),
+                None => "Every required field is answered. Review it and click Submit.".to_owned(),
+            },
         ),
         Step::Applied => (Some(Signal::Done), "Submitted and recorded.".to_owned()),
         Step::Failed(why) => (Some(Signal::Failed), why.clone()),
@@ -1248,6 +1500,7 @@ impl Render for Board {
             .test_support()
             .on_key_down(cx.listener(Self::on_key))
             .child(self.toolbar(&palette, cx))
+            .children(self.filter_strip(&palette, cx))
             .children(self.problem.clone().map(|problem| {
                 h_flex()
                     .gap(px(9.))
@@ -1423,6 +1676,30 @@ mod tests {
                 "High but not ready",
                 "Skipped but decided"
             ]
+        );
+    }
+
+    #[test]
+    fn the_company_filter_hides_companies_or_shows_one_alone() {
+        let mut filter = CompanyFilter::default();
+        assert!(filter.shows("Amazon"));
+        filter.hidden.insert("Amazon".into());
+        assert!(!filter.shows("amazon "));
+        assert!(filter.shows("Apple"));
+        filter.only = Some("Apple".into());
+        assert!(filter.shows("Apple"));
+        assert!(!filter.shows("Google"));
+
+        // Only the hidden companies outlast a restart.
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("company-filter.json");
+        filter.save(&file).unwrap();
+        let loaded = CompanyFilter::load(Some(&file));
+        assert_eq!(loaded.hidden, filter.hidden);
+        assert_eq!(loaded.only, None);
+        assert_eq!(
+            CompanyFilter::load(Some(&scratch.path().join("none.json"))),
+            CompanyFilter::default()
         );
     }
 
@@ -1603,5 +1880,118 @@ mod tests {
             assert!(window.try_find("approve").is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn hiding_a_company_takes_its_postings_out_until_it_is_shown_again(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let at = |company: &str, posting: Posting| Posting {
+            company: company.into(),
+            ..posting
+        };
+        let postings = vec![
+            at(
+                "Big Corp",
+                posting("https://simplify.jobs/p/1", "Big one", Stage::Review, Some(90), "10"),
+            ),
+            at(
+                "Big Corp",
+                posting("https://simplify.jobs/p/2", "Big two", Stage::Review, Some(80), "10"),
+            ),
+            at(
+                "Small Co",
+                posting("https://simplify.jobs/p/3", "Small one", Stage::Review, Some(70), "10"),
+            ),
+            at(
+                "Third Inc",
+                posting("https://simplify.jobs/p/4", "Third one", Stage::Review, Some(60), "10"),
+            ),
+        ];
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let data = BoardData::new(&postings, Vec::new(), &HashMap::new());
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                let bridge = maverick_core::bridge::Bridge::new();
+                Browser::new(bridge, background, Err("none".into()), None, None, cx)
+            })
+        });
+        let open = |cx: &mut TestAppContext, data: BoardData| {
+            cx.update(|cx| {
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1000.), px(640.)),
+                    ))),
+                    ..Default::default()
+                };
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    let outreach = cx.new(|cx| OutreachView::new(browser.clone(), None, window, cx));
+                    cx.new(|cx| Board::new(browser.clone(), outreach, data, Some(database.clone()), window, cx))
+                })
+                .expect("the test window opens")
+            })
+        };
+        let (window, board) = open(cx, data.clone());
+        let shown = |cx: &mut TestAppContext, board: &Entity<Board>| {
+            board.read_with(cx, |board, cx| {
+                let rows = board.list.read(cx).delegate();
+                let selected = rows.selected_entry().map(|entry| entry.title.clone());
+                (titles(&rows.entries).join(", "), selected, board.pending(cx))
+            })
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("h", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("filtered-out").label(), Some("2 pending hidden"));
+        })
+        .unwrap();
+        assert_eq!(
+            shown(cx, &board),
+            ("Small one, Third one".into(), Some("Small one".into()), 4)
+        );
+
+        // The hidden company stays hidden in a new window, as after a restart.
+        let (window, board) = open(cx, data);
+        assert_eq!(
+            shown(cx, &board),
+            ("Small one, Third one".into(), Some("Small one".into()), 4)
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("only-company", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("company-only").label(),
+                Some("Show all companies, not only Small Co")
+            );
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board).0, "Small one");
+
+        cx.update_window(window, |_, window, cx| {
+            window.click("company-only", cx);
+            window.render_frame(cx);
+            window.click(ElementId::NamedInteger("unhide-company".into(), 0), cx);
+            window.render_frame(cx);
+            assert!(window.try_find("filtered-out").is_none());
+        })
+        .unwrap();
+        assert_eq!(shown(cx, &board).0, "Big one, Big two, Small one, Third one");
+        let saved = std::fs::read_to_string(scratch.path().join("company-filter.json")).unwrap();
+        assert!(!saved.contains("Big Corp"), "{saved}");
     }
 }

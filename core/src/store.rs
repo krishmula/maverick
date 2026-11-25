@@ -190,6 +190,14 @@ const MIGRATIONS: &[&str] = &[
         read_at TEXT NOT NULL
     ) STRICT;
 ",
+    "
+    CREATE TABLE scorer_people (
+        posting_link TEXT PRIMARY KEY,
+        note TEXT NOT NULL,
+        people TEXT NOT NULL,
+        read_at TEXT NOT NULL
+    ) STRICT;
+",
 ];
 
 pub struct Store {

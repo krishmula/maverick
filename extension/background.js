@@ -11,6 +11,25 @@ let tabsTimer = null;
 // Tabs this extension holds a debugger on. Chrome shows its debugging bar while any are held.
 const debugged = new Set();
 
+// Chrome takes the debugger off a tab the moment a frame in it starts to load another
+// extension's page, such as the menu a password manager shows next to a field. This runs in
+// that extension's scripts of the tab, and from then on their frames cannot load such a page.
+const NO_EXTENSION_FRAMES = `(() => {
+  const ofAnExtension = (url) => String(url).trim().toLowerCase().startsWith("chrome-extension://");
+  const src = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src");
+  Object.defineProperty(HTMLIFrameElement.prototype, "src", {
+    ...src,
+    set(url) {
+      if (!ofAnExtension(url)) src.set.call(this, url);
+    },
+  });
+  const setAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (name, value) {
+    if (this instanceof HTMLIFrameElement && String(name).toLowerCase() === "src" && ofAnExtension(value)) return;
+    return setAttribute.call(this, name, value);
+  };
+})()`;
+
 function connect() {
   if (port || Date.now() - lastAttempt < RETRY_GAP_MS) return;
   lastAttempt = Date.now();
@@ -94,6 +113,8 @@ async function run(request) {
       if (!debugged.has(request.tabId)) {
         await chrome.debugger.attach({ tabId: request.tabId }, DEVTOOLS_PROTOCOL);
         debugged.add(request.tabId);
+        // Chrome now reports each place scripts run in this tab. See keepFramesOut.
+        await chrome.debugger.sendCommand({ tabId: request.tabId }, "Runtime.enable");
       }
       return null;
     case "debugger.detach":
@@ -128,10 +149,22 @@ for (const event of [
   event.addListener(tabsChanged);
 }
 
+// Another extension's scripts run in a place of their own in the page. The app cannot answer
+// in time, because the scripts start the moment that place exists.
+function keepFramesOut(source, context) {
+  const mine = `chrome-extension://${chrome.runtime.id}`;
+  if (!context.origin.startsWith("chrome-extension://") || context.origin === mine) return;
+  chrome.debugger
+    .sendCommand(source, "Runtime.evaluate", { contextId: context.id, expression: NO_EXTENSION_FRAMES })
+    .catch(() => {});
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (port && debugged.has(source.tabId)) {
-    post(port, { kind: "event", tabId: source.tabId, method, params: params ?? null });
-  }
+  if (!debugged.has(source.tabId)) return;
+  if (method === "Runtime.executionContextCreated") keepFramesOut(source, params.context);
+  // The app reads no event of this kind, and a page that logs a lot would flood it.
+  if (method.startsWith("Runtime.")) return;
+  if (port) post(port, { kind: "event", tabId: source.tabId, method, params: params ?? null });
 });
 // Fires when the tab closes or the user dismisses the debugging bar.
 chrome.debugger.onDetach.addListener((source) => debugged.delete(source.tabId));

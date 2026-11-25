@@ -1,6 +1,6 @@
-//! The apply queue: approved postings, filled several at once, each in its own Chrome tab. It never submits.
+//! The apply queue: approved postings, filled several at once, each in its own Chrome tab.
 
-use maverick_core::apply::{FieldResult, Report};
+use maverick_core::apply::{End, Report, Sent};
 use maverick_core::bridge::Tab;
 
 /// How many forms fill at once unless the user picks another number.
@@ -16,6 +16,8 @@ pub enum Step {
     Opening,
     /// Answering the form.
     Filling,
+    /// Nothing in the form was left for the user, and Maverick pressed Submit.
+    Submitting,
     /// The tab waits on the user: required fields left, a sign-in wall, an email to verify,
     /// or a system Maverick cannot fill. The text says which.
     NeedsYou(String),
@@ -29,7 +31,7 @@ pub enum Step {
 impl Step {
     /// True while the run holds one of the parallel slots.
     pub fn is_running(&self) -> bool {
-        matches!(self, Self::Opening | Self::Filling)
+        matches!(self, Self::Opening | Self::Filling | Self::Submitting)
     }
 
     /// The short word a list row shows.
@@ -38,6 +40,7 @@ impl Step {
             Self::Queued => "queued",
             Self::Opening => "opening",
             Self::Filling => "filling",
+            Self::Submitting => "submitting",
             Self::NeedsYou(_) => "needs you",
             Self::Ready => "ready to submit",
             Self::Applied => "applied",
@@ -46,14 +49,22 @@ impl Step {
     }
 }
 
-/// What a finished fill leaves for the user: ready to submit, or the required fields still open.
-pub fn after_fill(report: &Report) -> Step {
-    let open = report
-        .outcomes
-        .iter()
-        .filter(|outcome| outcome.required && !matches!(outcome.result, FieldResult::Filled { .. }))
-        .count();
-    match open {
+/// Where a finished fill leaves a run. `sent` says what a press of Submit led to, when Maverick
+/// pressed it.
+pub fn after_fill(report: &Report, sent: Option<&Sent>) -> Step {
+    match sent {
+        // The step turns to `Applied` once the application is recorded.
+        Some(Sent::Confirmed) => return Step::Submitting,
+        Some(Sent::Unconfirmed(why)) => return Step::NeedsYou(why.clone()),
+        None => {}
+    }
+    match &report.end {
+        // The form's own checks let every page through.
+        End::Review => return Step::Ready,
+        End::Stopped(why) => return Step::NeedsYou(why.clone()),
+        End::Page => {}
+    }
+    match report.outcomes.iter().filter(|outcome| outcome.is_open()).count() {
         0 => Step::Ready,
         1 => Step::NeedsYou("1 required field needs your answer.".into()),
         open => Step::NeedsYou(format!("{open} required fields need your answer.")),
@@ -156,9 +167,28 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use maverick_core::answers::Unanswered;
-    use maverick_core::apply::{Outcome, Source};
+    use maverick_core::apply::{FieldResult, Outcome, Source};
 
     use super::*;
+
+    fn after_fill_alone(report: &Report) -> Step {
+        after_fill(report, None)
+    }
+
+    #[test]
+    fn a_press_of_submit_decides_the_step_whatever_the_report_says() {
+        let report = Report {
+            outcomes: Vec::new(),
+            model_problem: None,
+            note: None,
+            end: End::Page,
+        };
+        assert_eq!(after_fill(&report, Some(&Sent::Confirmed)), Step::Submitting);
+        assert_eq!(
+            after_fill(&report, Some(&Sent::Unconfirmed("Greenhouse asks for a code.".into()))),
+            Step::NeedsYou("Greenhouse asks for a code.".into())
+        );
+    }
 
     #[test]
     fn the_queue_starts_no_more_runs_than_the_parallel_limit() {
@@ -191,6 +221,28 @@ mod tests {
     }
 
     #[test]
+    fn a_form_of_several_pages_is_ready_only_at_its_last_page() {
+        let left = Outcome {
+            title: "Country".into(),
+            required: true,
+            result: FieldResult::Left(Unanswered::Held),
+        };
+        let report = |end| Report {
+            outcomes: vec![left.clone()],
+            model_problem: None,
+            note: None,
+            end,
+        };
+        // An answer the form held already leaves nothing for the user to do.
+        assert_eq!(after_fill_alone(&report(End::Page)), Step::Ready);
+        assert_eq!(after_fill_alone(&report(End::Review)), Step::Ready);
+        assert_eq!(
+            after_fill_alone(&report(End::Stopped("Workday did not take My Experience.".into()))),
+            Step::NeedsYou("Workday did not take My Experience.".into())
+        );
+    }
+
+    #[test]
     fn a_fill_with_required_fields_left_needs_the_user() {
         let outcome = |required: bool, result: FieldResult| Outcome {
             title: "Field".into(),
@@ -206,13 +258,14 @@ mod tests {
             outcomes,
             model_problem: None,
             note: None,
+            end: maverick_core::apply::End::Page,
         };
         assert_eq!(
-            after_fill(&report(vec![outcome(true, filled()), outcome(false, left())])),
+            after_fill_alone(&report(vec![outcome(true, filled()), outcome(false, left())])),
             Step::Ready
         );
         assert_eq!(
-            after_fill(&report(vec![
+            after_fill_alone(&report(vec![
                 outcome(true, left()),
                 outcome(true, FieldResult::Failed("the field stayed empty".into())),
             ])),
