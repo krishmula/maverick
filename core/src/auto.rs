@@ -4,17 +4,19 @@
 //! Connections; while it is off, the user approves each posting. Whether an approved form is also
 //! submitted is the auto-submit switch's call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::bridge::Bridge;
 use crate::jobs::{Decision, Outreach, Posting, Stage};
 use crate::linkedin::{self, Delivery, Pacing};
 use crate::outreach::{self, About, Check, Draft};
+use crate::platform::{Platform, address_of};
 use crate::score::{APPLY_SCORE, Profile};
 use crate::store::{Store, StoreError};
 
@@ -51,6 +53,91 @@ pub fn set_on(database: &Path, on: bool) -> std::io::Result<()> {
     std::fs::write(file, if on { "on" } else { "off" })
 }
 
+/// Which postings auto-apply acts on: those on a chosen platform, at a company not left out.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Scope {
+    pub platforms: BTreeSet<Platform>,
+    /// Companies auto-apply leaves alone, as the postings name them.
+    pub left_out: BTreeSet<String>,
+}
+
+/// Until the user chooses, auto-apply covers the platforms Maverick can fill, at every company.
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            platforms: Platform::ALL
+                .into_iter()
+                .filter(|platform| platform.fillable())
+                .collect(),
+            left_out: BTreeSet::new(),
+        }
+    }
+}
+
+impl Scope {
+    fn file(database: &Path) -> Option<PathBuf> {
+        Some(database.parent()?.join("auto-apply-scope.json"))
+    }
+
+    /// The saved scope, or the default when none was saved or it cannot be read.
+    pub fn load(database: &Path) -> Self {
+        Self::file(database)
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|saved| serde_json::from_str(&saved).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, database: &Path) -> std::io::Result<()> {
+        let file = Self::file(database).ok_or_else(|| std::io::Error::other("the database has no directory"))?;
+        std::fs::write(file, serde_json::to_string_pretty(self)?)
+    }
+
+    pub fn includes_company(&self, company: &str) -> bool {
+        let company = company.trim();
+        !self.left_out.iter().any(|out| out.eq_ignore_ascii_case(company))
+    }
+
+    pub fn covers(&self, posting: &Posting) -> bool {
+        self.platforms.contains(&Platform::of(&address_of(posting))) && self.includes_company(&posting.company)
+    }
+
+    pub fn toggle_platform(&mut self, platform: Platform) {
+        if !self.platforms.remove(&platform) {
+            self.platforms.insert(platform);
+        }
+    }
+
+    pub fn toggle_company(&mut self, company: &str) {
+        let company = company.trim();
+        let before = self.left_out.len();
+        self.left_out.retain(|out| !out.eq_ignore_ascii_case(company));
+        if self.left_out.len() == before {
+            self.left_out.insert(company.to_owned());
+        }
+    }
+}
+
+/// The companies with postings scored 75 or more still waiting for a decision, with how many each,
+/// most first, then by name. Companies left out are listed too, so they can be brought back.
+pub fn companies(postings: &[Posting], decisions: &HashMap<String, Decision>, scope: &Scope) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+    for posting in postings {
+        if scored_enough(posting) && posting.stage == Stage::Review && !decisions.contains_key(&posting.link) {
+            let name = posting.company.trim();
+            counts
+                .entry(name.to_lowercase())
+                .or_insert_with(|| (name.to_owned(), 0))
+                .1 += 1;
+        }
+    }
+    for out in &scope.left_out {
+        counts.entry(out.to_lowercase()).or_insert_with(|| (out.clone(), 0));
+    }
+    let mut listed: Vec<(String, usize)> = counts.into_values().collect();
+    listed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    listed
+}
+
 fn scored_enough(posting: &Posting) -> bool {
     posting.score.is_some_and(|score| score >= APPLY_SCORE)
 }
@@ -60,12 +147,15 @@ fn best_first(postings: &mut [&Posting]) {
     postings.sort_by(|a, b| b.score.cmp(&a.score).then(b.found_at.cmp(&a.found_at)));
 }
 
-/// The postings to approve now: scored 75 or more, waiting for review, and not decided by anyone.
-pub fn to_approve(postings: &[Posting], decisions: &HashMap<String, Decision>) -> Vec<String> {
+/// The postings to approve now: scored 75 or more, in scope, waiting for review, and not decided by anyone.
+pub fn to_approve(postings: &[Posting], decisions: &HashMap<String, Decision>, scope: &Scope) -> Vec<String> {
     let mut waiting: Vec<&Posting> = postings
         .iter()
         .filter(|posting| {
-            scored_enough(posting) && posting.stage == Stage::Review && !decisions.contains_key(&posting.link)
+            scored_enough(posting)
+                && scope.covers(posting)
+                && posting.stage == Stage::Review
+                && !decisions.contains_key(&posting.link)
         })
         .collect();
     best_first(&mut waiting);
@@ -79,7 +169,7 @@ pub fn to_approve(postings: &[Posting], decisions: &HashMap<String, Decision>) -
 /// Approves the postings `to_approve` gives, and says how many.
 pub fn approve(database: &Path) -> Result<usize, StoreError> {
     let mut store = Store::open(database)?;
-    let links = to_approve(&store.postings()?, &store.decisions()?);
+    let links = to_approve(&store.postings()?, &store.decisions()?, &Scope::load(database));
     for link in &links {
         store.decide(link, Some(Decision::Approved))?;
     }
@@ -104,6 +194,7 @@ pub fn to_reach(
     decisions: &HashMap<String, Decision>,
     checks: &[Check],
     drafts: &[Draft],
+    scope: &Scope,
     now: Timestamp,
 ) -> Vec<Pick> {
     let sent_today = drafts
@@ -118,6 +209,7 @@ pub fn to_reach(
         .filter(|posting| {
             let decision = decisions.get(&posting.link);
             scored_enough(posting)
+                && scope.covers(posting)
                 && (decision == Some(&Decision::Approved) || posting.stage == Stage::Applied && decision.is_none())
         })
         .collect();
@@ -229,6 +321,7 @@ pub async fn reach(
             &store.decisions().map_err(said)?,
             &store.checks().map_err(said)?,
             &store.drafts().map_err(said)?,
+            &Scope::load(database),
             Timestamp::now(),
         )
     };
@@ -374,6 +467,68 @@ mod tests {
 
     const NOW: &str = "2026-11-24T20:00:00Z";
 
+    fn everywhere() -> Scope {
+        Scope {
+            platforms: Platform::ALL.into(),
+            left_out: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn auto_apply_keeps_to_the_chosen_platforms_and_companies() {
+        let at = |link: &str, company: &str, address: &str| Posting {
+            company: company.into(),
+            address: Some(address.into()),
+            ..posting(link, 90, Stage::Review)
+        };
+        let postings = [
+            at(
+                "ashby",
+                "Example Co",
+                "https://jobs.ashbyhq.com/example/0f3b8231-3a32-478a-b994-3441f4bb9401",
+            ),
+            at("amazon", "Amazon", "https://www.amazon.jobs/en/jobs/123/engineer"),
+            at("lever", "Lever Co", "https://jobs.lever.co/example/1"),
+            at(
+                "greenhouse",
+                "Big Corp",
+                "https://job-boards.greenhouse.io/example/jobs/123",
+            ),
+        ];
+        let none = HashMap::new();
+        let mut scope = Scope::default();
+        assert_eq!(to_approve(&postings, &none, &scope), ["ashby", "greenhouse"]);
+
+        scope.toggle_platform(Platform::Lever);
+        scope.toggle_company("big corp ");
+        assert_eq!(to_approve(&postings, &none, &scope), ["ashby", "lever"]);
+        // Big Corp is left out but still listed once, under the posting's own name; a company
+        // left out with nothing waiting is listed with none.
+        scope.toggle_company("Gone Inc");
+        let listed: Vec<(String, usize)> = companies(&postings, &none, &scope);
+        let names: Vec<(&str, usize)> = listed.iter().map(|(name, count)| (name.as_str(), *count)).collect();
+        assert_eq!(
+            names,
+            [
+                ("Amazon", 1),
+                ("Big Corp", 1),
+                ("Example Co", 1),
+                ("Lever Co", 1),
+                ("Gone Inc", 0)
+            ]
+        );
+        scope.toggle_company("gone inc");
+
+        scope.toggle_company("Big Corp");
+        assert!(scope.left_out.is_empty());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        assert_eq!(Scope::load(&database), Scope::default());
+        scope.save(&database).unwrap();
+        assert_eq!(Scope::load(&database), scope);
+    }
+
     #[test]
     fn postings_scored_75_or_more_and_undecided_are_approved_best_first() {
         let postings = [
@@ -385,10 +540,13 @@ mod tests {
             posting("f", 99, Stage::Applied),
         ];
         let decisions = HashMap::from([("e".to_owned(), Decision::Skipped)]);
-        assert_eq!(to_approve(&postings, &decisions), ["c", "b"]);
+        assert_eq!(to_approve(&postings, &decisions, &everywhere()), ["c", "b"]);
 
         let many: Vec<Posting> = (0..15).map(|n| posting(&n.to_string(), 80, Stage::Review)).collect();
-        assert_eq!(to_approve(&many, &HashMap::new()).len(), APPROVALS_PER_PASS);
+        assert_eq!(
+            to_approve(&many, &HashMap::new(), &everywhere()).len(),
+            APPROVALS_PER_PASS
+        );
     }
 
     #[test]
@@ -416,7 +574,14 @@ mod tests {
             draft(7, "b", "di", Outreach::Drafted, NOW),
             draft(8, "x", "ada", Outreach::Sent, "2026-11-20T18:00:00Z"),
         ];
-        let picks = to_reach(&postings, &decisions, &checks, &drafts, NOW.parse().unwrap());
+        let picks = to_reach(
+            &postings,
+            &decisions,
+            &checks,
+            &drafts,
+            &everywhere(),
+            NOW.parse().unwrap(),
+        );
         let said: Vec<(&str, &str, Option<i64>)> = picks
             .iter()
             .map(|pick| {
@@ -451,7 +616,14 @@ mod tests {
             post_draft(5, "twice", Outreach::Drafted, "2026-11-24T17:00:00Z"),
             draft(6, "x", "twice", Outreach::Sent, "2026-11-20T18:00:00Z"),
         ];
-        let picks = to_reach(&postings, &HashMap::new(), &checks, &drafts, NOW.parse().unwrap());
+        let picks = to_reach(
+            &postings,
+            &HashMap::new(),
+            &checks,
+            &drafts,
+            &everywhere(),
+            NOW.parse().unwrap(),
+        );
         let said: Vec<(&str, Option<i64>)> = picks
             .iter()
             .map(|pick| {
@@ -482,12 +654,18 @@ mod tests {
             .collect();
         let none = HashMap::new();
         let now: Timestamp = NOW.parse().unwrap();
-        assert_eq!(to_reach(&postings, &none, &checks, &[], now).len(), SENDS_PER_RUN);
+        assert_eq!(
+            to_reach(&postings, &none, &checks, &[], &everywhere(), now).len(),
+            SENDS_PER_RUN
+        );
 
         let sent_today: Vec<Draft> = (0..SENDS_PER_DAY as i64 - 1)
             .map(|n| draft(n, "old", &format!("s{n}"), Outreach::Sent, NOW))
             .collect();
-        assert_eq!(to_reach(&postings, &none, &checks, &sent_today, now).len(), 1);
+        assert_eq!(
+            to_reach(&postings, &none, &checks, &sent_today, &everywhere(), now).len(),
+            1
+        );
     }
 
     #[test]

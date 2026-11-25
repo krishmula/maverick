@@ -698,7 +698,7 @@ async fn fill_form(
         return Err(Stopped {
             reason: format!(
                 "Maverick cannot fill {} forms yet. The posting is open in a tab for you.",
-                crate::board::system_label(address)
+                maverick_core::platform::Platform::of(address).name()
             ),
             needs_you: true,
         });
