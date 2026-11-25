@@ -758,11 +758,13 @@ impl Connections {
         let state = if on { "on" } else { "off" };
         let explained = if on {
             "Maverick approves each posting scored 75 or more and queues its form. Each hour it sends a \
-             LinkedIn draft to the best two people found at those postings, up to 20 a day, without your \
-             review. The auto-submit switch on the Jobs tab decides whether a filled form is submitted."
+             LinkedIn draft to the best two people found at those postings, and sends the waiting hiring-post \
+             drafts, up to 20 a day in all, without your review. The auto-submit switch on the Jobs tab \
+             decides whether a filled form is submitted."
         } else {
             "You approve each posting on the Jobs tab, and every LinkedIn draft waits for you. Turn this on to \
-             let Maverick approve postings scored 75 or more and message the best two people at each."
+             let Maverick approve postings scored 75 or more, message the best two people at each, and send \
+             hiring-post drafts."
         };
         v_flex()
             .gap(px(10.))
@@ -784,7 +786,7 @@ impl Connections {
                     .aria_label(format!("auto-apply {state}"))
                     .cursor_pointer()
                     .child(h_flex().gap(px(8.)).child(checkbox(on, palette)).child(ui::serif(
-                        "Apply and reach out on my behalf for postings scored 75 or more",
+                        "Apply and reach out on my behalf: postings scored 75 or more, and hiring posts",
                     )))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let Some(database) = this.browser.read(cx).database() else {
