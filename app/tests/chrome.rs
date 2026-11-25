@@ -314,6 +314,52 @@ async fn a_background_tab_takes_typing_clicks_and_a_file_as_real_input() {
     ));
 }
 
+/// A form inside a frame of the same site, placed away from the page's corner, as iCIMS draws its forms.
+const FRAMED: &str = r#"<!doctype html><title>Framed</title>
+<body style="margin: 0"><div style="height: 300px"></div>
+<iframe style="margin-left: 150px; width: 400px; height: 200px; border: 7px solid" srcdoc="
+<input id='name'><button id='send' style='margin-top: 80px'>Send</button>
+<script>window.seen = []; for (const [id, kind] of [['name', 'input'], ['send', 'click']])
+document.getElementById(id).addEventListener(kind, (event) => seen.push(id + ' ' + event.isTrusted));</script>">
+</iframe></body>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
+async fn a_form_inside_a_frame_takes_typing_and_clicks() {
+    let Running {
+        bridge,
+        mut states,
+        scratch: _scratch,
+        _browser,
+    } = launch(TWO_TABS);
+    let framed = serve(FRAMED).await;
+    let tabs = wait_for(&mut states, "both tabs listed", |tabs| {
+        titled(tabs, "First").is_some() && titled(tabs, "Second").is_some()
+    })
+    .await;
+    let page = Page::attach(bridge, &titled(&tabs, "First").unwrap()).await.unwrap();
+    page.navigate(&framed).await.unwrap();
+    let inside = |id: &str| {
+        Locator::script(
+            id,
+            format!("document.querySelector('iframe').contentDocument.getElementById('{id}')"),
+        )
+    };
+    page.fill(&inside("name"), "Ada Lovelace").await.unwrap();
+    page.click(&inside("send")).await.unwrap();
+    let read = page
+        .evaluate(
+            "((frame) => ({ name: frame.document.getElementById('name').value, seen: [...new Set(frame.seen)] }))\
+             (document.querySelector('iframe').contentWindow)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read,
+        json!({ "name": "Ada Lovelace", "seen": ["name true", "send true"] })
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs MAVERICK_E2E_CHROME set to a Chrome for Testing binary"]
 async fn several_background_tabs_are_driven_at_the_same_time() {

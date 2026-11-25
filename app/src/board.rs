@@ -133,11 +133,7 @@ impl BoardData {
 
 /// The application system a posting is on, when Maverick can fill its form.
 pub fn system_name(address: &str) -> Option<&'static str> {
-    Some(match System::of(address)? {
-        System::Ashby => "Ashby",
-        System::Greenhouse => "Greenhouse",
-        System::Workday => "Workday",
-    })
+    System::of(address).map(System::name)
 }
 
 /// The application system at `address`. Maverick fills the first three. The rest open for the user.

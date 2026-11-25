@@ -14,6 +14,7 @@ pub mod funnel;
 pub mod google;
 pub mod greenhouse;
 pub mod http;
+pub mod icims;
 pub mod intake;
 pub mod jobs;
 pub mod linkedin;
