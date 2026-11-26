@@ -25,7 +25,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
-use maverick_core::apply;
+use maverick_core::apply::{self, System};
 use maverick_core::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
 use maverick_core::outreach::Check;
 use maverick_core::platform::{Platform, address_of};
@@ -415,7 +415,16 @@ fn decision_chip(decision: Decision, palette: &Palette) -> Div {
     match decision {
         Decision::Approved => ui::chip(Signal::Done, "approved", palette),
         Decision::Skipped => ui::boxed("skipped", palette.faint),
+        Decision::Queued => ui::boxed("queued", palette.muted),
     }
+}
+
+/// Whether the user can mark a posting submitted: nothing is filling it and no submit is recorded.
+fn can_mark_submitted(run: Option<&Step>) -> bool {
+    !matches!(
+        run,
+        Some(Step::Opening | Step::Filling | Step::Submitting | Step::Applied)
+    )
 }
 
 impl ListDelegate for Rows {
@@ -671,15 +680,7 @@ impl Board {
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
         });
-        if self.auto_apply() {
-            self.apply_approved(cx);
-        }
         cx.notify();
-    }
-
-    /// Whether Maverick submits approved postings and reaches their people by itself.
-    fn auto_apply(&self) -> bool {
-        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
 
     /// How many postings wait on a decision, those the company filter keeps out included.
@@ -810,15 +811,55 @@ impl Board {
     /// Decides the marked postings, or the selected one when none is marked. The selection stays
     /// in place, so it lands on the next pending one.
     pub fn decide(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.order;
-        let reachable = self.outreach.read(cx).reachable();
-        let decided = self.list.update(cx, |list, cx| {
-            let row = list.selected_index().map_or(0, |ix| ix.row);
+        let links = self.list.update(cx, |list, _| {
             let rows = list.delegate_mut();
             let mut links: Vec<String> = std::mem::take(&mut rows.marked).into_iter().collect();
             if links.is_empty() {
                 links.extend(rows.selected_entry().map(|entry| entry.link.clone()));
             }
+            links
+        });
+        self.decide_links(&links, decision, window, cx);
+    }
+
+    /// Approves every posting in the queue, as one batch that undo takes back together.
+    fn run_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let links: Vec<String> = self
+            .list
+            .read(cx)
+            .delegate()
+            .all()
+            .filter(|entry| entry.decision == Some(Decision::Queued))
+            .map(|entry| entry.link.clone())
+            .collect();
+        self.decide_links(&links, Decision::Approved, window, cx);
+    }
+
+    /// Records that the user submitted the selected posting's application themselves.
+    fn mark_submitted(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry(cx).cloned() else {
+            return;
+        };
+        let run = self
+            .browser
+            .read(cx)
+            .queue()
+            .get(&entry.address)
+            .map(|run| run.step.clone());
+        if !can_mark_submitted(run.as_ref()) {
+            return;
+        }
+        self.browser.update(cx, |browser, cx| {
+            browser.record_submitted(entry.role(), entry.address, cx)
+        });
+    }
+
+    fn decide_links(&mut self, links: &[String], decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.order;
+        let reachable = self.outreach.read(cx).reachable();
+        let decided = self.list.update(cx, |list, cx| {
+            let row = list.selected_index().map_or(0, |ix| ix.row);
+            let rows = list.delegate_mut();
             let mut made = Vec::new();
             for entry in rows.entries.iter_mut().chain(&mut rows.filtered_out) {
                 if links.contains(&entry.link) {
@@ -878,7 +919,8 @@ impl Board {
         self.list.read(cx).delegate().marked.len()
     }
 
-    /// Puts an approved posting in the apply queue, and takes any other out while it waits.
+    /// Starts filling an approved posting Maverick can fill, and takes any other out while it waits.
+    /// A posting on a site Maverick cannot fill opens nothing: the user applies there themselves.
     fn sync_queue(&mut self, link: &str, decision: Option<Decision>, cx: &mut Context<Self>) {
         let rows = self.list.read(cx).delegate();
         let Some(entry) = rows.all().find(|entry| entry.link == link) else {
@@ -886,29 +928,9 @@ impl Board {
         };
         let (role, address) = (entry.role(), entry.address.clone());
         self.browser.update(cx, |browser, cx| match decision {
-            Some(Decision::Approved) => browser.enqueue(role, address, cx),
+            Some(Decision::Approved) if System::of(&address).is_some() => browser.enqueue(role, address, cx),
             _ => browser.withdraw(&address, cx),
         });
-    }
-
-    /// Queues every approved posting that is not in the queue yet, such as those approved before a restart.
-    fn apply_approved(&mut self, cx: &mut Context<Self>) {
-        let waiting: Vec<String> = self.waiting_approved(cx).into_iter().map(|entry| entry.link).collect();
-        for link in waiting {
-            self.sync_queue(&link, Some(Decision::Approved), cx);
-        }
-    }
-
-    /// Approved postings that have not been queued in this run.
-    fn waiting_approved(&self, cx: &App) -> Vec<Entry> {
-        let queue = self.browser.read(cx).queue();
-        self.list
-            .read(cx)
-            .delegate()
-            .all()
-            .filter(|entry| entry.decision == Some(Decision::Approved) && queue.get(&entry.address).is_none())
-            .cloned()
-            .collect()
     }
 
     /// Brings the selected posting's tab forward, when the queue opened one.
@@ -1094,7 +1116,9 @@ impl Board {
             "x" => self.toggle_mark(window, cx),
             "/" => self.focus_search(window, cx),
             "a" => self.decide(Decision::Approved, window, cx),
+            "q" => self.decide(Decision::Queued, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
+            "m" => self.mark_submitted(cx),
             "o" => self.open_selected(cx),
             "h" => self.hide_company(window, cx),
             _ => return,
@@ -1342,16 +1366,22 @@ impl Board {
                     .into_any_element(),
             );
         }
-        let waiting_approved = self.waiting_approved(cx).len();
-        if waiting_approved > 0 {
+        let queued = self
+            .list
+            .read(cx)
+            .delegate()
+            .all()
+            .filter(|entry| entry.decision == Some(Decision::Queued))
+            .count();
+        if queued > 0 {
             controls.push(
                 ui::button(
-                    "apply-approved",
-                    format!("Apply approved · {waiting_approved}"),
-                    ui::quiet_face(format!("apply approved {waiting_approved}"), palette),
+                    "run-queue",
+                    format!("Run queue · {queued}"),
+                    ui::quiet_face(format!("run queue {queued}"), palette),
                 )
-                .tip("Queue the postings approved before Maverick last started.")
-                .on_click(cx.listener(|this, _, _, cx| this.apply_approved(cx)))
+                .tip("Apply to every posting in the queue. Maverick submits each form it can complete.")
+                .on_click(cx.listener(|this, _, window, cx| this.run_queue(window, cx)))
                 .into_any_element(),
             );
         }
@@ -1418,16 +1448,15 @@ impl Board {
             Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
             _ => None,
         };
-        let auto_submit = self.browser.read(cx).auto_submit();
+        let fillable = System::of(&entry.address).is_some();
         let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
-            (None, _) if auto_submit => "approve queues it. maverick submits it if it can and messages its people.",
-            (None, _) => "approve queues it. nothing gets submitted.",
+            (None | Some(Decision::Approved), None) if !fillable => "maverick can't fill this site.",
+            (None, _) => "approve applies now.",
+            (Some(Decision::Queued), _) => "waits for run queue.",
             (Some(Decision::Skipped), _) => "skipped.",
-            (Some(Decision::Approved), None) => "approve again to queue it.",
-            (_, Some(Step::Queued | Step::Opening | Step::Filling)) if auto_submit => {
-                "filling. maverick submits it when nothing is left for you."
-            }
-            (_, Some(Step::Queued | Step::Opening | Step::Filling)) => "filling. nothing gets submitted.",
+            (Some(Decision::Approved), None) => "approve again to apply.",
+            (_, Some(Step::Queued)) => "waits for a free slot.",
+            (_, Some(Step::Opening | Step::Filling)) => "filling. maverick submits it if it can.",
             (_, Some(Step::Submitting)) => "submitting.",
             (_, Some(Step::NeedsYou(_) | Step::Ready)) => "you click submit.",
             (_, Some(Step::Applied)) => "applied.",
@@ -1436,11 +1465,14 @@ impl Board {
         let marked = rows.marked.len();
         let (word, name) = match run.as_ref().map(|run| &run.step) {
             _ if marked > 0 => (format!("approve {marked}"), format!("Approve {marked} marked")),
-            None if entry.decision == Some(Decision::Approved) => ("apply".into(), "Apply".into()),
+            None if entry.decision == Some(Decision::Approved) && fillable => ("apply".into(), "Apply".into()),
+            None if entry.decision == Some(Decision::Approved) => (String::new(), String::new()),
             None => ("approve".into(), "Approve".into()),
             Some(Step::Failed(_)) => ("try again".into(), "Try again".into()),
             Some(_) => (String::new(), String::new()),
         };
+        let queueable = entry.decision.is_none() && run.is_none() && fillable;
+        let markable = marked == 0 && can_mark_submitted(run.as_ref().map(|run| &run.step));
         let link = entry.link.clone();
         let reported = run.as_ref().is_some_and(|run| run.report.is_some());
         let scorer_note = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref()).outreach;
@@ -1524,11 +1556,36 @@ impl Board {
                     .border_t_1()
                     .border_color(palette.line)
                     .children(primary)
+                    .children(queueable.then(|| {
+                        let (word, name) = match marked {
+                            0 => ("add to queue  q".to_owned(), "Add to queue".to_owned()),
+                            marked => (format!("queue {marked}  q"), format!("Add {marked} marked to queue")),
+                        };
+                        ui::button("add-to-queue", name, ui::quiet_face(word, palette))
+                            .tip("Save it for later. Run queue applies to every posting in the queue.")
+                            .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Queued, window, cx)))
+                    }))
+                    .children(markable.then(|| {
+                        ui::button(
+                            "mark-submitted",
+                            "Mark submitted",
+                            ui::quiet_face("mark submitted  m", palette),
+                        )
+                        .tip("You submitted it yourself. Maverick records the application.")
+                        .on_click(cx.listener(|this, _, _, cx| this.mark_submitted(cx)))
+                    }))
                     .child(
                         ui::button("skip", "Skip", ui::quiet_face("skip  s", palette))
                             .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Skipped, window, cx))),
                     )
-                    .child(ui::serif(note).ml_auto().text_size(px(13.5)).text_color(palette.muted)),
+                    .child(
+                        ui::serif(note)
+                            .ml_auto()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.5))
+                            .text_color(palette.muted),
+                    ),
             )
     }
 }
@@ -1765,6 +1822,8 @@ mod tests {
     use super::*;
 
     const ASHBY: &str = "https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb9401";
+    const READY_ASHBY: &str = "https://jobs.ashbyhq.com/example-co/1a2b3c4d-1111-4222-8333-444455556666";
+    const HIGH_ASHBY: &str = "https://jobs.ashbyhq.com/example-co/9f8e7d6c-1111-4222-8333-444455556666";
 
     fn posting(link: &str, title: &str, stage: Stage, score: Option<u8>, found: &str) -> Posting {
         Posting {
@@ -1795,15 +1854,19 @@ mod tests {
             Posting {
                 notes: Some(format!("{APPLY_READY} 77, Backend/Infra: fits")),
                 sponsorship: Some(Sponsorship::Sponsors),
+                address: Some(READY_ASHBY.into()),
                 ..posting("https://simplify.jobs/p/2", "Ready", Stage::Review, Some(77), "08")
             },
-            posting(
-                "https://simplify.jobs/p/3",
-                "High but not ready",
-                Stage::Review,
-                Some(90),
-                "09",
-            ),
+            Posting {
+                address: Some(HIGH_ASHBY.into()),
+                ..posting(
+                    "https://simplify.jobs/p/3",
+                    "High but not ready",
+                    Stage::Review,
+                    Some(90),
+                    "09",
+                )
+            },
             posting("https://simplify.jobs/p/4", "Unscored", Stage::Found, None, "12"),
             posting(
                 "https://simplify.jobs/p/5",
@@ -1864,7 +1927,8 @@ mod tests {
         );
         assert_eq!(entries[0].sponsorship, Sponsorship::Sponsors);
         assert_eq!(entries[1].sponsorship, Sponsorship::Unknown);
-        assert_eq!(entries[0].system(), "Simplify");
+        assert_eq!(entries[0].system(), "Ashby");
+        assert_eq!(entries[1].system(), "Simplify");
 
         sort(&mut entries, Order::Latest, &none);
         assert_eq!(
@@ -2106,6 +2170,115 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("board-submitted").label(), Some("Submitted · 1"));
             assert!(window.try_find("approve").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_queue_waits_for_run_queue_and_a_site_maverick_cannot_fill_is_marked_submitted(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let (postings, applications) = sample();
+        Store::open(&database).unwrap().add_found(&postings).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let data = BoardData::new(&postings, applications, &HashMap::new());
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                let bridge = maverick_core::bridge::Bridge::new();
+                Browser::new(bridge, background, Err("none".into()), None, Some(database.clone()), cx)
+            })
+        });
+        let (window, board) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1000.), px(640.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                let outreach = cx.new(|cx| OutreachView::new(browser.clone(), None, window, cx));
+                cx.new(|cx| Board::new(browser.clone(), outreach, data, Some(database.clone()), window, cx))
+            })
+            .expect("the test window opens")
+        });
+        let decisions = || Store::open(&database).unwrap().decisions().unwrap();
+        let runs = |cx: &mut TestAppContext| -> Vec<String> {
+            browser.read_with(cx, |browser, _| {
+                browser.queue().runs().iter().map(|run| run.address.clone()).collect()
+            })
+        };
+
+        // q adds Ready and then High but not ready to the queue. Nothing opens yet.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("q", cx);
+            window.press("q", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        wait_until("both are queued", || decisions().len() == 2);
+        assert!(decisions().values().all(|decision| *decision == Decision::Queued));
+        assert!(runs(cx).is_empty());
+
+        // Run queue starts both, as one batch.
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(window.find("run-queue").label(), Some("Run queue · 2"));
+            window.click("run-queue", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("run-queue").is_none());
+        })
+        .unwrap();
+        wait_until("both are approved", || {
+            decisions().values().all(|decision| *decision == Decision::Approved)
+        });
+        assert_eq!(runs(cx), [READY_ASHBY, HIGH_ASHBY]);
+
+        // Middling is on a site Maverick cannot fill. Approving it opens nothing; the user applies
+        // in Chrome and marks it submitted.
+        let selected = board.read_with(cx, |board, cx| {
+            board.selected_entry(cx).map(|entry| entry.title.clone())
+        });
+        assert_eq!(selected.as_deref(), Some("Middling"));
+        cx.update_window(window, |_, window, cx| {
+            window.press("a", cx);
+            window.render_frame(cx);
+            board.update(cx, |board, cx| {
+                let rows = board.list.read(cx).delegate();
+                let middling = rows.entries.iter().position(|entry| entry.title == "Middling").unwrap();
+                board.list.update(cx, |list, cx| select_row(list, middling, window, cx));
+            });
+            window.render_frame(cx);
+            window.click("mark-submitted", cx);
+        })
+        .unwrap();
+        assert_eq!(runs(cx).len(), 2);
+        wait_until("the application is recorded", || {
+            let store = Store::open(&database).unwrap();
+            let applied = store.applications().unwrap();
+            applied
+                .iter()
+                .any(|sent| sent.link.as_deref() == Some("https://simplify.jobs/p/1"))
+                && store
+                    .postings()
+                    .unwrap()
+                    .iter()
+                    .any(|posting| posting.link == "https://simplify.jobs/p/1" && posting.stage == Stage::Applied)
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("board-submitted").label(), Some("Submitted · 1"));
         })
         .unwrap();
     }

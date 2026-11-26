@@ -14,8 +14,12 @@ Time set aside on the calendar to work on something, which Mav proposes and the 
 _Avoid_: event (for a block Mav adds)
 
 **Jobs tab**:
-The view where the user approves or skips postings, sees who to reach at each posting's company, and sees the applications sent. Approving a posting queues its form to be filled in a batch.
+The view where the user approves, queues or skips postings, sees who to reach at each posting's company, and sees the applications sent. Approving a posting applies to it right away.
 _Avoid_: approvals, decision board, jobs list
+
+**Queue**:
+Postings the user set aside in the Jobs tab to apply to together. Run queue applies to all of them at once.
+_Avoid_: batch
 
 **Posts tab**:
 The view for hiring posts found on LinkedIn and the notes drafted to their posters. It has four sections: Found, Drafted, Sent and Rejected.
@@ -26,9 +30,9 @@ The Posts tab section that holds hiring posts with no draft yet: the queue the u
 _Avoid_: waiting, queue (for the section)
 
 **Rejected**:
-A hiring post or post draft the user took out of the queue for good. It sits in its own section and can be restored.
+A hiring post or post draft the user took out of Found or Drafted for good. It sits in its own section and can be restored.
 _Avoid_: skipped (for hiring posts)
 
 **Auto-apply**:
-The switch in Connections that lets Maverick approve each posting scored 75 or more and send a LinkedIn draft to the best two people at it, without the user's review. While it is off, the user approves each posting.
+The switch in Connections that lets Maverick send LinkedIn drafts to the best two people at each approved posting, and send hiring-post drafts, without the user's review. Maverick never approves a posting itself.
 _Avoid_: auto-reach

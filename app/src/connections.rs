@@ -858,14 +858,12 @@ impl Connections {
         let on = database.as_deref().is_some_and(maverick_core::auto::is_on);
         let state = if on { "on" } else { "off" };
         let explained = if on {
-            "Once you approve a posting, Maverick fills its form and submits it when nothing in it is left \
-             for you. Each hour it sends a LinkedIn draft to the best two people in the US found at approved postings \
-             on the platforms and at the companies below, at most two people per company a day, and sends the \
-             waiting hiring-post drafts, up to 20 a day in all, without your review. Maverick never approves a \
-             posting itself."
+            "Each hour Maverick sends a LinkedIn draft to the best two people in the US found at approved \
+             postings on the platforms and at the companies below, at most two people per company a day, and \
+             sends the waiting hiring-post drafts, up to 20 a day in all, without your review. Maverick never \
+             approves a posting itself."
         } else {
-            "Maverick fills each form you approve and leaves Submit to you, and every LinkedIn draft waits for \
-             you. Turn this on to let Maverick submit complete forms and message people at the postings you \
+            "Every LinkedIn draft waits for you. Turn this on to let Maverick message people at the postings you \
              approve, and send hiring-post drafts."
         };
         v_flex()
@@ -891,7 +889,7 @@ impl Connections {
                         h_flex()
                             .gap(px(8.))
                             .child(checkbox(on, palette))
-                            .child(ui::serif("When I approve a posting, submit it and reach out for me")),
+                            .child(ui::serif("When I approve a posting, reach out for me")),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let Some(database) = this.browser.read(cx).database() else {

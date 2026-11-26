@@ -55,10 +55,12 @@ stored_enum! {
 }
 
 stored_enum! {
-    /// What the user decided about a posting on the decision board. The sheet never holds it.
+    /// What the user decided about a posting in the Jobs tab. The sheet never holds it.
+    /// `Queued` sets the posting aside until the user runs the queue.
     Decision {
         Approved => "approved",
         Skipped => "skipped",
+        Queued => "queued",
     }
 }
 

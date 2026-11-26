@@ -1,7 +1,6 @@
-//! Auto-apply: once the user approves a posting, Maverick submits its form when nothing in it is
-//! left for the user, sends a draft to the best two people in the US its outreach check found there, and
-//! sends each waiting hiring-post draft, without the user's review. The user turns it on in
-//! Connections. Maverick never approves a posting itself.
+//! Auto-apply: once the user approves a posting, Maverick sends a draft to the best two people in
+//! the US its outreach check found there, and sends each waiting hiring-post draft, without the
+//! user's review. The user turns it on in Connections. Maverick never approves a posting itself.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};

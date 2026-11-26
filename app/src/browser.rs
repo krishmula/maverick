@@ -246,7 +246,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
-            self.auto_submit(),
+            false,
             |_| {},
         ));
         cx.spawn(async move |this, cx| {
@@ -278,7 +278,7 @@ impl Browser {
                 if let Some(filled) = filled {
                     this.filled_tab = Some(filled.tab.clone());
                     match filled.sent {
-                        Some(Sent::Confirmed) => this.record_sent(filled.title, filled.address, cx),
+                        Some(Sent::Confirmed) => this.record_submitted(filled.title, filled.address, cx),
                         _ => this.watch_for_submit(filled.system, filled.tab, filled.title, filled.address, cx),
                     }
                 }
@@ -337,14 +337,19 @@ impl Browser {
     fn note_applied(&mut self, applied: Applied, cx: &mut Context<Self>) {
         if let Some(run) = self.queue.get_mut(&applied.address) {
             run.step = Step::Applied;
+            run.tab = None;
         }
-        self.applied.push(applied);
+        // The user can mark a posting submitted while the tab watch still runs.
+        if !self.applied.iter().any(|before| before.address == applied.address) {
+            self.applied.push(applied);
+        }
         self.pump(cx);
         cx.notify();
     }
 
-    /// Records an application Maverick submitted itself and the system confirmed.
-    fn record_sent(&mut self, title: String, address: String, cx: &mut Context<Self>) {
+    /// Records a submitted application: one the system confirmed, or one the user marks
+    /// submitted, such as on a site Maverick cannot fill.
+    pub fn record_submitted(&mut self, title: String, address: String, cx: &mut Context<Self>) {
         let recorded = self.background.spawn(applied(self.database.clone(), title, address));
         cx.spawn(async move |this, cx| {
             if let Ok(applied) = recorded.await {
@@ -359,7 +364,8 @@ impl Browser {
         &self.queue
     }
 
-    /// Queues an approved posting. It fills in a background tab once a slot is free. It never submits.
+    /// Queues an approved posting. It fills in a background tab once a slot is free, and Maverick
+    /// submits it when nothing in the form is left for the user.
     pub fn enqueue(&mut self, title: String, address: String, cx: &mut Context<Self>) {
         self.queue.add(title, address);
         self.pump(cx);
@@ -370,12 +376,6 @@ impl Browser {
     pub fn withdraw(&mut self, address: &str, cx: &mut Context<Self>) {
         self.queue.withdraw(address);
         cx.notify();
-    }
-
-    /// True when Maverick submits a form itself once nothing in it is left for the user: the
-    /// auto-apply switch in Connections is on.
-    pub fn auto_submit(&self) -> bool {
-        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
 
     /// How many forms fill at once. The number is kept next to the database.
@@ -423,7 +423,7 @@ impl Browser {
             title.clone(),
             target,
             self.answers_file.clone(),
-            self.auto_submit(),
+            true,
             move |step| {
                 // The receiver goes away only with the window.
                 let _ = sender.send(step);
@@ -458,7 +458,7 @@ impl Browser {
                             if let Some(run) = this.queue.get_mut(&address) {
                                 run.tab = None;
                             }
-                            this.record_sent(title.clone(), address.clone(), cx);
+                            this.record_submitted(title.clone(), address.clone(), cx);
                         }
                         Some((filled.system, filled.tab))
                     }
@@ -636,7 +636,10 @@ fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<
         .map_err(said)?
         .into_iter()
         .map(|posting| posting.link)
-        .filter(|link| apply::posting_address(&posting_address(link)).as_deref() == Some(address))
+        .filter(|link| {
+            let found = posting_address(link);
+            apply::posting_address(&found).unwrap_or(found) == address
+        })
         .collect();
     store
         .record_application(&links, &Application::submitted_today(role, address))

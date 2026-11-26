@@ -198,6 +198,16 @@ const MIGRATIONS: &[&str] = &[
         read_at TEXT NOT NULL
     ) STRICT;
 ",
+    "
+    CREATE TABLE decisions_next (
+        link TEXT PRIMARY KEY,
+        decision TEXT NOT NULL CHECK (decision IN ('approved', 'skipped', 'queued')),
+        decided_at TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO decisions_next SELECT link, decision, decided_at FROM decisions;
+    DROP TABLE decisions;
+    ALTER TABLE decisions_next RENAME TO decisions;
+",
 ];
 
 pub struct Store {
