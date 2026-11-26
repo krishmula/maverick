@@ -18,8 +18,12 @@ The view where the user approves, queues or skips postings, sees who to reach at
 _Avoid_: approvals, decision board, jobs list
 
 **Queue**:
-Postings the user set aside in the Jobs tab to apply to together. Run queue applies to all of them at once.
+Postings the user set aside in the Jobs tab to apply to together, plus those Maverick is applying to or waits on the user for. Run queue applies to the set-aside ones at once.
 _Avoid_: batch
+
+**Errors**:
+The Jobs tab list of approved postings Maverick could not apply to, such as a closed posting or a site it cannot fill. Approving one again tries again.
+_Avoid_: failed list, problems
 
 **Posts tab**:
 The view for hiring posts found on LinkedIn and the notes drafted to their posters. It has four sections: Found, Drafted, Sent and Rejected.

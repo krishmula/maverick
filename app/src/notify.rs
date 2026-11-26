@@ -33,7 +33,7 @@ pub fn fill_ended(title: &str, step: &Step) -> Option<Notice> {
             "Maverick submitted it and the application system confirmed.".to_owned(),
         ),
         Step::NeedsYou(why) => ("Needs you", why.clone()),
-        Step::Failed(why) => ("Fill failed", format!("Nothing was submitted. {why}")),
+        Step::Failed(_, why) => ("Fill failed", format!("Nothing was submitted. {why}")),
         Step::Queued | Step::Opening | Step::Filling | Step::Applied => return None,
     };
     Some(Notice {
@@ -197,7 +197,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            said(Step::Failed("the page did not load".into())),
+            said(Step::Failed(maverick_core::jobs::Failure::Failed, "the page did not load".into())),
             Some((
                 "Fill failed: Engineer, Example Co".into(),
                 "Nothing was submitted. the page did not load".into()

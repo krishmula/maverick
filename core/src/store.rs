@@ -9,7 +9,7 @@ use jiff::Timestamp;
 use rusqlite::types::Type;
 use rusqlite::{Connection, Row, params};
 
-use crate::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
+use crate::jobs::{Application, ApplicationStatus, Decision, Failure, Outreach, Posting, Sponsorship, Stage};
 use crate::tracker::Tracker;
 
 pub use rusqlite::Error as StoreError;
@@ -207,6 +207,14 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO decisions_next SELECT link, decision, decided_at FROM decisions;
     DROP TABLE decisions;
     ALTER TABLE decisions_next RENAME TO decisions;
+",
+    "
+    CREATE TABLE failures (
+        link TEXT PRIMARY KEY,
+        failure TEXT NOT NULL CHECK (failure IN ('closed', 'unfillable', 'failed')),
+        detail TEXT NOT NULL,
+        failed_at TEXT NOT NULL
+    ) STRICT;
 ",
 ];
 
@@ -419,6 +427,32 @@ impl Store {
         Ok(())
     }
 
+    /// Records why Maverick could not apply to the posting at `link`, in place of any earlier reason.
+    pub fn record_failure(&mut self, link: &str, failure: Failure, detail: &str) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO failures (link, failure, detail, failed_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (link) DO UPDATE SET failure = excluded.failure, detail = excluded.detail,
+                 failed_at = excluded.failed_at",
+            params![link, failure.as_str(), detail, Timestamp::now().to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_failure(&mut self, link: &str) -> Result<(), StoreError> {
+        self.db.execute("DELETE FROM failures WHERE link = ?1", [link])?;
+        Ok(())
+    }
+
+    /// Why Maverick could not apply, with what it said, by posting link.
+    pub fn failures(&self) -> Result<HashMap<String, (Failure, String)>, StoreError> {
+        let mut select = self.db.prepare("SELECT link, failure, detail FROM failures")?;
+        select
+            .query_map([], |row| {
+                Ok((row.get(0)?, (stored(row, 1, Failure::parse)?, row.get(2)?)))
+            })?
+            .collect()
+    }
+
     /// The user's decisions, by posting link.
     pub fn decisions(&self) -> Result<HashMap<String, Decision>, StoreError> {
         let mut select = self.db.prepare("SELECT link, decision FROM decisions")?;
@@ -529,6 +563,20 @@ pub(crate) fn stored<T>(row: &Row<'_>, column: usize, parse: impl Fn(&str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_is_kept_until_it_is_cleared_and_a_new_one_replaces_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        store.record_failure("p/1", Failure::Unfillable, "a company site").unwrap();
+        store.record_failure("p/2", Failure::Failed, "the page did not load").unwrap();
+        store.record_failure("p/2", Failure::Closed, "this posting is closed").unwrap();
+        let failures = store.failures().unwrap();
+        assert_eq!(failures["p/1"], (Failure::Unfillable, "a company site".to_owned()));
+        assert_eq!(failures["p/2"], (Failure::Closed, "this posting is closed".to_owned()));
+        store.clear_failure("p/1").unwrap();
+        assert_eq!(store.failures().unwrap().len(), 1);
+    }
 
     #[test]
     fn the_fifth_migration_keeps_the_hiring_posts_and_lets_them_be_typed() {

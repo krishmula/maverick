@@ -52,49 +52,101 @@ pub fn is_posting(address: &str) -> bool {
     posting(address).is_some()
 }
 
-/// The address of a posting's application form. The form is on the posting's own page.
+/// The address of a posting's application form. A hosted board shows the form on the posting's
+/// own page. A company's career page shows Greenhouse's embedded form, which opens on its own.
 pub fn form_address(address: &str) -> Option<String> {
-    posting_address(address)
+    posting(address).map(|posting| posting.form())
 }
 
-/// Where a posting is on Greenhouse's hosted boards.
+/// Where a posting is on Greenhouse.
 #[derive(Debug, PartialEq)]
 struct Posting<'a> {
-    /// `eu.` for a board in the European region, and empty for the others.
-    region: &'a str,
-    board: &'a str,
+    on: Board<'a>,
     id: &'a str,
     /// True when the address is the page that holds the form.
     on_form: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum Board<'a> {
+    /// A hosted board. `region` is `eu.` for a board in the European region, and empty for the others.
+    Hosted { region: &'a str, board: &'a str },
+    /// Greenhouse's embedded form, which names the posting by its number alone.
+    Embed,
+    /// A company's own career page that embeds the posting, as `stripe.com/jobs/search?gh_jid=<id>`.
+    /// `page` is the address up to its query.
+    Company { page: &'a str },
+}
+
 impl Posting<'_> {
     fn address(&self) -> String {
-        format!(
-            "https://job-boards.{}greenhouse.io/{}/jobs/{}",
-            self.region, self.board, self.id
-        )
+        match &self.on {
+            Board::Hosted { region, board } => {
+                format!("https://job-boards.{region}greenhouse.io/{board}/jobs/{}", self.id)
+            }
+            Board::Embed => self.form(),
+            Board::Company { page } => format!("https://{page}?gh_jid={}", self.id),
+        }
+    }
+
+    /// The embedded form on the older host sends the browser on to the board that holds the
+    /// posting, so the posting's number is enough to find it.
+    fn form(&self) -> String {
+        match &self.on {
+            Board::Hosted { .. } => self.address(),
+            Board::Embed | Board::Company { .. } => {
+                format!("https://boards.greenhouse.io/embed/job_app?token={}", self.id)
+            }
+        }
     }
 }
 
 fn posting(address: &str) -> Option<Posting<'_>> {
-    let (host, path) = address.strip_prefix("https://")?.split_once('/')?;
+    let (host, rest) = address.strip_prefix("https://")?.split_once('/')?;
+    let (path, query) = match rest.split('#').next()?.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (rest.split('#').next()?, ""),
+    };
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .filter(|value| number(value))
+    };
+    let on_greenhouse = host == "greenhouse.io" || host.ends_with(".greenhouse.io");
+    if !on_greenhouse {
+        let plain_host = !host.is_empty()
+            && host.contains('.')
+            && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte));
+        return plain_host.then_some(()).and(param("gh_jid")).map(|id| Posting {
+            on: Board::Company {
+                page: &address["https://".len()..][..host.len() + 1 + path.len()],
+            },
+            id,
+            on_form: false,
+        });
+    }
     // `boards.` is the older host. It sends the browser on to `job-boards.`.
     let (current, region) = [("job-boards.", true), ("boards.", false)]
         .into_iter()
         .find_map(|(start, current)| Some((current, host.strip_prefix(start)?.strip_suffix("greenhouse.io")?)))?;
-    let path = path.split(['?', '#']).next()?;
+    if path.trim_end_matches('/') == "embed/job_app" && region.is_empty() {
+        return param("token").map(|id| Posting {
+            on: Board::Embed,
+            id,
+            on_form: true,
+        });
+    }
     let mut parts = path.split('/').filter(|part| !part.is_empty());
     let (board, jobs, id) = (parts.next()?, parts.next()?, parts.next()?);
     let plain = |text: &str| {
         text.bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
     };
-    let is_posting =
-        matches!(region, "" | "eu.") && plain(board) && jobs == "jobs" && id.bytes().all(|byte| byte.is_ascii_digit());
+    let is_posting = matches!(region, "" | "eu.") && plain(board) && jobs == "jobs" && number(id);
     is_posting.then(|| Posting {
-        region,
-        board,
+        on: Board::Hosted { region, board },
         id,
         on_form: current && parts.next().is_none(),
     })
@@ -115,7 +167,7 @@ fn says_closed(address: &str) -> bool {
 
 /// Reads the form of the posting at `address` from the page Greenhouse serves, without a browser.
 pub async fn read_form(address: &str) -> Result<Form, String> {
-    let page_address = posting_address(address).ok_or("not a Greenhouse posting")?;
+    let page_address = form_address(address).ok_or("not a Greenhouse posting")?;
     let (status, page) = crate::description::get(&page_address).await?;
     if status == 404 {
         return Err(FillError::Closed.to_string());
@@ -237,7 +289,7 @@ fn is_yes_or_no(options: &[String]) -> bool {
 pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
     let mut address = address_of(page).await?;
     if posting(&address).is_some_and(|posting| !posting.on_form) {
-        let form = posting_address(&address).expect("the address was just read as a posting");
+        let form = form_address(&address).expect("the address was just read as a posting");
         page.navigate(&form).await.map_err(during("opening the form"))?;
         address = address_of(page).await?;
     }
@@ -474,8 +526,10 @@ mod tests {
         assert_eq!(
             super::posting(posting),
             Some(Posting {
-                region: "",
-                board: "example-co",
+                on: Board::Hosted {
+                    region: "",
+                    board: "example-co"
+                },
                 id: "4012345006",
                 on_form: true
             })
@@ -501,17 +555,37 @@ mod tests {
     }
 
     #[test]
+    fn a_posting_on_a_company_career_page_opens_in_the_embedded_form() {
+        let page = "https://example.com/jobs/search?utm_source=mail&gh_jid=4012345006#top";
+        let embed = "https://boards.greenhouse.io/embed/job_app?token=4012345006";
+        assert_eq!(
+            posting_address(page).as_deref(),
+            Some("https://example.com/jobs/search?gh_jid=4012345006")
+        );
+        assert_eq!(form_address(page).as_deref(), Some(embed));
+        assert!(!super::posting(page).unwrap().on_form);
+        // The older host sends the browser on to the board that holds the posting.
+        let landed = "https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=4012345006";
+        assert!(super::posting(landed).unwrap().on_form);
+        assert_eq!(posting_address(landed).as_deref(), Some(embed));
+        assert_eq!(form_address(embed).as_deref(), Some(embed));
+    }
+
+    #[test]
     fn an_address_that_is_no_posting_is_not_recognized() {
         for address in [
             "https://job-boards.greenhouse.io/example-co",
             "https://job-boards.greenhouse.io/example-co?error=true",
             "https://job-boards.greenhouse.io/example-co/jobs",
             "https://job-boards.greenhouse.io/example-co/jobs/latest",
-            "https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=4012345006",
+            "https://job-boards.greenhouse.io/embed/job_app?for=example-co",
+            "https://job-boards.eu.greenhouse.io/embed/job_app?token=4012345006",
             "https://job-boards.xx.greenhouse.io/example-co/jobs/4012345006",
             "https://app.greenhouse.io/example-co/jobs/4012345006",
             "https://job-boards.greenhouse.io.example.com/example-co/jobs/4012345006",
-            "https://example.com/careers?gh_jid=4012345006",
+            "https://example.com/careers?gh_jid=latest",
+            "https://example.com/careers?other_gh_jid=4012345006",
+            "https://job-boards.greenhouse.io/example-co?gh_jid=4012345006",
             "http://job-boards.greenhouse.io/example-co/jobs/4012345006",
         ] {
             assert!(!is_posting(address), "{address}");

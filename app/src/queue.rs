@@ -1,6 +1,7 @@
 //! The apply queue: approved postings, filled several at once, each in its own Chrome tab.
 
 use maverick_core::apply::{End, Report, Sent};
+use maverick_core::jobs::Failure;
 use maverick_core::bridge::Tab;
 
 /// How many forms fill at once unless the user picks another number.
@@ -28,7 +29,8 @@ pub enum Step {
     Ready,
     /// The application system confirmed a submission.
     Applied,
-    Failed(String),
+    /// Maverick could not apply. The text says why.
+    Failed(Failure, String),
 }
 
 impl Step {
@@ -47,7 +49,7 @@ impl Step {
             Self::NeedsYou(_) => "needs you",
             Self::Ready => "ready to submit",
             Self::Applied => "applied",
-            Self::Failed(_) => "failed",
+            Self::Failed(..) => "failed",
         }
     }
 }
@@ -112,7 +114,7 @@ impl Queue {
     /// unless its last run failed, in which case it waits for another try.
     pub fn add(&mut self, title: String, address: String) {
         match self.runs.iter_mut().find(|run| run.address == address) {
-            Some(run) if matches!(run.step, Step::Failed(_)) => {
+            Some(run) if matches!(run.step, Step::Failed(..)) => {
                 run.step = Step::Queued;
                 run.report = None;
             }
@@ -220,7 +222,7 @@ mod tests {
         queue.get_mut("a").unwrap().step = Step::Filling;
         assert!(queue.start_next().is_empty());
 
-        queue.get_mut("b").unwrap().step = Step::Failed("the page did not load".into());
+        queue.get_mut("b").unwrap().step = Step::Failed(Failure::Failed, "the page did not load".into());
         assert_eq!(queue.start_next(), ["c"]);
 
         queue.withdraw("d");

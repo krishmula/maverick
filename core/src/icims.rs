@@ -205,6 +205,7 @@ pub async fn fill_with(page: &Page, answers: &Answers, sign_ins: &impl SignIns) 
                     }
                 }
                 Screen::Loading => {}
+                Screen::Gone => return Err(FillError::Closed),
                 Screen::Other { says } => {
                     return Err(FillError::UnexpectedForm(format!(
                         "the iCIMS page shows something Maverick does not know: {says:?}"
@@ -294,6 +295,8 @@ enum Screen {
         name: String,
     },
     Loading,
+    /// The page left iCIMS, as a closed posting sends the browser to the company's own site.
+    Gone,
     Other {
         says: String,
     },
@@ -308,6 +311,7 @@ const SCREEN: &str = r##"(() => {
         if (document.querySelector('input[type="password"]')) return { screen: "password" };
         return { screen: "auth", says: text(document.querySelector("h1, h2, main") ?? document.body).slice(0, 200) };
     }
+    if (!location.host.endsWith(".icims.com")) return { screen: "gone" };
     const frame = document.getElementById("icims_content_iframe");
     const doc = frame?.contentDocument ?? document;
     if (!doc.body || doc.readyState === "loading") return { screen: "loading" };
@@ -362,6 +366,7 @@ fn screen_in(seen: &Value) -> Screen {
             of: number("of"),
             name: text("name"),
         },
+        Some("gone") => Screen::Gone,
         Some("other") => Screen::Other { says: text("says") },
         _ => Screen::Loading,
     }

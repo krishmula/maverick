@@ -52,7 +52,8 @@ pub fn stored_lists(database: Option<&Path>) -> Lists {
     let postings = store.postings().unwrap_or_default();
     let applications = store.applications().unwrap_or_default();
     let decisions = store.decisions().unwrap_or_default();
-    let board = BoardData::new(&postings, applications, &decisions);
+    let mut board = BoardData::new(&postings, applications, &decisions);
+    board.failures = store.failures().unwrap_or_default();
     let open: Vec<&str> = board
         .entries
         .iter()

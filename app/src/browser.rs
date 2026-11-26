@@ -8,7 +8,8 @@ use gpui_kit::{Context, Task};
 use maverick_core::answers::Answers;
 use maverick_core::apply::{self, FillError, Report, Sent, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
-use maverick_core::jobs::{Application, posting_address};
+use maverick_core::jobs::{Application, Failure};
+use maverick_core::platform::address_of;
 use maverick_core::page::Page;
 use maverick_core::store::Store;
 use tokio::runtime::Handle;
@@ -70,6 +71,9 @@ pub struct Browser {
     state: BrowserState,
     latency: Latency,
     failure: Option<String>,
+    /// Whether a run asks the application system if the posting is still open before it opens a
+    /// tab. Tests turn it off, since the question goes to the system's servers.
+    asks_if_closed: bool,
     _watch: Task<()>,
 }
 
@@ -109,6 +113,7 @@ impl Browser {
             filled_tab: None,
             latency: Latency::Measuring,
             failure: None,
+            asks_if_closed: true,
             _watch,
         };
         if browser.is_connected() {
@@ -247,6 +252,7 @@ impl Browser {
             target,
             self.answers_file.clone(),
             false,
+            false,
             |_| {},
         ));
         cx.spawn(async move |this, cx| {
@@ -327,7 +333,10 @@ impl Browser {
         if let Some(run) = self.queue.get_mut(address)
             && matches!(run.step, Step::Ready | Step::NeedsYou(_))
         {
-            run.step = Step::Failed("The tab closed before the application went through.".into());
+            run.step = Step::Failed(
+                Failure::Failed,
+                "The tab closed before the application went through.".into(),
+            );
             run.tab = None;
         }
         self.pump(cx);
@@ -424,6 +433,7 @@ impl Browser {
             target,
             self.answers_file.clone(),
             true,
+            self.asks_if_closed,
             move |step| {
                 // The receiver goes away only with the window.
                 let _ = sender.send(step);
@@ -469,7 +479,7 @@ impl Browser {
                             run.step = if stopped.needs_you {
                                 Step::NeedsYou(stopped.reason)
                             } else {
-                                Step::Failed(stopped.reason)
+                                Step::Failed(stopped.failure, stopped.reason)
                             };
                         }
                         // At a sign-in wall the user can still apply in the tab.
@@ -477,7 +487,7 @@ impl Browser {
                     }
                     Err(stopped) => {
                         if let Some(run) = this.queue.get_mut(&address) {
-                            run.step = Step::Failed(stopped.to_string());
+                            run.step = Step::Failed(Failure::Failed, stopped.to_string());
                         }
                         None
                     }
@@ -627,19 +637,17 @@ fn saved_parallel(database: Option<&Path>) -> usize {
 }
 
 /// Marks the posting applied in the local database and adds the application.
-fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<(), String> {
+pub(crate) fn record_applied(database: Option<&Path>, role: &str, address: &str) -> Result<(), String> {
     let database = database.ok_or("This system has no application data directory.")?;
     let said = |error: maverick_core::store::StoreError| error.to_string();
     let mut store = Store::open(database).map_err(said)?;
+    let own = apply::posting_address(address).unwrap_or_else(|| address.to_owned());
     let links: Vec<String> = store
         .postings()
         .map_err(said)?
         .into_iter()
+        .filter(|posting| address_of(posting) == own)
         .map(|posting| posting.link)
-        .filter(|link| {
-            let found = posting_address(link);
-            apply::posting_address(&found).unwrap_or(found) == address
-        })
         .collect();
     store
         .record_application(&links, &Application::submitted_today(role, address))
@@ -663,6 +671,8 @@ struct Stopped {
     reason: String,
     /// The tab waits on the user, as at a sign-in wall. Otherwise the fill failed.
     needs_you: bool,
+    /// Why the fill failed, when it did.
+    failure: Failure,
 }
 
 impl From<String> for Stopped {
@@ -670,6 +680,7 @@ impl From<String> for Stopped {
         Self {
             reason,
             needs_you: false,
+            failure: Failure::Failed,
         }
     }
 }
@@ -680,48 +691,52 @@ impl From<&str> for Stopped {
     }
 }
 
+/// Held by the fill whose tab is forward for its submit.
+static SUBMIT_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn fill_form(
     bridge: Arc<Bridge>,
     title: String,
     target: Target,
     answers_file: Option<PathBuf>,
     auto_submit: bool,
+    ask_if_closed: bool,
     progress: impl Fn(Progress),
 ) -> Result<Filled, Stopped> {
     let said = |error: BridgeError| error.to_string();
-    // A posting on a system Maverick cannot fill opens for the user to apply by hand.
-    if let Target::Posting { address, active } = &target
-        && System::of(address).is_none()
-    {
-        let connection = *bridge
-            .connections()
-            .first()
-            .ok_or_else(|| said(BridgeError::NotConnected))?;
-        let open = Command::OpenTab {
-            url: address.clone(),
-            active: *active,
+    // A posting Maverick cannot fill, or one that is gone, opens no tab.
+    if let Target::Posting { address, .. } = &target {
+        let Some(system) = System::of(address) else {
+            return Err(Stopped {
+                reason: format!(
+                    "Maverick cannot fill {} forms yet.",
+                    maverick_core::platform::Platform::of(address).name()
+                ),
+                needs_you: false,
+                failure: Failure::Unfillable,
+            });
         };
-        bridge.request(connection, &open).await.map_err(said)?;
-        return Err(Stopped {
-            reason: format!(
-                "Maverick cannot fill {} forms yet. The posting is open in a tab for you.",
-                maverick_core::platform::Platform::of(address).name()
-            ),
-            needs_you: true,
-        });
+        if ask_if_closed && system.is_closed(address).await {
+            return Err(Stopped {
+                reason: FillError::Closed.to_string(),
+                needs_you: false,
+                failure: Failure::Closed,
+            });
+        }
     }
     let answers_file = answers_file.ok_or("This system has no application data directory.")?;
     // Read on every run, so an edit to the file counts at once.
     let mut answers = Answers::load(&answers_file)?;
     // A tab the user picked comes forward, so the user can watch the form fill and then review it.
-    let (tab, form) = match target {
+    let (tab, form, source) = match target {
         Target::Tab(tab) => {
             let forward = Command::ActivateTab {
                 tab_id: tab.tab.id,
                 window_id: tab.tab.window_id,
             };
             bridge.request(tab.connection, &forward).await.map_err(said)?;
-            (tab, None)
+            let source = tab.tab.url.clone();
+            (tab, None, source)
         }
         Target::Posting { address, active } => {
             let form = System::of(&address)
@@ -750,15 +765,20 @@ async fn fill_form(
                 url: String::new(),
                 active,
             };
-            (Tab { connection, tab }, Some(form))
+            (Tab { connection, tab }, Some(form), address)
         }
     };
     progress(Progress::Opened(tab.clone()));
     let on = form.as_deref().unwrap_or(&tab.tab.url);
     let not_fillable = "This tab is not on a posting Maverick can fill.";
     let system = System::of(on).ok_or(not_fillable)?;
-    let address = system.posting_address(on).ok_or(not_fillable)?;
-    let page = Page::attach(bridge, &tab).await.map_err(|error| error.to_string())?;
+    // The posting is named by the address it was found at: a form on another host, as Greenhouse's
+    // embedded one, says nothing of the company page that holds it.
+    let address = System::of(&source)
+        .and_then(|system| system.posting_address(&source))
+        .or_else(|| system.posting_address(on))
+        .ok_or(not_fillable)?;
+    let page = Page::attach(bridge.clone(), &tab).await.map_err(|error| error.to_string())?;
     answers.facts.extend(applied_before(&answers_file).await);
     let report = match form {
         Some(form) => match page.navigate(&form).await {
@@ -777,6 +797,14 @@ async fn fill_form(
     let sent = match &report {
         Ok(report) if auto_submit && report.held_for_the_user().is_none() => {
             progress(Progress::Submitting);
+            // A form in a background tab can sit on its submit until the tab shows, so the tab
+            // comes forward for the press and the wait. One submit shows at a time.
+            let _turn = SUBMIT_TURN.lock().await;
+            let forward = Command::ActivateTab {
+                tab_id: tab.tab.id,
+                window_id: tab.tab.window_id,
+            };
+            let _ = bridge.request(tab.connection, &forward).await;
             Some(system.submit(&page).await.unwrap_or_else(|error| {
                 Sent::Unconfirmed(format!(
                     "{error} Look at the tab before you do anything else: the application may have gone through."
@@ -793,6 +821,10 @@ async fn fill_form(
     let detached = page.detach().await;
     let report = report.map_err(|error| Stopped {
         needs_you: matches!(error, FillError::SignInNeeded { .. } | FillError::SignIn(_)),
+        failure: match error {
+            FillError::Closed => Failure::Closed,
+            _ => Failure::Failed,
+        },
         reason: error.to_string(),
     })?;
     // A form that was submitted is done, whatever the detach said.
@@ -954,7 +986,11 @@ mod tests {
         let background = runtime.handle().clone();
         let browser = cx.update(|cx| {
             use gpui_kit::AppContext as _;
-            cx.new(|cx| Browser::new(bridge.clone(), background, Err("none".into()), Some(answers), None, cx))
+            cx.new(|cx| {
+                let mut browser = Browser::new(bridge.clone(), background, Err("none".into()), Some(answers), None, cx);
+                browser.asks_if_closed = false;
+                browser
+            })
         });
         let ashby = |id: u8| format!("https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb94{id:02}");
         let elsewhere = "https://careers.example.com/jobs/7";
@@ -986,18 +1022,19 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the queue drains: {steps:?}");
             std::thread::sleep(Duration::from_millis(2));
         };
-        let failed = Step::Failed("the page did not load: net::ERR_NAME_NOT_RESOLVED".into());
+        let failed = Step::Failed(Failure::Failed, "the page did not load: net::ERR_NAME_NOT_RESOLVED".into());
         assert_eq!(steps[..4], [failed.clone(), failed.clone(), failed.clone(), failed]);
         assert_eq!(
             steps[4],
-            Step::NeedsYou("Maverick cannot fill Company site forms yet. The posting is open in a tab for you.".into())
+            Step::Failed(Failure::Unfillable, "Maverick cannot fill Company site forms yet.".into())
         );
         drop(runtime);
         let (most, opened) = chrome.join().unwrap();
         assert_eq!(most, 2, "two forms at most were open at once");
-        assert_eq!(opened.len(), 5);
+        // A site Maverick cannot fill opens no tab.
+        assert_eq!(opened.len(), 4);
         assert!(opened.iter().all(|request| request["active"] == false), "{opened:?}");
-        assert_eq!(opened[4]["url"], elsewhere);
+        assert!(opened.iter().all(|request| request["url"] != elsewhere), "{opened:?}");
     }
 
     #[test]

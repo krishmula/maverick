@@ -62,6 +62,22 @@ impl System {
         }
     }
 
+    /// True when the system says, without a browser, that the posting at `address` is gone.
+    /// A system Maverick cannot ask, or a question that fails, counts as open: the fill finds out.
+    pub async fn is_closed(self, address: &str) -> bool {
+        let closed = FillError::Closed.to_string();
+        match self {
+            Self::Ashby => ashby::read_form(address).await.err() == Some(closed),
+            Self::Greenhouse => greenhouse::read_form(address).await.err() == Some(closed),
+            // A closed iCIMS posting answers 410 Gone, or 404, and sends the browser to the company's site.
+            Self::Icims => match self.posting_address(address) {
+                Some(posting) => matches!(crate::description::get(&posting).await, Ok((404 | 410, _))),
+                None => false,
+            },
+            Self::Workday | Self::Amazon => false,
+        }
+    }
+
     /// A CSS selector for the element the system shows once an application went through.
     pub fn submitted(self) -> &'static str {
         match self {
@@ -457,18 +473,32 @@ pub async fn fill_form(page: &Page, answers: &Answers, form: Form, system: &impl
         if answers.facts.is_empty() || factual.is_empty() {
             return None;
         }
-        let questions: Vec<&Question> = factual.iter().map(|&index| &fields[index].question).collect();
-        Some(
-            model::answer(
-                &facts_for_a_model(answers),
-                answers.standing,
-                &job,
-                &requirements,
-                &questions,
-                &factual.iter().map(|&index| fields[index].required).collect::<Vec<_>>(),
-            )
-            .await,
-        )
+        let facts = facts_for_a_model(answers);
+        let ask = |asked: &[usize]| {
+            let questions: Vec<&Question> = asked.iter().map(|&index| &fields[index].question).collect();
+            let required: Vec<bool> = asked.iter().map(|&index| fields[index].required).collect();
+            let (facts, job, requirements) = (&facts, &job, &requirements);
+            async move { model::answer(facts, answers.standing, job, requirements, &questions, &required).await }
+        };
+        let mut said = ask(&factual).await;
+        // The model leaves a question it can answer now and then. A required one left blank
+        // keeps the form from going in, so those are asked once more on their own.
+        if let Ok(first) = &said {
+            let again: Vec<usize> = (0..factual.len())
+                .filter(|&at| fields[factual[at]].required && first.get(at).is_some_and(|said| said.answer.is_none()))
+                .collect();
+            if !again.is_empty() {
+                let asked: Vec<usize> = again.iter().map(|&at| factual[at]).collect();
+                if let (Ok(second), Ok(first)) = (ask(&asked).await, said.as_mut()) {
+                    for (&at, answer) in again.iter().zip(second) {
+                        if answer.answer.is_some() {
+                            first[at] = answer;
+                        }
+                    }
+                }
+            }
+        }
+        Some(said)
     };
     let entering = async {
         // The resume goes first, because Ashby can fill other fields from it.
