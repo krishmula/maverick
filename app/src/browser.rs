@@ -9,8 +9,8 @@ use maverick_core::answers::Answers;
 use maverick_core::apply::{self, FillError, Report, Sent, System};
 use maverick_core::bridge::{Bridge, BridgeError, BrowserState, BrowserTab, Command, ConnectionId, Tab};
 use maverick_core::jobs::{Application, Failure};
-use maverick_core::platform::address_of;
 use maverick_core::page::Page;
+use maverick_core::platform::address_of;
 use maverick_core::store::Store;
 use tokio::runtime::Handle;
 
@@ -778,7 +778,9 @@ async fn fill_form(
         .and_then(|system| system.posting_address(&source))
         .or_else(|| system.posting_address(on))
         .ok_or(not_fillable)?;
-    let page = Page::attach(bridge.clone(), &tab).await.map_err(|error| error.to_string())?;
+    let page = Page::attach(bridge.clone(), &tab)
+        .await
+        .map_err(|error| error.to_string())?;
     answers.facts.extend(applied_before(&answers_file).await);
     let report = match form {
         Some(form) => match page.navigate(&form).await {
@@ -1022,11 +1024,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the queue drains: {steps:?}");
             std::thread::sleep(Duration::from_millis(2));
         };
-        let failed = Step::Failed(Failure::Failed, "the page did not load: net::ERR_NAME_NOT_RESOLVED".into());
+        let failed = Step::Failed(
+            Failure::Failed,
+            "the page did not load: net::ERR_NAME_NOT_RESOLVED".into(),
+        );
         assert_eq!(steps[..4], [failed.clone(), failed.clone(), failed.clone(), failed]);
         assert_eq!(
             steps[4],
-            Step::Failed(Failure::Unfillable, "Maverick cannot fill Company site forms yet.".into())
+            Step::Failed(
+                Failure::Unfillable,
+                "Maverick cannot fill Company site forms yet.".into()
+            )
         );
         drop(runtime);
         let (most, opened) = chrome.join().unwrap();

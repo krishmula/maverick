@@ -691,6 +691,7 @@ async fn entered(
         Err(Problem::Page(error)) if error.ends_the_work() => {
             Err(during(format!("filling {:?}", field.question.title))(error))
         }
+        Err(Problem::NotNeeded) => Ok(FieldResult::Left(Unanswered::NotNeeded)),
         Err(problem) => Ok(FieldResult::Failed(problem.to_string())),
     }
 }
@@ -701,6 +702,8 @@ pub enum Problem {
     /// The field does not show what was entered.
     Shows(String),
     Mismatch(&'static str),
+    /// The page took the field away because of another answer.
+    NotNeeded,
 }
 
 impl fmt::Display for Problem {
@@ -710,6 +713,7 @@ impl fmt::Display for Problem {
             Self::Shows(shown) if shown.is_empty() => f.write_str("the field stayed empty"),
             Self::Shows(shown) => write!(f, "the field shows {shown:?} instead"),
             Self::Mismatch(problem) => f.write_str(problem),
+            Self::NotNeeded => Unanswered::NotNeeded.fmt(f),
         }
     }
 }

@@ -197,7 +197,10 @@ mod tests {
             ))
         );
         assert_eq!(
-            said(Step::Failed(maverick_core::jobs::Failure::Failed, "the page did not load".into())),
+            said(Step::Failed(
+                maverick_core::jobs::Failure::Failed,
+                "the page did not load".into()
+            )),
             Some((
                 "Fill failed: Engineer, Example Co".into(),
                 "Nothing was submitted. the page did not load".into()

@@ -589,7 +589,9 @@ impl ListDelegate for Rows {
             Section::Pending if searching && !self.filtered_out.is_empty() => "No posting matches the search.",
             Section::Pending if !self.filtered_out.is_empty() => "The company filter hides every posting.",
             Section::Pending => "Nothing waits on a decision. New postings arrive with the hourly check.",
-            Section::Queue if searching && !self.filtered_out.is_empty() => "No posting in the queue matches the search.",
+            Section::Queue if searching && !self.filtered_out.is_empty() => {
+                "No posting in the queue matches the search."
+            }
             Section::Queue => "The queue is empty. Add to queue sets a posting aside for Run queue.",
             Section::Errors if self.failure_filter.is_some() => "No posting failed this way.",
             Section::Errors => "Maverick applied to every posting you approved, or is still at it.",
@@ -787,7 +789,8 @@ impl Board {
 
     /// Shows the errors of one kind, or all of them with `None`.
     fn filter_failures(&mut self, failure: Option<Failure>, window: &mut Window, cx: &mut Context<Self>) {
-        self.list.update(cx, |list, _| list.delegate_mut().failure_filter = failure);
+        self.list
+            .update(cx, |list, _| list.delegate_mut().failure_filter = failure);
         self.regroup(window, cx);
     }
 
@@ -1961,12 +1964,7 @@ fn failure_status(failure: Failure, why: &str, palette: &Palette) -> impl IntoEl
         .border_b_1()
         .border_color(palette.line)
         .child(ui::square(palette.signal(Signal::Failed)).mt(px(6.)))
-        .child(
-            ui::serif(capitalized(why))
-                .flex_1()
-                .min_w_0()
-                .text_size(px(13.5)),
-        )
+        .child(ui::serif(capitalized(why)).flex_1().min_w_0().text_size(px(13.5)))
 }
 
 fn capitalized(text: &str) -> String {
@@ -2431,10 +2429,7 @@ mod tests {
                 ("High but not ready at Example Co".to_owned(), Step::Queued),
             ]
         );
-        assert_eq!(
-            shown(cx),
-            ("Unscored, Middling".into(), Some("Unscored".into()), 2)
-        );
+        assert_eq!(shown(cx), ("Unscored, Middling".into(), Some("Unscored".into()), 2));
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             window.click("board-queue", cx);
@@ -2573,7 +2568,13 @@ mod tests {
             window.click("board-errors", cx);
             window.render_frame(cx);
             assert_eq!(window.find("error-unfillable").label(), Some("Show can't fill site 1"));
-            assert!(window.find("failure-status").label().unwrap().starts_with("can't fill site: "));
+            assert!(
+                window
+                    .find("failure-status")
+                    .label()
+                    .unwrap()
+                    .starts_with("can't fill site: ")
+            );
         })
         .unwrap();
         wait_until("the error is saved", || {

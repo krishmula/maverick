@@ -568,9 +568,15 @@ mod tests {
     fn a_failure_is_kept_until_it_is_cleared_and_a_new_one_replaces_it() {
         let scratch = tempfile::tempdir().unwrap();
         let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
-        store.record_failure("p/1", Failure::Unfillable, "a company site").unwrap();
-        store.record_failure("p/2", Failure::Failed, "the page did not load").unwrap();
-        store.record_failure("p/2", Failure::Closed, "this posting is closed").unwrap();
+        store
+            .record_failure("p/1", Failure::Unfillable, "a company site")
+            .unwrap();
+        store
+            .record_failure("p/2", Failure::Failed, "the page did not load")
+            .unwrap();
+        store
+            .record_failure("p/2", Failure::Closed, "this posting is closed")
+            .unwrap();
         let failures = store.failures().unwrap();
         assert_eq!(failures["p/1"], (Failure::Unfillable, "a company site".to_owned()));
         assert_eq!(failures["p/2"], (Failure::Closed, "this posting is closed".to_owned()));

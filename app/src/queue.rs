@@ -1,8 +1,8 @@
 //! The apply queue: approved postings, filled several at once, each in its own Chrome tab.
 
 use maverick_core::apply::{End, Report, Sent};
-use maverick_core::jobs::Failure;
 use maverick_core::bridge::Tab;
+use maverick_core::jobs::Failure;
 
 /// How many forms fill at once unless the user picks another number.
 pub const DEFAULT_PARALLEL: usize = 3;

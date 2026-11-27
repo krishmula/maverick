@@ -1483,7 +1483,9 @@ async fn with_options(page: &Page, mut fields: Vec<Field>) -> Result<Vec<Field>,
         }
         field.question.kind = match options(page, &field.path).await {
             Ok(options) if !options.is_empty() => Kind::Choice { options },
-            Ok(_) | Err(Problem::Shows(_) | Problem::Mismatch(_)) => Kind::Unsupported("list that did not open".into()),
+            Ok(_) | Err(Problem::Shows(_) | Problem::Mismatch(_) | Problem::NotNeeded) => {
+                Kind::Unsupported("list that did not open".into())
+            }
             Err(Problem::Page(error)) if error.ends_the_work() => {
                 return Err(during(format!("reading the options of {:?}", field.question.title))(
                     error,
