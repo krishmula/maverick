@@ -388,8 +388,8 @@ impl Store {
         Ok(added)
     }
 
-    /// Records an application the user submitted: the postings at `posting_links` become applied,
-    /// and the application is added unless one with the same link is already recorded.
+    /// Records an application the user submitted: the postings at `posting_links` become applied
+    /// and lose any error recorded for them, and the application is added unless one with the same link is already recorded.
     pub fn record_application(&mut self, posting_links: &[String], sent: &Application) -> Result<(), StoreError> {
         let write = self.db.transaction()?;
         for link in posting_links {
@@ -397,6 +397,7 @@ impl Store {
                 "UPDATE postings SET stage = ?1 WHERE link = ?2",
                 params![Stage::Applied.as_str(), link],
             )?;
+            write.execute("DELETE FROM failures WHERE link = ?1", params![link])?;
         }
         write.execute(
             "INSERT INTO applications (sheet_row, role, link, applied_on, status, notes)
@@ -582,6 +583,20 @@ mod tests {
         assert_eq!(failures["p/2"], (Failure::Closed, "this posting is closed".to_owned()));
         store.clear_failure("p/1").unwrap();
         assert_eq!(store.failures().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_recorded_submit_clears_the_posting_s_error() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("maverick.db")).unwrap();
+        store.record_failure("p/1", Failure::Failed, "the tab closed").unwrap();
+        store
+            .record_application(
+                &["p/1".to_owned()],
+                &Application::submitted_today("Engineer at Example Co", "p/1"),
+            )
+            .unwrap();
+        assert!(store.failures().unwrap().is_empty());
     }
 
     #[test]
