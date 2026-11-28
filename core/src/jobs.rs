@@ -55,10 +55,35 @@ stored_enum! {
 }
 
 stored_enum! {
-    /// What the user decided about a posting on the decision board. The sheet never holds it.
+    /// What the user decided about a posting in the Jobs tab. The sheet never holds it.
+    /// `Queued` sets the posting aside until the user runs the queue.
     Decision {
         Approved => "approved",
         Skipped => "skipped",
+        Queued => "queued",
+    }
+}
+
+stored_enum! {
+    /// Why Maverick could not apply to a posting the user approved. Such a posting sits in the
+    /// Jobs tab's Errors until the user approves it again or decides otherwise. `Closed`: the
+    /// posting is no longer listed. `Unfillable`: it is on a site whose forms Maverick cannot fill.
+    /// `Failed`: the fill stopped on something it did not expect.
+    Failure {
+        Closed => "closed",
+        Unfillable => "unfillable",
+        Failed => "failed",
+    }
+}
+
+impl Failure {
+    /// The name the Errors filter shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "posting closed",
+            Self::Unfillable => "can't fill site",
+            Self::Failed => "fill failed",
+        }
     }
 }
 

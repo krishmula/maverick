@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::answers::{Answer, Answers, Kind, Question, Role};
+use crate::answers::{Answer, Answers, Kind, Question, Role, SchoolPart};
 use crate::apply::{
     self, Enter, Field, FillError, Form, Problem, Report, during, expect_value, plain_text, quoted, settles, text_of,
 };
@@ -26,14 +26,58 @@ pub const SUBMITTED: &str = ".confirmation__content";
 const FORM_DATA: &str = r#"(() => {
     const held = Object.values(window.__remixContext?.state?.loaderData ?? {}).find((data) => data?.jobPost);
     if (!held) return null;
-    const { title, job_post_location, content, questions } = held.jobPost;
-    return { title, job_post_location, content, questions };
+    const { title, job_post_location, content, questions, education_config, eeoc_sections } = held.jobPost;
+    return { title, job_post_location, content, questions, education_config, eeoc_sections };
 })()"#;
 
 /// The form, once it is ready for input. The server sends the form already drawn, and what is
 /// typed before the page's script takes the form over is lost. The script's first act is to
 /// ask for the credentials its file uploads need, and an upload before they arrive fails.
 /// So the form is ready when that request is done.
+/// The degrees Greenhouse offers in an education section. The page lists them only once the list is open.
+const DEGREES: [&str; 10] = [
+    "Associate's Degree",
+    "Bachelor's Degree",
+    "Doctor of Medicine (M.D.)",
+    "Doctor of Philosophy (Ph.D.)",
+    "Engineer's Degree",
+    "High School",
+    "Juris Doctor (J.D.)",
+    "Master of Business Administration (M.B.A.)",
+    "Master's Degree",
+    "Other",
+];
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The fields of the voluntary self-identification sections. They are answered only from the
+/// user's disclosures.
+const VOLUNTARY: [&str; 5] = [
+    "gender",
+    "hispanic_ethnicity",
+    "race",
+    "veteran_status",
+    "disability_status",
+];
+
+/// The page asks whether the applicant is Hispanic or Latino before it asks for a race, and
+/// shows the race list only to one who answers no.
+const HISPANIC: &str = "hispanic_ethnicity";
+const HISPANIC_OR_LATINO: &str = "Hispanic or Latino";
+
 const READY_FORM: &str = r#"(() => {
     const asked = performance
         .getEntriesByType("resource")
@@ -52,49 +96,103 @@ pub fn is_posting(address: &str) -> bool {
     posting(address).is_some()
 }
 
-/// The address of a posting's application form. The form is on the posting's own page.
+/// The address of a posting's application form. A hosted board shows the form on the posting's
+/// own page. A company's career page shows Greenhouse's embedded form, which opens on its own.
 pub fn form_address(address: &str) -> Option<String> {
-    posting_address(address)
+    posting(address).map(|posting| posting.form())
 }
 
-/// Where a posting is on Greenhouse's hosted boards.
+/// Where a posting is on Greenhouse.
 #[derive(Debug, PartialEq)]
 struct Posting<'a> {
-    /// `eu.` for a board in the European region, and empty for the others.
-    region: &'a str,
-    board: &'a str,
+    on: Board<'a>,
     id: &'a str,
     /// True when the address is the page that holds the form.
     on_form: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum Board<'a> {
+    /// A hosted board. `region` is `eu.` for a board in the European region, and empty for the others.
+    Hosted { region: &'a str, board: &'a str },
+    /// Greenhouse's embedded form, which names the posting by its number alone.
+    Embed,
+    /// A company's own career page that embeds the posting, as `stripe.com/jobs/search?gh_jid=<id>`.
+    /// `page` is the address up to its query.
+    Company { page: &'a str },
+}
+
 impl Posting<'_> {
     fn address(&self) -> String {
-        format!(
-            "https://job-boards.{}greenhouse.io/{}/jobs/{}",
-            self.region, self.board, self.id
-        )
+        match &self.on {
+            Board::Hosted { region, board } => {
+                format!("https://job-boards.{region}greenhouse.io/{board}/jobs/{}", self.id)
+            }
+            Board::Embed => self.form(),
+            Board::Company { page } => format!("https://{page}?gh_jid={}", self.id),
+        }
+    }
+
+    /// The embedded form on the older host sends the browser on to the board that holds the
+    /// posting, so the posting's number is enough to find it.
+    fn form(&self) -> String {
+        match &self.on {
+            Board::Hosted { .. } => self.address(),
+            Board::Embed | Board::Company { .. } => {
+                format!("https://boards.greenhouse.io/embed/job_app?token={}", self.id)
+            }
+        }
     }
 }
 
 fn posting(address: &str) -> Option<Posting<'_>> {
-    let (host, path) = address.strip_prefix("https://")?.split_once('/')?;
+    let (host, rest) = address.strip_prefix("https://")?.split_once('/')?;
+    let (path, query) = match rest.split('#').next()?.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (rest.split('#').next()?, ""),
+    };
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .filter(|value| number(value))
+    };
+    let on_greenhouse = host == "greenhouse.io" || host.ends_with(".greenhouse.io");
+    if !on_greenhouse {
+        let plain_host = !host.is_empty()
+            && host.contains('.')
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte));
+        return plain_host.then_some(()).and(param("gh_jid")).map(|id| Posting {
+            on: Board::Company {
+                page: &address["https://".len()..][..host.len() + 1 + path.len()],
+            },
+            id,
+            on_form: false,
+        });
+    }
     // `boards.` is the older host. It sends the browser on to `job-boards.`.
     let (current, region) = [("job-boards.", true), ("boards.", false)]
         .into_iter()
         .find_map(|(start, current)| Some((current, host.strip_prefix(start)?.strip_suffix("greenhouse.io")?)))?;
-    let path = path.split(['?', '#']).next()?;
+    if path.trim_end_matches('/') == "embed/job_app" && region.is_empty() {
+        return param("token").map(|id| Posting {
+            on: Board::Embed,
+            id,
+            on_form: true,
+        });
+    }
     let mut parts = path.split('/').filter(|part| !part.is_empty());
     let (board, jobs, id) = (parts.next()?, parts.next()?, parts.next()?);
     let plain = |text: &str| {
         text.bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
     };
-    let is_posting =
-        matches!(region, "" | "eu.") && plain(board) && jobs == "jobs" && id.bytes().all(|byte| byte.is_ascii_digit());
+    let is_posting = matches!(region, "" | "eu.") && plain(board) && jobs == "jobs" && number(id);
     is_posting.then(|| Posting {
-        region,
-        board,
+        on: Board::Hosted { region, board },
         id,
         on_form: current && parts.next().is_none(),
     })
@@ -115,7 +213,7 @@ fn says_closed(address: &str) -> bool {
 
 /// Reads the form of the posting at `address` from the page Greenhouse serves, without a browser.
 pub async fn read_form(address: &str) -> Result<Form, String> {
-    let page_address = posting_address(address).ok_or("not a Greenhouse posting")?;
+    let page_address = form_address(address).ok_or("not a Greenhouse posting")?;
     let (status, page) = crate::description::get(&page_address).await?;
     if status == 404 {
         return Err(FillError::Closed.to_string());
@@ -141,6 +239,26 @@ pub fn form(job_post: &Value) -> Result<Form, FillError> {
         title: String,
         job_post_location: Option<String>,
         content: Option<String>,
+        questions: Vec<Asked>,
+        #[serde(default)]
+        education_config: Option<Education>,
+        #[serde(default)]
+        eeoc_sections: Option<Vec<Section>>,
+    }
+    /// Each part of the education section is "required", "optional" or "hidden".
+    #[derive(Deserialize)]
+    struct Education {
+        school_name: Option<String>,
+        degree: Option<String>,
+        discipline: Option<String>,
+        start_month: Option<String>,
+        start_year: Option<String>,
+        end_month: Option<String>,
+        end_year: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Section {
+        #[serde(default)]
         questions: Vec<Asked>,
     }
     #[derive(Deserialize)]
@@ -168,7 +286,12 @@ pub fn form(job_post: &Value) -> Result<Form, FillError> {
     }
     let post = JobPost::deserialize(job_post).map_err(|error| FillError::UnexpectedForm(error.to_string()))?;
     let mut fields = Vec::new();
-    for asked in post.questions {
+    let voluntary = post
+        .eeoc_sections
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|section| section.questions);
+    for asked in post.questions.into_iter().chain(voluntary) {
         // A question's other fields are other ways to give the same answer, such as pasted
         // text in place of a file. The page draws the first one.
         let Some(field) = asked.fields.into_iter().next() else {
@@ -183,7 +306,22 @@ pub fn form(job_post: &Value) -> Result<Form, FillError> {
         {
             return Err(FillError::UnexpectedForm(format!("the field name {:?}", field.name)));
         }
-        let options: Vec<String> = field.values.iter().map(|value| value.label.trim().to_owned()).collect();
+        let mut options: Vec<String> = field.values.iter().map(|value| value.label.trim().to_owned()).collect();
+        if field.name == "race" {
+            options.retain(|option| option != HISPANIC_OR_LATINO);
+            fields.push(Field {
+                held: false,
+                path: HISPANIC.to_owned(),
+                required: false,
+                question: Question {
+                    title: "Are you Hispanic/Latino?".to_owned(),
+                    kind: Kind::Choice {
+                        options: vec!["Yes".into(), "No".into(), "Decline To Self Identify".into()],
+                    },
+                    role: None,
+                },
+            });
+        }
         let (kind, role) = match (field.name.as_str(), field.kind.as_str()) {
             ("first_name", "input_text") => (Kind::Text, Some(Role::FirstName)),
             ("last_name", "input_text") => (Kind::Text, Some(Role::LastName)),
@@ -210,6 +348,77 @@ pub fn form(job_post: &Value) -> Result<Form, FillError> {
             },
         });
     }
+    if let Some(education) = post.education_config {
+        let choice = |options: &[&str]| Kind::Choice {
+            options: options.iter().map(|&option| option.to_owned()).collect(),
+        };
+        let parts = [
+            (
+                education.school_name,
+                "school",
+                "School",
+                Kind::Search,
+                SchoolPart::Name,
+            ),
+            (
+                education.degree,
+                "degree",
+                "Degree",
+                choice(&DEGREES),
+                SchoolPart::Degree,
+            ),
+            (
+                education.discipline,
+                "discipline",
+                "Discipline",
+                Kind::Search,
+                SchoolPart::Field,
+            ),
+            (
+                education.start_month,
+                "start-month",
+                "Start date month",
+                choice(&MONTHS),
+                SchoolPart::From,
+            ),
+            (
+                education.start_year,
+                "start-year",
+                "Start date year",
+                Kind::Text,
+                SchoolPart::From,
+            ),
+            (
+                education.end_month,
+                "end-month",
+                "End date month",
+                choice(&MONTHS),
+                SchoolPart::To,
+            ),
+            (
+                education.end_year,
+                "end-year",
+                "End date year",
+                Kind::Text,
+                SchoolPart::To,
+            ),
+        ];
+        for (shown, id, title, kind, part) in parts {
+            let Some(shown) = shown.filter(|shown| shown != "hidden") else {
+                continue;
+            };
+            fields.push(Field {
+                held: false,
+                path: format!("{id}--0"),
+                required: shown == "required",
+                question: Question {
+                    title: title.to_owned(),
+                    kind,
+                    role: Some(Role::School(0, part)),
+                },
+            });
+        }
+    }
     let job = match post.job_post_location.as_deref().map(str::trim) {
         Some(place) if !place.is_empty() => format!("{}, {place}", post.title.trim()),
         _ => post.title.trim().to_owned(),
@@ -233,11 +442,12 @@ fn is_yes_or_no(options: &[String]) -> bool {
 /// The tab must be on a Greenhouse posting.
 ///
 /// The standard answers go in first. A model then answers what they left, from the user's facts.
-/// The demographic and equal opportunity sections are not among the posting's questions, so they stay as they are.
+/// The voluntary self-identification questions are answered from the user's disclosures. With
+/// none, they stay as they are.
 pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
     let mut address = address_of(page).await?;
     if posting(&address).is_some_and(|posting| !posting.on_form) {
-        let form = posting_address(&address).expect("the address was just read as a posting");
+        let form = form_address(&address).expect("the address was just read as a posting");
         page.navigate(&form).await.map_err(during("opening the form"))?;
         address = address_of(page).await?;
     }
@@ -251,11 +461,23 @@ pub async fn fill(page: &Page, answers: &Answers) -> Result<Report, FillError> {
         .evaluate(FORM_DATA)
         .await
         .map_err(during("reading the form's questions from the page"))?;
-    let form = form(&described)?;
+    let mut form = form(&described)?;
     page.wait_for(&Locator::script("the application form", READY_FORM), FORM_WAIT)
         .await
         .map_err(during("waiting for the form to appear"))?;
 
+    // The model reads the disclosures beside the facts. Its instructions keep them to the questions that ask.
+    let disclosing;
+    let answers = if answers.disclosures.is_empty() {
+        form.fields.retain(|field| !VOLUNTARY.contains(&field.path.as_str()));
+        answers
+    } else {
+        disclosing = Answers {
+            facts: [answers.disclosures.as_slice(), answers.facts.as_slice()].concat(),
+            ..answers.clone()
+        };
+        &disclosing
+    };
     apply::fill_form(page, answers, form, &Greenhouse).await
 }
 
@@ -308,7 +530,16 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
             let shown = page.evaluate(&value).await?.as_str().unwrap_or_default().to_owned();
             if entered { Ok(shown) } else { Err(Problem::Shows(shown)) }
         }
+        (Answer::Text(text), Kind::Search) => {
+            let lowered = format!("text.toLowerCase() === {}", quoted(&text.to_lowercase()));
+            choose(page, path, text, &lowered).await
+        }
         (Answer::Text(text), _) => {
+            // A year field takes the year alone, though the user may have written a month with it.
+            let text = match field.question.role {
+                Some(Role::School(_, SchoolPart::From | SchoolPart::To)) => text.get(..4).unwrap_or(text),
+                _ => text,
+            };
             let input = input(path);
             page.fill(&input, text).await?;
             expect_value(page, &input, text).await
@@ -316,6 +547,11 @@ async fn enter(page: &Page, field: &Field, answer: &Answer) -> Result<String, Pr
         (Answer::YesNo(yes), _) => {
             let word = if *yes { "yes" } else { "no" };
             choose(page, path, word, &format!("text.toLowerCase() === {}", quoted(word))).await
+        }
+        (Answer::Choice(_), _)
+            if path == "race" && page.evaluate(&format!("!({})", input(path).as_script())).await? == true =>
+        {
+            Err(Problem::NotNeeded)
         }
         (Answer::Choice(wanted), _) => choose(page, path, wanted, &format!("text === {}", quoted(wanted))).await,
         (Answer::Choices(options), _) => {
@@ -474,8 +710,10 @@ mod tests {
         assert_eq!(
             super::posting(posting),
             Some(Posting {
-                region: "",
-                board: "example-co",
+                on: Board::Hosted {
+                    region: "",
+                    board: "example-co"
+                },
                 id: "4012345006",
                 on_form: true
             })
@@ -501,17 +739,37 @@ mod tests {
     }
 
     #[test]
+    fn a_posting_on_a_company_career_page_opens_in_the_embedded_form() {
+        let page = "https://example.com/jobs/search?utm_source=mail&gh_jid=4012345006#top";
+        let embed = "https://boards.greenhouse.io/embed/job_app?token=4012345006";
+        assert_eq!(
+            posting_address(page).as_deref(),
+            Some("https://example.com/jobs/search?gh_jid=4012345006")
+        );
+        assert_eq!(form_address(page).as_deref(), Some(embed));
+        assert!(!super::posting(page).unwrap().on_form);
+        // The older host sends the browser on to the board that holds the posting.
+        let landed = "https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=4012345006";
+        assert!(super::posting(landed).unwrap().on_form);
+        assert_eq!(posting_address(landed).as_deref(), Some(embed));
+        assert_eq!(form_address(embed).as_deref(), Some(embed));
+    }
+
+    #[test]
     fn an_address_that_is_no_posting_is_not_recognized() {
         for address in [
             "https://job-boards.greenhouse.io/example-co",
             "https://job-boards.greenhouse.io/example-co?error=true",
             "https://job-boards.greenhouse.io/example-co/jobs",
             "https://job-boards.greenhouse.io/example-co/jobs/latest",
-            "https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=4012345006",
+            "https://job-boards.greenhouse.io/embed/job_app?for=example-co",
+            "https://job-boards.eu.greenhouse.io/embed/job_app?token=4012345006",
             "https://job-boards.xx.greenhouse.io/example-co/jobs/4012345006",
             "https://app.greenhouse.io/example-co/jobs/4012345006",
             "https://job-boards.greenhouse.io.example.com/example-co/jobs/4012345006",
-            "https://example.com/careers?gh_jid=4012345006",
+            "https://example.com/careers?gh_jid=latest",
+            "https://example.com/careers?other_gh_jid=4012345006",
+            "https://job-boards.greenhouse.io/example-co?gh_jid=4012345006",
             "http://job-boards.greenhouse.io/example-co/jobs/4012345006",
         ] {
             assert!(!is_posting(address), "{address}");
@@ -657,6 +915,70 @@ mod tests {
                     Kind::Unsupported("signature".into()),
                     None
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_education_and_voluntary_sections_become_fields_after_the_questions() {
+        let mut post = job_post(vec![asked("email", "Email", "input_text", true)]);
+        post["education_config"] = json!({
+            "id": 7, "school_name": "required", "degree": "optional", "discipline": "hidden",
+            "start_month": "hidden", "start_year": "hidden", "end_month": "hidden", "end_year": "optional",
+        });
+        post["eeoc_sections"] = json!([
+            { "questions": [
+                offering(asked("gender", "Gender", "multi_value_single_select", false), &["Male", "Female"]),
+                offering(asked("race", "Race", "multi_value_single_select", false), &["Asian", "Hispanic or Latino", "White"]),
+            ]},
+            { "questions": [offering(asked("veteran_status", "Veteran Status", "multi_value_single_select", false), &["I am not a protected veteran"])] },
+        ]);
+        let fields = form(&post).unwrap().fields;
+        let seen: Vec<(&str, bool, &Kind, Option<Role>)> = fields
+            .iter()
+            .map(|field| {
+                (
+                    field.path.as_str(),
+                    field.required,
+                    &field.question.kind,
+                    field.question.role,
+                )
+            })
+            .collect();
+        let choice = |options: &[&str]| Kind::Choice {
+            options: options.iter().map(|&option| option.to_owned()).collect(),
+        };
+        assert_eq!(
+            seen,
+            [
+                ("email", true, &Kind::Email, None),
+                ("gender", false, &choice(&["Male", "Female"]), None),
+                (
+                    "hispanic_ethnicity",
+                    false,
+                    &choice(&["Yes", "No", "Decline To Self Identify"]),
+                    None
+                ),
+                ("race", false, &choice(&["Asian", "White"]), None),
+                (
+                    "veteran_status",
+                    false,
+                    &choice(&["I am not a protected veteran"]),
+                    None
+                ),
+                (
+                    "school--0",
+                    true,
+                    &Kind::Search,
+                    Some(Role::School(0, SchoolPart::Name))
+                ),
+                (
+                    "degree--0",
+                    false,
+                    &choice(&DEGREES),
+                    Some(Role::School(0, SchoolPart::Degree))
+                ),
+                ("end-year--0", false, &Kind::Text, Some(Role::School(0, SchoolPart::To))),
             ]
         );
     }

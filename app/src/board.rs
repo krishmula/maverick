@@ -25,8 +25,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 use jiff::Timestamp;
-use maverick_core::apply;
-use maverick_core::jobs::{Application, ApplicationStatus, Decision, Outreach, Posting, Sponsorship, Stage};
+use maverick_core::apply::{self, System};
+use maverick_core::jobs::{Application, ApplicationStatus, Decision, Failure, Outreach, Posting, Sponsorship, Stage};
 use maverick_core::outreach::Check;
 use maverick_core::platform::{Platform, address_of};
 use maverick_core::score::APPLY_READY;
@@ -79,6 +79,8 @@ fn is_apply_ready(notes: &str) -> bool {
 pub struct BoardData {
     pub entries: Vec<Entry>,
     pub applications: Vec<Application>,
+    /// Why Maverick could not apply to an approved posting, with what it said, by posting link.
+    pub failures: HashMap<String, (Failure, String)>,
 }
 
 impl BoardData {
@@ -117,7 +119,11 @@ impl BoardData {
         entries.sort_by_key(|entry| entry.decision.is_none());
         let mut seen = std::collections::HashSet::new();
         entries.retain(|entry| seen.insert(entry.address.clone()));
-        Self { entries, applications }
+        Self {
+            entries,
+            applications,
+            failures: HashMap::new(),
+        }
     }
 }
 
@@ -287,6 +293,10 @@ impl Search {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
     Pending,
+    /// Postings set aside for Run queue, and those Maverick is applying to or waits on the user for.
+    Queue,
+    /// Approved postings Maverick could not apply to.
+    Errors,
     Submitted,
 }
 
@@ -306,6 +316,12 @@ pub struct Rows {
     selected: Option<IndexPath>,
     /// The postings marked to decide together, by link.
     marked: BTreeSet<String>,
+    /// The addresses of the postings the apply queue is working on or waits on the user for.
+    active: HashSet<String>,
+    /// Why Maverick could not apply to an approved posting, with what it said, by posting link.
+    failures: HashMap<String, (Failure, String)>,
+    /// The one kind of failure Errors shows, until the user shows them all again.
+    failure_filter: Option<Failure>,
 }
 
 impl Rows {
@@ -321,9 +337,18 @@ impl Rows {
         let mut all = std::mem::take(&mut self.entries);
         all.append(&mut self.filtered_out);
         let search = &self.search;
-        (self.entries, self.filtered_out) = all
-            .into_iter()
-            .partition(|entry| (!search.is_empty() || filter.shows(&entry.company)) && search.finds_entry(entry));
+        let section = match self.section {
+            Section::Submitted => Section::Pending,
+            section => section,
+        };
+        (self.entries, self.filtered_out) = all.into_iter().partition(|entry| {
+            (!search.is_empty() || filter.shows(&entry.company))
+                && search.finds_entry(entry)
+                && self.section_of(entry) == section
+                && (section != Section::Errors
+                    || self.failure_filter.is_none()
+                    || self.failures.get(&entry.link).map(|(failure, _)| *failure) == self.failure_filter)
+        });
         let mut sent = std::mem::take(&mut self.submitted);
         sent.append(&mut self.submitted_out);
         (self.submitted, self.submitted_out) = sent.into_iter().partition(|sent| search.finds_application(sent));
@@ -331,9 +356,28 @@ impl Rows {
 
     fn shown(&self) -> usize {
         match self.section {
-            Section::Pending => self.entries.len(),
             Section::Submitted => self.submitted.len(),
+            _ => self.entries.len(),
         }
+    }
+
+    /// The list a posting belongs in: the queue while it is set aside or being applied to,
+    /// Errors when Maverick could not apply to it, and Pending otherwise.
+    fn section_of(&self, entry: &Entry) -> Section {
+        match entry.decision {
+            Some(Decision::Queued) => Section::Queue,
+            Some(Decision::Approved) if self.active.contains(&entry.address) => Section::Queue,
+            Some(Decision::Approved) if self.failures.contains_key(&entry.link) => Section::Errors,
+            _ => Section::Pending,
+        }
+    }
+
+    /// How many postings each list holds, those the search and the company filter keep out included.
+    fn count(&self, section: Section) -> usize {
+        self.all()
+            .filter(|entry| self.section_of(entry) == section)
+            .filter(|entry| section != Section::Pending || entry.decision.is_none())
+            .count()
     }
 
     /// Marks the selected posting, or unmarks it when it was marked.
@@ -347,7 +391,7 @@ impl Rows {
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
-        (self.section == Section::Pending)
+        (self.section != Section::Submitted)
             .then(|| self.entries.get(self.selected?.row))
             .flatten()
     }
@@ -378,7 +422,7 @@ fn step_chip(step: &Step, palette: &Palette) -> Div {
         Step::Queued | Step::Opening | Step::Filling | Step::Submitting => ui::boxed(step.word(), palette.muted),
         Step::NeedsYou(_) | Step::Ready => ui::chip(Signal::Yours, step.word(), palette),
         Step::Applied => ui::chip(Signal::Done, step.word(), palette),
-        Step::Failed(_) => ui::chip(Signal::Failed, step.word(), palette),
+        Step::Failed(..) => ui::chip(Signal::Failed, step.word(), palette),
     }
 }
 
@@ -415,7 +459,16 @@ fn decision_chip(decision: Decision, palette: &Palette) -> Div {
     match decision {
         Decision::Approved => ui::chip(Signal::Done, "approved", palette),
         Decision::Skipped => ui::boxed("skipped", palette.faint),
+        Decision::Queued => ui::boxed("queued", palette.muted),
     }
+}
+
+/// Whether the user can mark a posting submitted: nothing is filling it and no submit is recorded.
+fn can_mark_submitted(run: Option<&Step>) -> bool {
+    !matches!(
+        run,
+        Some(Step::Opening | Step::Filling | Step::Submitting | Step::Applied)
+    )
 }
 
 impl ListDelegate for Rows {
@@ -429,7 +482,7 @@ impl ListDelegate for Rows {
         let palette = Palette::of(cx);
         let selected = self.selected == Some(ix);
         let row = match self.section {
-            Section::Pending => {
+            Section::Pending | Section::Queue | Section::Errors => {
                 let entry = self.entries.get(ix.row)?;
                 let run = self.browser.read(cx).queue().get(&entry.address).cloned();
                 let tone = match (entry.decision, entry.score) {
@@ -488,6 +541,10 @@ impl ListDelegate for Rows {
                     )
                     .child(sponsorship_chip(entry.sponsorship, &palette))
                     .children(match (&run, entry.decision) {
+                        (_, Some(Decision::Approved)) if self.section == Section::Errors => self
+                            .failures
+                            .get(&entry.link)
+                            .map(|(failure, _)| ui::chip(Signal::Failed, failure.label(), &palette)),
                         (Some(run), Some(Decision::Approved)) => Some(step_chip(&run.step, &palette)),
                         (_, decision) => decision.map(|decision| decision_chip(decision, &palette)),
                     })
@@ -532,6 +589,12 @@ impl ListDelegate for Rows {
             Section::Pending if searching && !self.filtered_out.is_empty() => "No posting matches the search.",
             Section::Pending if !self.filtered_out.is_empty() => "The company filter hides every posting.",
             Section::Pending => "Nothing waits on a decision. New postings arrive with the hourly check.",
+            Section::Queue if searching && !self.filtered_out.is_empty() => {
+                "No posting in the queue matches the search."
+            }
+            Section::Queue => "The queue is empty. Add to queue sets a posting aside for Run queue.",
+            Section::Errors if self.failure_filter.is_some() => "No posting failed this way.",
+            Section::Errors => "Maverick applied to every posting you approved, or is still at it.",
             Section::Submitted if searching && !self.submitted_out.is_empty() => "No application matches the search.",
             Section::Submitted => "No applications are recorded yet.",
         };
@@ -596,6 +659,9 @@ impl Board {
             search: Search::default(),
             selected: None,
             marked: BTreeSet::new(),
+            active: HashSet::new(),
+            failures: HashMap::new(),
+            failure_filter: None,
         };
         let list = cx.new(|cx| ListState::new(rows, window, cx));
         let search = cx.new(|cx| {
@@ -624,7 +690,10 @@ impl Board {
                 }
                 cx.notify();
             }),
-            cx.observe_in(&browser, window, |this, _, window, cx| this.move_applied(window, cx)),
+            cx.observe_in(&browser, window, |this, _, window, cx| {
+                this.move_applied(window, cx);
+                this.follow_runs(window, cx);
+            }),
             // A check or a draft changes what the cards say about outreach.
             cx.observe(&outreach, |this, _, cx| {
                 this.list.update(cx, |_, cx| cx.notify());
@@ -664,6 +733,7 @@ impl Board {
             let rows = list.delegate_mut();
             rows.entries = data.entries;
             rows.filtered_out.clear();
+            rows.failures = data.failures;
             rows.submitted = data.applications;
             rows.submitted_out.clear();
             rows.refilter(&filter);
@@ -671,15 +741,7 @@ impl Board {
             sort_submitted(&mut rows.submitted, submitted_order);
             select_row(list, 0, window, cx);
         });
-        if self.auto_apply() {
-            self.apply_approved(cx);
-        }
         cx.notify();
-    }
-
-    /// Whether Maverick submits approved postings and reaches their people by itself.
-    fn auto_apply(&self) -> bool {
-        self.database.as_deref().is_some_and(maverick_core::auto::is_on)
     }
 
     /// How many postings wait on a decision, those the company filter keeps out included.
@@ -699,8 +761,7 @@ impl Board {
             .list
             .read(cx)
             .delegate()
-            .entries
-            .iter()
+            .all()
             .filter(|entry| entry.decision.is_none() && Some(entry.address.as_str()) != except)
             .collect();
         pending.sort_by_key(|entry| std::cmp::Reverse(entry.score));
@@ -713,12 +774,24 @@ impl Board {
     }
 
     fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        let (order, filter) = (self.order, self.filter.clone());
+        let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
-            list.delegate_mut().section = section;
+            let rows = list.delegate_mut();
+            rows.section = section;
+            rows.refilter(&filter);
+            sort(&mut rows.entries, order, &reachable);
             select_row(list, 0, window, cx);
         });
         self.focus(window, cx);
         cx.notify();
+    }
+
+    /// Shows the errors of one kind, or all of them with `None`.
+    fn filter_failures(&mut self, failure: Option<Failure>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list
+            .update(cx, |list, _| list.delegate_mut().failure_filter = failure);
+        self.regroup(window, cx);
     }
 
     fn set_order(&mut self, order: Order, window: &mut Window, cx: &mut Context<Self>) {
@@ -755,7 +828,6 @@ impl Board {
         let reachable = self.outreach.read(cx).reachable();
         self.list.update(cx, |list, cx| {
             let rows = list.delegate_mut();
-            rows.section = Section::Pending;
             rows.refilter(&filter);
             sort(&mut rows.entries, order, &reachable);
             select_row(list, row, window, cx);
@@ -810,15 +882,55 @@ impl Board {
     /// Decides the marked postings, or the selected one when none is marked. The selection stays
     /// in place, so it lands on the next pending one.
     pub fn decide(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.order;
-        let reachable = self.outreach.read(cx).reachable();
-        let decided = self.list.update(cx, |list, cx| {
-            let row = list.selected_index().map_or(0, |ix| ix.row);
+        let links = self.list.update(cx, |list, _| {
             let rows = list.delegate_mut();
             let mut links: Vec<String> = std::mem::take(&mut rows.marked).into_iter().collect();
             if links.is_empty() {
                 links.extend(rows.selected_entry().map(|entry| entry.link.clone()));
             }
+            links
+        });
+        self.decide_links(&links, decision, window, cx);
+    }
+
+    /// Approves every posting in the queue, as one batch that undo takes back together.
+    fn run_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let links: Vec<String> = self
+            .list
+            .read(cx)
+            .delegate()
+            .all()
+            .filter(|entry| entry.decision == Some(Decision::Queued))
+            .map(|entry| entry.link.clone())
+            .collect();
+        self.decide_links(&links, Decision::Approved, window, cx);
+    }
+
+    /// Records that the user submitted the selected posting's application themselves.
+    fn mark_submitted(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry(cx).cloned() else {
+            return;
+        };
+        let run = self
+            .browser
+            .read(cx)
+            .queue()
+            .get(&entry.address)
+            .map(|run| run.step.clone());
+        if !can_mark_submitted(run.as_ref()) {
+            return;
+        }
+        self.browser.update(cx, |browser, cx| {
+            browser.record_submitted(entry.role(), entry.address, cx)
+        });
+    }
+
+    fn decide_links(&mut self, links: &[String], decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.order;
+        let reachable = self.outreach.read(cx).reachable();
+        let decided = self.list.update(cx, |list, cx| {
+            let row = list.selected_index().map_or(0, |ix| ix.row);
+            let rows = list.delegate_mut();
             let mut made = Vec::new();
             for entry in rows.entries.iter_mut().chain(&mut rows.filtered_out) {
                 if links.contains(&entry.link) {
@@ -833,11 +945,102 @@ impl Board {
             let saves = decided.iter().map(|(link, _)| (link.clone(), Some(decision))).collect();
             self.save(saves, cx);
             for (link, _) in &decided {
+                // A new decision, another try included, sets the last failure aside.
+                self.set_failure(link, None, cx);
                 self.sync_queue(link, Some(decision), cx);
             }
             self.made.push(decided);
         }
+        self.follow_runs(window, cx);
         cx.notify();
+    }
+
+    /// Keeps the lists in step with the apply queue: a posting moves to the queue while Maverick
+    /// works on it, and to Errors when Maverick could not apply to it.
+    fn follow_runs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (active, failed): (HashSet<String>, Vec<(String, Failure, String)>) = {
+            let runs = self.browser.read(cx).queue().runs();
+            let active = runs
+                .iter()
+                .filter(|run| !matches!(run.step, Step::Failed(..) | Step::Applied))
+                .map(|run| run.address.clone())
+                .collect();
+            let failed = runs
+                .iter()
+                .filter_map(|run| match &run.step {
+                    Step::Failed(failure, why) => Some((run.address.clone(), *failure, why.clone())),
+                    _ => None,
+                })
+                .collect();
+            (active, failed)
+        };
+        let rows = self.list.read(cx).delegate();
+        let news: Vec<(String, (Failure, String))> = failed
+            .into_iter()
+            .filter_map(|(address, failure, why)| {
+                let entry = rows
+                    .all()
+                    .find(|entry| entry.address == address && entry.decision == Some(Decision::Approved))?;
+                let said = (failure, why);
+                (rows.failures.get(&entry.link) != Some(&said)).then(|| (entry.link.clone(), said))
+            })
+            .collect();
+        let moved = rows.active != active || !news.is_empty();
+        self.list.update(cx, |list, _| list.delegate_mut().active = active);
+        for (link, said) in news {
+            self.set_failure(&link, Some(said), cx);
+        }
+        if moved {
+            self.regroup(window, cx);
+        }
+    }
+
+    /// Sorts the postings into the lists again, keeping the selection's place.
+    fn regroup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (order, filter) = (self.order, self.filter.clone());
+        let reachable = self.outreach.read(cx).reachable();
+        self.list.update(cx, |list, cx| {
+            let row = list.selected_index().map_or(0, |ix| ix.row);
+            let rows = list.delegate_mut();
+            rows.refilter(&filter);
+            sort(&mut rows.entries, order, &reachable);
+            select_row(list, row, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Records why Maverick could not apply to the posting at `link`, or clears it with `None`.
+    fn set_failure(&mut self, link: &str, failure: Option<(Failure, String)>, cx: &mut Context<Self>) {
+        let changed = self.list.update(cx, |list, _| {
+            let failures = &mut list.delegate_mut().failures;
+            match &failure {
+                Some(said) => failures.insert(link.to_owned(), said.clone()).as_ref() != Some(said),
+                None => failures.remove(link).is_some(),
+            }
+        });
+        if !changed {
+            return;
+        }
+        let (database, link) = (self.database.clone(), link.to_owned());
+        let saved = self.browser.read(cx).background().spawn_blocking(move || {
+            let database = database.ok_or("this system has no application data directory")?;
+            let mut store = Store::open(&database).map_err(|error| error.to_string())?;
+            match failure {
+                Some((failure, detail)) => store.record_failure(&link, failure, &detail),
+                None => store.clear_failure(&link),
+            }
+            .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Err(reason)) = saved.await {
+                this.update(cx, |this, cx| {
+                    this.problem = Some(format!("The error was not saved: {reason}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Marks the selected posting, or unmarks it, and moves to the next one.
@@ -878,37 +1081,24 @@ impl Board {
         self.list.read(cx).delegate().marked.len()
     }
 
-    /// Puts an approved posting in the apply queue, and takes any other out while it waits.
+    /// Starts filling an approved posting Maverick can fill, and takes any other out while it waits.
+    /// A posting on a site Maverick cannot fill opens nothing: the user applies there themselves.
     fn sync_queue(&mut self, link: &str, decision: Option<Decision>, cx: &mut Context<Self>) {
         let rows = self.list.read(cx).delegate();
         let Some(entry) = rows.all().find(|entry| entry.link == link) else {
             return;
         };
         let (role, address) = (entry.role(), entry.address.clone());
+        let fillable = System::of(&address).is_some();
+        if decision == Some(Decision::Approved) && !fillable {
+            let platform = Platform::of(&address).name();
+            let said = format!("Maverick cannot fill {platform} forms yet. Apply on the site, then mark it submitted.");
+            self.set_failure(link, Some((Failure::Unfillable, said)), cx);
+        }
         self.browser.update(cx, |browser, cx| match decision {
-            Some(Decision::Approved) => browser.enqueue(role, address, cx),
+            Some(Decision::Approved) if fillable => browser.enqueue(role, address, cx),
             _ => browser.withdraw(&address, cx),
         });
-    }
-
-    /// Queues every approved posting that is not in the queue yet, such as those approved before a restart.
-    fn apply_approved(&mut self, cx: &mut Context<Self>) {
-        let waiting: Vec<String> = self.waiting_approved(cx).into_iter().map(|entry| entry.link).collect();
-        for link in waiting {
-            self.sync_queue(&link, Some(Decision::Approved), cx);
-        }
-    }
-
-    /// Approved postings that have not been queued in this run.
-    fn waiting_approved(&self, cx: &App) -> Vec<Entry> {
-        let queue = self.browser.read(cx).queue();
-        self.list
-            .read(cx)
-            .delegate()
-            .all()
-            .filter(|entry| entry.decision == Some(Decision::Approved) && queue.get(&entry.address).is_none())
-            .cloned()
-            .collect()
     }
 
     /// Brings the selected posting's tab forward, when the queue opened one.
@@ -950,18 +1140,35 @@ impl Board {
         let Some(batch) = self.made.pop() else {
             return;
         };
-        let order = self.order;
-        let reachable = self.outreach.read(cx).reachable();
-        self.list.update(cx, |list, cx| {
+        self.list.update(cx, |list, _| {
             let rows = list.delegate_mut();
-            rows.section = Section::Pending;
             for entry in rows.entries.iter_mut().chain(&mut rows.filtered_out) {
                 if let Some((_, before)) = batch.iter().find(|(link, _)| *link == entry.link) {
                     entry.decision = *before;
                 }
             }
-            sort(&mut rows.entries, order, &reachable);
+        });
+        self.save(batch.clone(), cx);
+        for (link, before) in &batch {
+            self.set_failure(link, None, cx);
+            self.sync_queue(link, *before, cx);
+        }
+        self.follow_runs(window, cx);
+        // The list that holds the first posting taken back shows, with that posting selected.
+        let (order, filter) = (self.order, self.filter.clone());
+        let reachable = self.outreach.read(cx).reachable();
+        self.list.update(cx, |list, cx| {
+            let rows = list.delegate_mut();
             let first = batch.first().map(|(link, _)| link);
+            let restored = rows
+                .all()
+                .find(|entry| Some(&entry.link) == first)
+                .map(|entry| rows.section_of(entry));
+            if let Some(section) = restored {
+                rows.section = section;
+            }
+            rows.refilter(&filter);
+            sort(&mut rows.entries, order, &reachable);
             let row = rows
                 .entries
                 .iter()
@@ -969,10 +1176,6 @@ impl Board {
                 .unwrap_or(0);
             select_row(list, row, window, cx);
         });
-        self.save(batch.clone(), cx);
-        for (link, before) in &batch {
-            self.sync_queue(link, *before, cx);
-        }
         cx.notify();
     }
 
@@ -1094,7 +1297,9 @@ impl Board {
             "x" => self.toggle_mark(window, cx),
             "/" => self.focus_search(window, cx),
             "a" => self.decide(Decision::Approved, window, cx),
+            "q" => self.decide(Decision::Queued, window, cx),
             "s" => self.decide(Decision::Skipped, window, cx),
+            "m" => self.mark_submitted(cx),
             "o" => self.open_selected(cx),
             "h" => self.hide_company(window, cx),
             _ => return,
@@ -1106,8 +1311,24 @@ impl Board {
     fn toolbar(&self, palette: &Palette, cx: &mut Context<Self>) -> Div {
         let rows = self.list.read(cx).delegate();
         let section = rows.section;
-        let pending = rows.entries.iter().filter(|entry| entry.decision.is_none()).count();
+        let (pending, queued, errors) = (
+            rows.count(Section::Pending),
+            rows.count(Section::Queue),
+            rows.count(Section::Errors),
+        );
         let sent = rows.submitted.len();
+        let failure_filter = rows.failure_filter;
+        let failures_of = |failure: Failure| {
+            rows.all()
+                .filter(|entry| rows.section_of(entry) == Section::Errors)
+                .filter(|entry| rows.failures.get(&entry.link).map(|(kind, _)| *kind) == Some(failure))
+                .count()
+        };
+        let failure_counts: Vec<(Failure, usize)> = Failure::ALL
+            .iter()
+            .map(|&failure| (failure, failures_of(failure)))
+            .filter(|(_, count)| *count > 0)
+            .collect();
         let choice = |id: &'static str, name: String, word: String, chosen: bool| {
             let ink = palette.ink;
             let face = ui::caps(word)
@@ -1116,7 +1337,22 @@ impl Board {
             ui::button(id, name, face)
         };
         let orders: Vec<AnyElement> = match section {
-            Section::Pending => Order::ALL
+            // Errors are filtered by what went wrong in place of a sort.
+            Section::Errors => std::iter::once((None, "all".to_owned(), "error-all".to_owned()))
+                .chain(failure_counts.into_iter().map(|(failure, count)| {
+                    (
+                        Some(failure),
+                        format!("{} {count}", failure.label()),
+                        format!("error-{}", failure.as_str()),
+                    )
+                }))
+                .map(|(failure, word, id)| {
+                    choice_owned(id, format!("Show {word}"), word, failure_filter == failure, palette)
+                        .on_click(cx.listener(move |this, _, window, cx| this.filter_failures(failure, window, cx)))
+                        .into_any_element()
+                })
+                .collect(),
+            Section::Pending | Section::Queue => Order::ALL
                 .into_iter()
                 .map(|order| {
                     let word = order.word();
@@ -1162,6 +1398,24 @@ impl Board {
                     section == Section::Pending,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.show(Section::Pending, window, cx))),
+            )
+            .child(
+                choice(
+                    "board-queue",
+                    format!("Queue · {queued}"),
+                    format!("queue {queued}"),
+                    section == Section::Queue,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show(Section::Queue, window, cx))),
+            )
+            .child(
+                choice(
+                    "board-errors",
+                    format!("Errors · {errors}"),
+                    format!("errors {errors}"),
+                    section == Section::Errors,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show(Section::Errors, window, cx))),
             )
             .child(
                 choice(
@@ -1342,16 +1596,22 @@ impl Board {
                     .into_any_element(),
             );
         }
-        let waiting_approved = self.waiting_approved(cx).len();
-        if waiting_approved > 0 {
+        let queued = self
+            .list
+            .read(cx)
+            .delegate()
+            .all()
+            .filter(|entry| entry.decision == Some(Decision::Queued))
+            .count();
+        if queued > 0 {
             controls.push(
                 ui::button(
-                    "apply-approved",
-                    format!("Apply approved · {waiting_approved}"),
-                    ui::quiet_face(format!("apply approved {waiting_approved}"), palette),
+                    "run-queue",
+                    format!("Run queue · {queued}"),
+                    ui::quiet_face(format!("run queue {queued}"), palette),
                 )
-                .tip("Queue the postings approved before Maverick last started.")
-                .on_click(cx.listener(|this, _, _, cx| this.apply_approved(cx)))
+                .tip("Apply to every posting in the queue. Maverick submits each form it can complete.")
+                .on_click(cx.listener(|this, _, window, cx| this.run_queue(window, cx)))
                 .into_any_element(),
             );
         }
@@ -1418,29 +1678,40 @@ impl Board {
             Some(Decision::Approved) => self.browser.read(cx).queue().get(&entry.address).cloned(),
             _ => None,
         };
-        let auto_submit = self.browser.read(cx).auto_submit();
+        let fillable = System::of(&entry.address).is_some();
+        let failure = rows
+            .failures
+            .get(&entry.link)
+            .filter(|_| rows.section_of(&entry) == Section::Errors)
+            .cloned();
         let note = match (&entry.decision, run.as_ref().map(|run| &run.step)) {
-            (None, _) if auto_submit => "approve queues it. maverick submits it if it can and messages its people.",
-            (None, _) => "approve queues it. nothing gets submitted.",
+            _ if failure.is_some() && fillable => "approve to try again.",
+            _ if failure.is_some() => "apply on the site, then mark it submitted.",
+            (None | Some(Decision::Approved), None) if !fillable => "maverick can't fill this site.",
+            (None, _) => "approve applies now.",
+            (Some(Decision::Queued), _) => "waits for run queue.",
             (Some(Decision::Skipped), _) => "skipped.",
-            (Some(Decision::Approved), None) => "approve again to queue it.",
-            (_, Some(Step::Queued | Step::Opening | Step::Filling)) if auto_submit => {
-                "filling. maverick submits it when nothing is left for you."
-            }
-            (_, Some(Step::Queued | Step::Opening | Step::Filling)) => "filling. nothing gets submitted.",
+            (Some(Decision::Approved), None) => "approve again to apply.",
+            (_, Some(Step::Queued)) => "waits for a free slot.",
+            (_, Some(Step::Opening | Step::Filling)) => "filling. maverick submits it if it can.",
             (_, Some(Step::Submitting)) => "submitting.",
             (_, Some(Step::NeedsYou(_) | Step::Ready)) => "you click submit.",
             (_, Some(Step::Applied)) => "applied.",
-            (_, Some(Step::Failed(_))) => "nothing was submitted.",
+            (_, Some(Step::Failed(..))) => "nothing was submitted.",
         };
         let marked = rows.marked.len();
         let (word, name) = match run.as_ref().map(|run| &run.step) {
             _ if marked > 0 => (format!("approve {marked}"), format!("Approve {marked} marked")),
-            None if entry.decision == Some(Decision::Approved) => ("apply".into(), "Apply".into()),
+            _ if failure.is_some() && fillable => ("try again".into(), "Try again".into()),
+            _ if failure.is_some() => (String::new(), String::new()),
+            None if entry.decision == Some(Decision::Approved) && fillable => ("apply".into(), "Apply".into()),
+            None if entry.decision == Some(Decision::Approved) => (String::new(), String::new()),
             None => ("approve".into(), "Approve".into()),
-            Some(Step::Failed(_)) => ("try again".into(), "Try again".into()),
+            Some(Step::Failed(..)) => ("try again".into(), "Try again".into()),
             Some(_) => (String::new(), String::new()),
         };
+        let queueable = entry.decision.is_none() && run.is_none() && fillable;
+        let markable = marked == 0 && can_mark_submitted(run.as_ref().map(|run| &run.step));
         let link = entry.link.clone();
         let reported = run.as_ref().is_some_and(|run| run.report.is_some());
         let scorer_note = Verdict::read(entry.notes.as_deref(), entry.flags.as_deref()).outreach;
@@ -1496,7 +1767,10 @@ impl Board {
             .size_full()
             .child(posting_header(&entry, company_actions, palette))
             .child(link_bar)
-            .children(run.as_ref().map(|run| run_status(run, palette)))
+            .children(match &failure {
+                Some((failure, why)) => Some(failure_status(*failure, why, palette).into_any_element()),
+                None => run.as_ref().map(|run| run_status(run, palette).into_any_element()),
+            })
             .child(
                 div()
                     .id("board-facts")
@@ -1524,13 +1798,47 @@ impl Board {
                     .border_t_1()
                     .border_color(palette.line)
                     .children(primary)
+                    .children(queueable.then(|| {
+                        let (word, name) = match marked {
+                            0 => ("add to queue  q".to_owned(), "Add to queue".to_owned()),
+                            marked => (format!("queue {marked}  q"), format!("Add {marked} marked to queue")),
+                        };
+                        ui::button("add-to-queue", name, ui::quiet_face(word, palette))
+                            .tip("Save it for later. Run queue applies to every posting in the queue.")
+                            .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Queued, window, cx)))
+                    }))
+                    .children(markable.then(|| {
+                        ui::button(
+                            "mark-submitted",
+                            "Mark submitted",
+                            ui::quiet_face("mark submitted  m", palette),
+                        )
+                        .tip("You submitted it yourself. Maverick records the application.")
+                        .on_click(cx.listener(|this, _, _, cx| this.mark_submitted(cx)))
+                    }))
                     .child(
                         ui::button("skip", "Skip", ui::quiet_face("skip  s", palette))
                             .on_click(cx.listener(|this, _, window, cx| this.decide(Decision::Skipped, window, cx))),
                     )
-                    .child(ui::serif(note).ml_auto().text_size(px(13.5)).text_color(palette.muted)),
+                    .child(
+                        ui::serif(note)
+                            .ml_auto()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.5))
+                            .text_color(palette.muted),
+                    ),
             )
     }
+}
+
+/// A word in the toolbar that picks a list, an order or a filter.
+fn choice_owned(id: String, name: String, word: String, chosen: bool, palette: &Palette) -> ui::Button {
+    let ink = palette.ink;
+    let face = ui::caps(word)
+        .text_color(if chosen { palette.ink } else { palette.faint })
+        .hover(move |face| face.text_color(ink));
+    ui::button(SharedString::from(id), name, face)
 }
 
 /// The company, its filter buttons and the application system above the posting's title, which can be copied.
@@ -1641,6 +1949,32 @@ fn verdict_view(entry: &Entry, palette: &Palette) -> Div {
 }
 
 /// Where a queued posting is, and the fill report's map once there is one.
+/// Why Maverick could not apply to a posting in Errors.
+fn failure_status(failure: Failure, why: &str, palette: &Palette) -> impl IntoElement + use<> {
+    h_flex()
+        .id("failure-status")
+        .test_support()
+        .role(gpui_kit::Role::Label)
+        .aria_label(format!("{}: {why}", failure.label()))
+        .flex_none()
+        .items_start()
+        .gap(px(9.))
+        .px_4()
+        .pb_3()
+        .border_b_1()
+        .border_color(palette.line)
+        .child(ui::square(palette.signal(Signal::Failed)).mt(px(6.)))
+        .child(ui::serif(capitalized(why)).flex_1().min_w_0().text_size(px(13.5)))
+}
+
+fn capitalized(text: &str) -> String {
+    let mut letters = text.chars();
+    letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect())
+        .unwrap_or_default()
+}
+
 fn run_status(run: &Run, palette: &Palette) -> impl IntoElement + use<> {
     let (signal, text) = match &run.step {
         Step::Queued => (None, "Queued. It starts when a slot is free.".to_owned()),
@@ -1660,7 +1994,7 @@ fn run_status(run: &Run, palette: &Palette) -> impl IntoElement + use<> {
             },
         ),
         Step::Applied => (Some(Signal::Done), "Submitted and recorded.".to_owned()),
-        Step::Failed(why) => (Some(Signal::Failed), why.clone()),
+        Step::Failed(_, why) => (Some(Signal::Failed), why.clone()),
     };
     v_flex()
         .id("run-status")
@@ -1765,6 +2099,8 @@ mod tests {
     use super::*;
 
     const ASHBY: &str = "https://jobs.ashbyhq.com/example-co/0f3b8231-3a32-478a-b994-3441f4bb9401";
+    const READY_ASHBY: &str = "https://jobs.ashbyhq.com/example-co/1a2b3c4d-1111-4222-8333-444455556666";
+    const HIGH_ASHBY: &str = "https://jobs.ashbyhq.com/example-co/9f8e7d6c-1111-4222-8333-444455556666";
 
     fn posting(link: &str, title: &str, stage: Stage, score: Option<u8>, found: &str) -> Posting {
         Posting {
@@ -1795,15 +2131,19 @@ mod tests {
             Posting {
                 notes: Some(format!("{APPLY_READY} 77, Backend/Infra: fits")),
                 sponsorship: Some(Sponsorship::Sponsors),
+                address: Some(READY_ASHBY.into()),
                 ..posting("https://simplify.jobs/p/2", "Ready", Stage::Review, Some(77), "08")
             },
-            posting(
-                "https://simplify.jobs/p/3",
-                "High but not ready",
-                Stage::Review,
-                Some(90),
-                "09",
-            ),
+            Posting {
+                address: Some(HIGH_ASHBY.into()),
+                ..posting(
+                    "https://simplify.jobs/p/3",
+                    "High but not ready",
+                    Stage::Review,
+                    Some(90),
+                    "09",
+                )
+            },
             posting("https://simplify.jobs/p/4", "Unscored", Stage::Found, None, "12"),
             posting(
                 "https://simplify.jobs/p/5",
@@ -1864,7 +2204,8 @@ mod tests {
         );
         assert_eq!(entries[0].sponsorship, Sponsorship::Sponsors);
         assert_eq!(entries[1].sponsorship, Sponsorship::Unknown);
-        assert_eq!(entries[0].system(), "Simplify");
+        assert_eq!(entries[0].system(), "Ashby");
+        assert_eq!(entries[1].system(), "Simplify");
 
         sort(&mut entries, Order::Latest, &none);
         assert_eq!(
@@ -2048,15 +2389,21 @@ mod tests {
         wait_until("both decisions are saved", || decisions().len() == 2);
         assert_eq!(decisions()["https://simplify.jobs/p/2"], Decision::Approved);
         assert_eq!(decisions()["https://simplify.jobs/p/3"], Decision::Skipped);
-        // Decided rows sink below the pending ones, so the selection lands on the next pending posting.
+        // The approved posting moves to the queue and the skipped one sinks below the pending
+        // ones, so the selection lands on the next pending posting.
         assert_eq!(
             shown(cx),
             (
-                "Middling, Unscored, Ready, High but not ready".into(),
+                "Middling, Unscored, High but not ready".into(),
                 Some("Middling".into()),
                 2
             )
         );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("board-queue").label(), Some("Queue · 1"));
+        })
+        .unwrap();
 
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
@@ -2082,14 +2429,22 @@ mod tests {
                 ("High but not ready at Example Co".to_owned(), Step::Queued),
             ]
         );
+        assert_eq!(shown(cx), ("Unscored, Middling".into(), Some("Unscored".into()), 2));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("board-queue", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
         assert_eq!(
             shown(cx),
-            (
-                "Unscored, Middling, High but not ready, Ready".into(),
-                Some("Unscored".into()),
-                2
-            )
+            ("High but not ready, Ready".into(), Some("High but not ready".into()), 2)
         );
+        cx.update_window(window, |_, window, cx| {
+            window.click("board-pending", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
 
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
@@ -2106,6 +2461,145 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("board-submitted").label(), Some("Submitted · 1"));
             assert!(window.try_find("approve").is_none());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_submit_marks_the_posting_applied_when_it_was_found_by_another_link() {
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let (postings, _) = sample();
+        Store::open(&database).unwrap().add_found(&postings).unwrap();
+        let address = format!("{READY_ASHBY}?utm_source=mail");
+        crate::browser::record_applied(Some(&database), "Ready at Example Co", &address).unwrap();
+        let store = Store::open(&database).unwrap();
+        let ready = store
+            .postings()
+            .unwrap()
+            .into_iter()
+            .find(|posting| posting.link == "https://simplify.jobs/p/2")
+            .unwrap();
+        assert_eq!(ready.stage, Stage::Applied);
+    }
+
+    #[gpui_kit::test]
+    fn the_queue_waits_for_run_queue_and_a_site_maverick_cannot_fill_is_marked_submitted(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let scratch = tempfile::tempdir().unwrap();
+        let database = scratch.path().join("maverick.db");
+        let (postings, applications) = sample();
+        Store::open(&database).unwrap().add_found(&postings).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::install(cx);
+        });
+        let data = BoardData::new(&postings, applications, &HashMap::new());
+        let background = runtime.handle().clone();
+        let browser = cx.update(|cx| {
+            cx.new(|cx| {
+                let bridge = maverick_core::bridge::Bridge::new();
+                Browser::new(bridge, background, Err("none".into()), None, Some(database.clone()), cx)
+            })
+        });
+        let (window, board) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1000.), px(640.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                let outreach = cx.new(|cx| OutreachView::new(browser.clone(), None, window, cx));
+                cx.new(|cx| Board::new(browser.clone(), outreach, data, Some(database.clone()), window, cx))
+            })
+            .expect("the test window opens")
+        });
+        let decisions = || Store::open(&database).unwrap().decisions().unwrap();
+        let runs = |cx: &mut TestAppContext| -> Vec<String> {
+            browser.read_with(cx, |browser, _| {
+                browser.queue().runs().iter().map(|run| run.address.clone()).collect()
+            })
+        };
+
+        // q adds Ready and then High but not ready to the queue. Nothing opens yet.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            board.update(cx, |board, cx| board.focus(window, cx));
+            window.press("q", cx);
+            window.press("q", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        wait_until("both are queued", || decisions().len() == 2);
+        assert!(decisions().values().all(|decision| *decision == Decision::Queued));
+        assert!(runs(cx).is_empty());
+
+        // Run queue starts both, as one batch.
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(window.find("run-queue").label(), Some("Run queue · 2"));
+            window.click("run-queue", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("run-queue").is_none());
+        })
+        .unwrap();
+        wait_until("both are approved", || {
+            decisions().values().all(|decision| *decision == Decision::Approved)
+        });
+        assert_eq!(runs(cx), [READY_ASHBY, HIGH_ASHBY]);
+
+        // Middling is on a site Maverick cannot fill. Approving it opens nothing and moves it to
+        // Errors; the user applies on the site and marks it submitted.
+        let selected = board.read_with(cx, |board, cx| {
+            board.selected_entry(cx).map(|entry| entry.title.clone())
+        });
+        assert_eq!(selected.as_deref(), Some("Middling"));
+        cx.update_window(window, |_, window, cx| {
+            window.press("a", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("board-queue").label(), Some("Queue · 2"));
+            assert_eq!(window.find("board-errors").label(), Some("Errors · 1"));
+            window.click("board-errors", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("error-unfillable").label(), Some("Show can't fill site 1"));
+            assert!(
+                window
+                    .find("failure-status")
+                    .label()
+                    .unwrap()
+                    .starts_with("can't fill site: ")
+            );
+        })
+        .unwrap();
+        wait_until("the error is saved", || {
+            Store::open(&database).unwrap().failures().unwrap()["https://simplify.jobs/p/1"].0 == Failure::Unfillable
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.click("mark-submitted", cx);
+        })
+        .unwrap();
+        assert_eq!(runs(cx).len(), 2);
+        wait_until("the application is recorded", || {
+            let store = Store::open(&database).unwrap();
+            let applied = store.applications().unwrap();
+            applied
+                .iter()
+                .any(|sent| sent.link.as_deref() == Some("https://simplify.jobs/p/1"))
+                && store
+                    .postings()
+                    .unwrap()
+                    .iter()
+                    .any(|posting| posting.link == "https://simplify.jobs/p/1" && posting.stage == Stage::Applied)
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("board-submitted").label(), Some("Submitted · 1"));
         })
         .unwrap();
     }
